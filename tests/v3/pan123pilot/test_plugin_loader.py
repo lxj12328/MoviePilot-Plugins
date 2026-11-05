@@ -63,30 +63,24 @@ class TestPluginLoader(unittest.TestCase):
         self.assertFalse(plugin.get_state())
         self.assertEqual(plugin.get_service(), [])
 
-    def test_trigger_parsing(self):
+    def test_interval_and_service_scheduling(self):
         plugin = Pan123Pilot()
-        # Parse minutes
-        t1 = plugin._parse_trigger("45", default_minutes=30)
-        self.assertIsNotNone(t1)
-
-        # Parse cron expression
-        t2 = plugin._parse_trigger("*/15 * * * *", default_minutes=30)
-        self.assertIsNotNone(t2)
-
-        # Parse invalid fallback
-        t3 = plugin._parse_trigger("invalid_expression", default_minutes=30)
-        self.assertIsNotNone(t3)
-
         # Test init_plugin with custom schedule configuration
         plugin.init_plugin({
             "enabled": True,
-            "retry_interval": "15",
-            "cleanup_interval": "0 */2 * * *",
+            "retry_interval": 15,
+            "cleanup_interval": 45,
         })
-        self.assertEqual(plugin._retry_interval, "15")
-        self.assertEqual(plugin._cleanup_interval, "0 */2 * * *")
+        self.assertEqual(plugin._retry_interval, 15)
+        self.assertEqual(plugin._cleanup_interval, 45)
         services = plugin.get_service()
         self.assertEqual(len(services), 2)
+        self.assertEqual(services[0]["id"], "pan123_retry_job")
+        self.assertEqual(services[1]["id"], "pan123_cleanup_job")
+
+        # Test silent execution when no tasks are due
+        plugin._service_retry_tasks()
+        plugin._service_cleanup_tasks()
 
     def test_transfer_completed_handler(self):
         class DummyEvent:

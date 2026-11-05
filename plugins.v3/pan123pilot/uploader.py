@@ -319,7 +319,11 @@ class TaskScheduler:
                 f"媒体【{os.path.basename(target_path)}】真实上传失败: {err}",
             )
 
-    def retry_retrying_tasks(self, enable_real_upload: bool = True) -> None:
+    def retry_retrying_tasks(
+        self,
+        enable_real_upload: bool = True,
+        retry_interval_minutes: int = 0,
+    ) -> None:
         """周期性扫描 RETRYING 任务并重新发起 SHA1 秒传检测"""
         retrying_tasks = self.db.list_tasks_by_status(statuses=["RETRYING"])
         for task in retrying_tasks:
@@ -336,6 +340,22 @@ class TaskScheduler:
 
             if not sha1_str:
                 continue
+
+            # 校验任务距离上次重试/更新是否已达到设定的重试间隔时间
+            if retry_interval_minutes > 0:
+                updated_at_val = task.get("updated_at")
+                if updated_at_val:
+                    try:
+                        if isinstance(updated_at_val, datetime):
+                            last_time = updated_at_val
+                        else:
+                            last_time = datetime.strptime(str(updated_at_val), "%Y-%m-%d %H:%M:%S")
+                        elapsed_seconds = (datetime.now() - last_time).total_seconds()
+                        if elapsed_seconds < retry_interval_minutes * 60:
+                            # 距离上次尝试尚未满用户设定的重试间隔时间，暂不触发
+                            continue
+                    except Exception:
+                        pass
 
             parent_id = self.resolve_target_parent_id(target_path)
             reuse, file_id, _ = self.client.sha1_reuse(

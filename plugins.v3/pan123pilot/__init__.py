@@ -4,6 +4,7 @@
 """
 
 import os
+from datetime import datetime
 from typing import Any, Optional
 
 try:
@@ -196,7 +197,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -209,8 +210,8 @@ class Pan123Pilot(_PluginBase):
     _parent_file_id: int = 0
     _local_library_root: str = ""
     _enable_path_cascade: bool = True
-    _retry_interval: str = "30"
-    _cleanup_interval: str = "60"
+    _retry_interval: int = 30
+    _cleanup_interval: int = 60
     _max_retry_count: int = 10
     _enable_real_upload: bool = True
 
@@ -274,8 +275,16 @@ class Pan123Pilot(_PluginBase):
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
         self._local_library_root = str(config.get("local_library_root") or "").strip()
         self._enable_path_cascade = bool(config.get("enable_path_cascade", True))
-        self._retry_interval = str(config.get("retry_interval") or "30").strip()
-        self._cleanup_interval = str(config.get("cleanup_interval") or "60").strip()
+        try:
+            self._retry_interval = max(1, int(config.get("retry_interval") or 30))
+        except (ValueError, TypeError):
+            self._retry_interval = 30
+
+        try:
+            self._cleanup_interval = max(1, int(config.get("cleanup_interval") or 60))
+        except (ValueError, TypeError):
+            self._cleanup_interval = 60
+
         self._max_retry_count = int(config.get("max_retry_count") or 10)
         self._enable_real_upload = bool(config.get("enable_real_upload", True))
 
@@ -385,50 +394,23 @@ class Pan123Pilot(_PluginBase):
         """返回插件是否启用"""
         return self._enabled
 
-    @staticmethod
-    def _parse_trigger(val: Any, default_minutes: int = 30) -> Any:
-        """
-        根据用户配置解析并返回 APScheduler Trigger 实例：
-        1. 若配置为 Cron 表达式（含空格），使用 CronTrigger.from_crontab
-        2. 若配置为数字（分钟数），使用 IntervalTrigger(minutes=val)
-        3. 异常或缺乏库时平滑兜底
-        """
-        val_str = str(val or "").strip()
-        if not val_str:
-            val_str = str(default_minutes)
-
-        # 1. 尝试按 Cron 表达式解析（通常含有空格，如 '*/30 * * * *' 或 '0 * * * *'）
-        if " " in val_str and CronTrigger:
-            try:
-                return CronTrigger.from_crontab(val_str)
-            except Exception as e:
-                logger.warning(f"Pan123Pilot 解析 Cron 表达式 '{val_str}' 失败: {e}，回退至分钟间隔")
-
-        # 2. 尝试按间隔分钟数解析
-        try:
-            clean_num = val_str.lower().rstrip("m").rstrip("in").rstrip("s").strip()
-            minutes = max(1, int(float(clean_num)))
-            if IntervalTrigger:
-                return IntervalTrigger(minutes=minutes)
-            elif CronTrigger:
-                cron_min = min(minutes, 59)
-                return CronTrigger.from_crontab(f"*/{cron_min} * * * *")
-        except Exception as e:
-            logger.warning(f"Pan123Pilot 解析时间间隔 '{val_str}' 失败: {e}，使用默认 {default_minutes} 分钟")
-
-        if IntervalTrigger:
-            return IntervalTrigger(minutes=default_minutes)
-        if CronTrigger:
-            return CronTrigger.from_crontab(f"*/{min(default_minutes, 59)} * * * *")
-        return "interval"
-
     def get_service(self) -> list[dict[str, Any]]:
-        """注册周期性服务任务"""
+        """注册周期性服务任务：调度周期直接基于用户设置的分钟间隔运行"""
         if not self._enabled:
             return []
 
-        retry_trigger = self._parse_trigger(self._retry_interval, default_minutes=30)
-        cleanup_trigger = self._parse_trigger(self._cleanup_interval, default_minutes=60)
+        interval_min = max(1, int(self._retry_interval or 30))
+        cleanup_min = max(1, int(self._cleanup_interval or 60))
+
+        if IntervalTrigger:
+            retry_trigger = IntervalTrigger(minutes=interval_min)
+            cleanup_trigger = IntervalTrigger(minutes=cleanup_min)
+        elif CronTrigger:
+            retry_trigger = CronTrigger.from_crontab(f"*/{min(interval_min, 59)} * * * *")
+            cleanup_trigger = CronTrigger.from_crontab(f"*/{min(cleanup_min, 59)} * * * *")
+        else:
+            retry_trigger = "interval"
+            cleanup_trigger = "interval"
 
         return [
             {
@@ -455,8 +437,27 @@ class Pan123Pilot(_PluginBase):
         if not retrying_tasks:
             logger.debug("Pan123Pilot 定时重试检查：当前无待重试任务")
             return
-        logger.info(f"Pan123Pilot 开始执行秒传任务定时重试，当前待重试任务数: {len(retrying_tasks)}...")
-        self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload)
+
+        interval_min = max(1, int(self._retry_interval or 30))
+        due_tasks = []
+        for t in retrying_tasks:
+            up_val = t.get("updated_at")
+            if not up_val:
+                due_tasks.append(t)
+                continue
+            try:
+                last_time = up_val if isinstance(up_val, datetime) else datetime.strptime(str(up_val), "%Y-%m-%d %H:%M:%S")
+                if (datetime.now() - last_time).total_seconds() >= interval_min * 60:
+                    due_tasks.append(t)
+            except Exception:
+                due_tasks.append(t)
+
+        if not due_tasks:
+            logger.debug(f"Pan123Pilot 定时重试检查：当前有 {len(retrying_tasks)} 个待重试任务，但均未达到设定的重试间隔时间 ({interval_min}分钟)")
+            return
+
+        logger.info(f"Pan123Pilot 开始执行秒传任务定时重试，达到重试间隔 ({interval_min}分钟) 的任务数: {len(due_tasks)}...")
+        self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload, retry_interval_minutes=interval_min)
 
     def _service_cleanup_tasks(self) -> None:
         """定时做种达标清理绑定方法"""
@@ -505,7 +506,8 @@ class Pan123Pilot(_PluginBase):
         return {"code": 0, "message": "ok", "data": tasks}
 
     def _api_trigger_retry(self) -> dict:
-        self._service_retry_tasks()
+        if self.scheduler and self._enabled:
+            self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload, retry_interval_minutes=0)
         return {"code": 0, "message": "已手动触发秒传重试"}
 
     def _api_trigger_cleanup(self) -> dict:
@@ -646,9 +648,9 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "retry_interval",
-                                            "label": "秒传重试周期",
-                                            "placeholder": "30 或 */30 * * * *",
-                                            "hint": "分钟数（如 30）或 5 位 Cron 表达式（如 */30 * * * *）",
+                                            "label": "秒传重试间隔 (分钟)",
+                                            "placeholder": "30",
+                                            "hint": "秒传未命中时，每隔多少分钟对排队任务重新发起一次秒传检测（默认 30 分钟）",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -887,9 +889,9 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "cleanup_interval",
-                                            "label": "清理巡检周期",
-                                            "placeholder": "60 或 0 * * * *",
-                                            "hint": "分钟数（如 60）或 Cron 表达式（如 0 * * * *）",
+                                            "label": "清理巡检间隔 (分钟)",
+                                            "placeholder": "60",
+                                            "hint": "每隔多少分钟巡检一次已完成任务并检查做种是否达标（默认 60 分钟）",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1031,8 +1033,8 @@ class Pan123Pilot(_PluginBase):
             "target_parent_file_id": 0,
             "local_library_root": "",
             "enable_path_cascade": True,
-            "retry_interval": "30",
-            "cleanup_interval": "60",
+            "retry_interval": 30,
+            "cleanup_interval": 60,
             "max_retry_count": 10,
             "enable_real_upload": True,
             "downloader_select": "manual",
@@ -1076,7 +1078,7 @@ class Pan123Pilot(_PluginBase):
                     "variant": "tonal",
                     "text": (
                         f"123云盘助手运行状态: {status_text} | "
-                        f"重试周期: {self._retry_interval} | 清理巡检: {self._cleanup_interval} | "
+                        f"秒传重试间隔: {self._retry_interval} 分钟 | 做种清理巡检: {self._cleanup_interval} 分钟 | "
                         f"目录级联: {cascade_text} (根: {self._local_library_root or '未指定'} -> ID: {self._parent_file_id}) | "
                         f"下载器: {dl_text} | Symedia 联动: {symedia_text}"
                     ),
