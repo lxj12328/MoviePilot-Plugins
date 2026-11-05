@@ -101,7 +101,7 @@
 | 参数名 | 类型 | 默认值 | 说明与示例 |
 | :--- | :--- | :--- | :--- |
 | `symedia_enabled` | 开关 | `False` | 是否启用 Symedia Webhook 联动。 |
-| `symedia_url` | 文本 | 空 | Symedia 服务的根地址，如 `http://207.174.6.23:8095` 或内网 `http://192.168.1.50:8095`。 |
+| `symedia_url` | 文本 | 空 | Symedia 服务的根地址，如 `http://127.0.0.1:8095` 或内网 `http://192.168.1.50:8095`。 |
 | `symedia_mount_prefix`| 文本 | 空 | **Symedia 端挂载前缀**。例如 `/CloudNAS/123/video` 或 `/123云盘/video`。插件会将文件的相对路径与此前缀拼接为 `source_file`，精准对齐 Symedia 挂载点。 |
 | `symedia_auth` | 文本 | 空 | 请求 Authorization 凭据（选填）。若 Symedia 设置了鉴权，请填写如 `basic usernamepassword`。 |
 

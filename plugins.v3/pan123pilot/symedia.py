@@ -25,7 +25,7 @@ def send_symedia_file_notify(
 ) -> Tuple[bool, str]:
     """
     发送符合 CloudDrive2 规范的 file_notify Webhook 给 Symedia
-    :param server_url: Symedia 服务地址，如 http://207.174.6.23:8095
+    :param server_url: Symedia 服务地址，如 http://127.0.0.1:8095
     :param target_path: 本地文件实际路径，如 /video/emby-movies/国产电影/流浪地球.mkv
     :param local_library_root: 本地媒体库根目录，如 /video
     :param mount_prefix: Symedia 端的挂载前缀，如 /CloudNAS/123/video
