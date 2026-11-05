@@ -1,0 +1,15 @@
+{
+  "Pan123Pilot": {
+    "name": "123云盘助手",
+    "description": "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。",
+    "labels": "网盘,上传,秒传,清理",
+    "version": "1.0.0",
+    "icon": "cloud_upload.png",
+    "author": "Antigravity",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首次发布，支持 123 开放平台 Token 自动保活、SHA1 零流量秒传、断点续传、qBittorrent 状态标签联动与做种安全清理。"
+    }
+  }
+}
