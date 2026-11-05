@@ -63,53 +63,103 @@
 
 ---
 
-## ⚙️ 配置项详细说明
+## ⚙️ 配置项详细说明与使用指南
 
-在 MoviePilot 后台插件管理页面中，支持如下配置：
+在 MoviePilot 后台插件管理页面中，本插件提供清晰的分组配置表单：
 
 ### 1. 123 云盘开放平台凭证
-| 参数名 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `enabled` | `False` | 是否启用本插件。 |
-| `client_id` | 空 | 123 开放平台申请的应用 Client ID。 |
-| `client_secret` | 空 | 123 开放平台申请的应用 Client Secret。 |
-| `target_parent_file_id` | `0` | 上传到 123 云盘的目标目录 ID（`parentFileID`），根目录填 0。 |
+| 参数名 | 类型 | 默认值 | 说明与示例 |
+| :--- | :--- | :--- | :--- |
+| `enabled` | 开关 | `False` | 是否启用本插件。未勾选时插件处于休眠状态。 |
+| `client_id` | 文本 | 空 | 在 123 云盘开放平台申请的自建应用 `Client ID`。 |
+| `client_secret` | 密码 | 空 | 在 123 云盘开放平台申请的自建应用 `Client Secret`。 |
 
-### 2. 秒传与重试策略
-| 参数名 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `retry_interval` | `30` | 秒传未命中时的定时重试检查间隔（单位：分钟）。 |
-| `max_retry_count` | `10` | 秒传最大重试次数。 |
-| `enable_real_upload` | `True` | 达到最大重试次数后，是否启动真实分片本地上传兜底。 |
+### 2. 媒体库目录与多级级联设置
+| 参数名 | 类型 | 默认值 | 说明与示例 |
+| :--- | :--- | :--- | :--- |
+| `local_library_root` | 文本 | 空 | **本地媒体库根路径**。例如 `/video` 或 `/media`。用于裁剪文件的相对层级；若留空则所有文件直接扁平存入目标 ID。 |
+| `target_parent_file_id` | 文本 | `0` | **123 云盘根目录 ID**。对应上述本地根路径在 123 网盘的文件夹 ID（网盘根目录填 `0`；子文件夹可打开 123 网页端进入该目录，从浏览器 URL 中获取 `folderId`）。 |
+| `enable_path_cascade` | 开关 | `True` | **启用目录级联同步**。开启后，插件会在 123 网盘中 1:1 递归创建并维护完整的 Emby 影视目录树（如 `emby-movies/国产电影/流浪地球 (2019)`）。 |
+| `retry_interval` | 整数 | `30` | 秒传未命中时的定时重试检查间隔（单位：分钟）。系统会定期发起秒传校验，等待其他用户转存以触发零流量秒传。 |
+| `max_retry_count` | 整数 | `10` | 秒传最大重试次数。达到次数前绝不消耗本地家庭上行流量。 |
+| `enable_real_upload` | 开关 | `True` | **失败转真实分片上传**。达到最大重试次数后，自动切换为 123 云盘官方 V2 分片断点上传，确保影视最终必定入库。 |
 
 ### 3. qBittorrent 联动与标签设置
-| 参数名 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `qb_host` | 空 | qBittorrent WebUI 访问地址（留空则不联动或使用主程序默认下载器）。 |
-| `qb_username` | 空 | qBittorrent 登录用户名。 |
-| `qb_password` | 空 | qBittorrent 登录密码。 |
-| `tag_pending` | `123_待处理` | 加入处理队列时的种子标签。 |
-| `tag_uploading` | `123_上传中` | 处理与上传中的种子标签。 |
-| `tag_retrying` | `123_待重试` | 秒传重试队列中的种子标签。 |
-| `tag_failed` | `123_秒传失败` | 秒传失败时的种子标签。 |
-| `tag_completed` | `123_已上传` | 同步完成时的种子标签。 |
+| 参数名 | 类型 | 默认值 | 说明与示例 |
+| :--- | :--- | :--- | :--- |
+| `downloader_select` | 下拉 | `manual` | **选择已配置的 qBittorrent（推荐）**。插件动态检索 MoviePilot 系统中已绑定的 QB 下载器，直接点击即可自动复用 IP、端口与密码，无需手动填写。若选“手动自定义配置”则使用下方输入框。 |
+| `qb_host` | 文本 | 空 | qBittorrent WebUI 访问地址（如 `http://192.168.1.100:8080`），仅在手动模式生效。 |
+| `qb_username` | 文本 | 空 | qBittorrent 登录用户名，仅在手动模式生效。 |
+| `qb_password` | 密码 | 空 | qBittorrent 登录密码，仅在手动模式生效。 |
+| `tag_pending` | 文本 | `123_待处理` | 新任务录入时的种子标签。 |
+| `tag_uploading` | 文本 | `123_上传中` | 正在计算哈希或正在进行分片真实上传时的标签。 |
+| `tag_retrying` | 文本 | `123_待重试` | SHA1 秒传未命中、排队等待定时重试时的标签。 |
+| `tag_failed` | 文本 | `123_秒传失败` | 达到最大重试次数或上传异常时的标签。 |
+| `tag_completed` | 文本 | `123_已上传` | 123 云盘同步就绪（秒传成功或真实上传完成）时的标签。 |
 
-### 4. 做种达标自动清理 (H&R 规则)
-| 参数名 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `enable_auto_cleanup` | `False` | 是否开启做种达标后的自动清理。 |
-| `min_seed_time` | `48.0` | 种子最低做种时长（单位：小时）。 |
-| `min_seed_ratio` | `2.0` | 种子最低做种分享率（Ratio）。 |
-| `delete_torrent_file` | `True` | 清理时是否从 qBittorrent 中删除种子和源数据。 |
-| `delete_hardlink_file` | `True` | 清理时是否删除 MoviePilot 整理刮削的本地硬链接。 |
+### 4. Symedia Webhook 联动设置 (302 直链与 .strm 毫秒级生成)
+| 参数名 | 类型 | 默认值 | 说明与示例 |
+| :--- | :--- | :--- | :--- |
+| `symedia_enabled` | 开关 | `False` | 是否启用 Symedia Webhook 联动。 |
+| `symedia_url` | 文本 | 空 | Symedia 服务的根地址，如 `http://207.174.6.23:8095` 或内网 `http://192.168.1.50:8095`。 |
+| `symedia_mount_prefix`| 文本 | 空 | **Symedia 端挂载前缀**。例如 `/CloudNAS/123/video` 或 `/123云盘/video`。插件会将文件的相对路径与此前缀拼接为 `source_file`，精准对齐 Symedia 挂载点。 |
+| `symedia_auth` | 文本 | 空 | 请求 Authorization 凭据（选填）。若 Symedia 设置了鉴权，请填写如 `basic usernamepassword`。 |
 
-### 5. MoviePilot 系统消息通知
-| 参数名 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `notify_enabled` | `True` | 是否启用 MoviePilot 系统渠道消息推送。 |
-| `notify_on_upload` | `True` | 秒传或真实上传成功时发送通知。 |
-| `notify_on_cleanup` | `True` | 满足做种达标并完成自动清理后发送通知。 |
-| `notify_on_failed` | `True` | 同步失败或重试超限时发送报警通知。 |
+> 💡 **Symedia 联动说明**：本插件原生实现了 CloudDrive2 (CD2) 的 `file_notify` 事件协议。当文件在 123 云盘同步成功（秒传或真实上传）瞬间，插件立即组装符合规范的 JSON 发送给 Symedia，Symedia 收到后即刻增量生成对应影视的 `.strm` 文件，无需再开 CD2 进行耗时的全盘扫描。
+
+### 5. 做种达标自动清理 (H&R 规则)
+| 参数名 | 类型 | 默认值 | 说明与示例 |
+| :--- | :--- | :--- | :--- |
+| `enable_auto_cleanup` | 开关 | `False` | 是否开启做种达标后的自动清理。安全防护机制：**未上传完毕（未打上 123_已上传 标签）的任务绝对不会被清理**。 |
+| `min_seed_time` | 浮点 | `48.0` | 最低做种时间要求（小时）。例如设为 `48.0` 代表种子必须在下载器做种满 48 小时。 |
+| `min_seed_ratio` | 浮点 | `2.0` | 最低做种分享率要求。例如设为 `2.0` 代表分享率达到 2.0。两项条件需同时满足方可触发清理。 |
+| `delete_torrent_file` | 开关 | `True` | 达标清理时，是否从 qBittorrent 中删除种子以及原始下载数据文件。 |
+| `delete_hardlink_file`| 开关 | `True` | 达标清理时，是否删除本地影视库中整理刮削出的硬链接文件，并自动向上递归修剪空目录。 |
+
+### 6. MoviePilot 系统消息通知
+| 参数名 | 类型 | 默认值 | 说明与示例 |
+| :--- | :--- | :--- | :--- |
+| `notify_enabled` | 开关 | `True` | 是否启用 MoviePilot 系统渠道消息推送（微信、Telegram、Bark 等）。 |
+| `notify_on_upload` | 开关 | `True` | 秒传成功或真实上传完成时推送通知。 |
+| `notify_on_cleanup` | 开关 | `True` | 满足做种达标并完成自动清理后推送通知。 |
+| `notify_on_failed` | 开关 | `True` | 同步失败或重试超限时推送报警通知。 |
+
+---
+
+## 📖 【实战配置示例】端到端全自动直链闭环搭建
+
+以最常见的 Docker / NAS 环境为例，手把手教您如何配置各组件：
+
+### 场景设定
+- **本地影视硬链接库**：`/video`（对应容器内 `/video/emby-movies/国产电影/xxx.mkv`）
+- **123 云盘**：在 123 云盘根目录下新建了名为 `video` 的文件夹（其文件夹 ID 为 `14663228`）
+- **Symedia 挂载点**：Symedia 通过 CD2 或 CloudNAS 挂载 123 云盘，其路径为 `/CloudNAS/123/video`
+- **下载器**：MoviePilot 中已经添加了名称为 `QB-PT` 的下载器
+
+### 插件配置填写指引
+1. **凭证设置**：
+   - `Client ID` / `Client Secret`：填入 123 开放平台生成的字符串。
+2. **媒体库与级联设置**：
+   - `本地媒体库根路径`：填写 `/video`
+   - `123 云盘根目录 ID`：填写 `14663228`
+   - `启用目录级联同步`：**开启**
+3. **qBittorrent 设置**：
+   - `选择已配置的 qBittorrent`：下拉选中 `【系统下载器】QB-PT (...)`
+4. **Symedia 设置**：
+   - `启用 Symedia Webhook`：**开启**
+   - `Symedia 服务地址`：填写 `http://192.168.1.50:8095`（或外网地址）
+   - `Symedia 挂载前缀`：填写 `/CloudNAS/123/video`
+5. **做种清理**：
+   - `启用做种达标清理`：**开启**
+   - `最低做种时间`：`48`
+   - `最低分享率`：`2.0`
+
+### 自动化效果
+1. 当 MoviePilot 整理影片到 `/video/emby-movies/国产电影/流浪地球 (2019)/流浪地球 (2019).mkv`；
+2. 插件自动在 123 网盘的 `14663228` 目录下创建多级目录，并执行 SHA1 零流量秒传；
+3. 秒传完毕后，QB 种子标签自动变为 `123_已上传`；
+4. 插件向 Symedia 发送 Webhook，Symedia 为 `/CloudNAS/123/video/emby-movies/国产电影/流浪地球 (2019)/流浪地球 (2019).mkv` 瞬间生成 `.strm`，Emby 即可 302 秒开；
+5. 做种满 48 小时且分享率达到 2.0 后，插件自动删除 QB 种子与源文件，并释放本地硬链文件，不留任何残留垃圾！
 
 ---
 
