@@ -30,6 +30,7 @@ except ImportError:
         from app.sdk.events import EventType  # type: ignore
     except ImportError:
         class EventType:  # type: ignore
+            TransferComplete = "TransferComplete"
             TransferCompleted = "TransferCompleted"
             PluginAction = "PluginAction"
 
@@ -58,7 +59,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -698,8 +699,10 @@ class Pan123Pilot(_PluginBase):
         logger.info("Pan123Pilot 后台调度服务已安全停止")
 
 
-# 注册 MoviePilot 整理刮削完成事件监听
-@eventmanager.register(EventType.TransferCompleted)
+# 注册 MoviePilot 整理刮削完成事件监听（安全适配 TransferComplete / TransferCompleted）
+_transfer_event = getattr(EventType, "TransferComplete", getattr(EventType, "TransferCompleted", None))
+
+
 def pan123_on_transfer_completed(event: Any) -> None:
     """
     当 MoviePilot 刮削整理完成时，自动将新文件录入 123 云盘同步任务表
@@ -732,3 +735,10 @@ def pan123_on_transfer_completed(event: Any) -> None:
         logger.info(f"Pan123Pilot 已捕获新整理媒体文件: {filename} (任务ID: {task_id})")
     except Exception as e:
         logger.error(f"Pan123Pilot 录入同步任务失败: {e}")
+
+
+if _transfer_event and hasattr(eventmanager, "register"):
+    try:
+        pan123_on_transfer_completed = eventmanager.register(_transfer_event)(pan123_on_transfer_completed)
+    except Exception as e:
+        logger.warning(f"Pan123Pilot 注册 TransferComplete 事件监听失败: {e}")

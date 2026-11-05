@@ -1,0 +1,61 @@
+import os
+import sys
+import unittest
+
+plugins_v3_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../plugins.v3"))
+if plugins_v3_dir not in sys.path:
+    sys.path.insert(0, plugins_v3_dir)
+
+from pan123pilot import Pan123Pilot, pan123_on_transfer_completed
+
+
+class TestPluginLoader(unittest.TestCase):
+    def test_plugin_instantiation_and_lifecycle(self):
+        plugin = Pan123Pilot()
+        self.assertEqual(plugin.plugin_name, "123云盘助手")
+        self.assertFalse(plugin.get_state())
+
+        # Test init_plugin
+        config = {
+            "enabled": True,
+            "client_id": "test_id",
+            "client_secret": "test_secret",
+            "parent_file_id": 12345,
+            "max_retry_count": 5,
+        }
+        plugin.init_plugin(config)
+        self.assertTrue(plugin.get_state())
+
+        # Test get_api
+        apis = plugin.get_api()
+        self.assertTrue(len(apis) > 0)
+        for api in apis:
+            self.assertIn("path", api)
+            self.assertIn("endpoint", api)
+            self.assertEqual(api.get("auth"), "bear")
+
+        # Test get_form
+        fields, defaults = plugin.get_form()
+        self.assertTrue(len(fields) > 0)
+        self.assertIn("client_id", defaults)
+
+        # Test get_page
+        page = plugin.get_page()
+        self.assertTrue(len(page) > 0)
+
+        # Test stop_service
+        plugin.stop_service()
+        self.assertFalse(plugin.get_state())
+
+    def test_transfer_completed_handler(self):
+        class DummyEvent:
+            event_data = {
+                "target_path": "/tmp/non_existent_test_movie.mkv",
+                "torrent_hash": "abcdef123456",
+            }
+        # Calling handler should not raise exception
+        pan123_on_transfer_completed(DummyEvent())
+
+
+if __name__ == "__main__":
+    unittest.main()
