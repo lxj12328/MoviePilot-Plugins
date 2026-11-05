@@ -55,59 +55,131 @@ from .uploader import TaskScheduler
 
 def get_system_qbittorrents() -> list[dict[str, Any]]:
     """
-    动态检测并检索 MoviePilot 系统中已配置的 qBittorrent 下载器
+    动态检测并检索 MoviePilot 系统中已配置的 qBittorrent 下载器。
+    综合四级高可用检索机制：
+    1. 通过 system_config_oper / SystemConfigOper 查询 SystemConfigKey.Downloaders / 'Downloaders'
+    2. 通过 SQLAlchemy Engine 直接物理查询 SQLite systemconfig 表中的 'Downloaders'
+    3. 通过 ServiceConfigHelper 服务契约查询
+    4. 通过 DownloadChain 下载链实例检索
     """
     qb_list: list[dict[str, Any]] = []
-    # 方式一：从 app.db.oper.downloader 检索
-    try:
-        from app.db.oper.downloader import DownloaderOper
-        oper = DownloaderOper()
-        items = oper.list() if hasattr(oper, "list") else (oper.get_all() if hasattr(oper, "get_all") else [])
-        for item in (items or []):
-            dtype = str(getattr(item, "type", "") or getattr(item, "downloader_type", "")).lower()
-            if "qb" in dtype:
-                dl_id = str(getattr(item, "id", "") or getattr(item, "name", "qb"))
-                name = getattr(item, "name", "qBittorrent")
-                host = getattr(item, "host", "") or getattr(item, "url", "")
-                port = getattr(item, "port", None)
-                if host and port and ":" not in host.replace("http://", "").replace("https://", ""):
-                    host = f"{host}:{port}"
+    seen_hosts: set[str] = set()
+
+    def _parse_and_append(items: Any) -> None:
+        if not items:
+            return
+        if isinstance(items, str):
+            try:
+                import json
+                items = json.loads(items)
+            except Exception:
+                return
+
+        # 若为字典，转为其 values 列表
+        if isinstance(items, dict):
+            items = list(items.values())
+
+        if not isinstance(items, (list, tuple)):
+            items = [items]
+
+        for idx, item in enumerate(items):
+            if not item:
+                continue
+            # 支持 dict 或 Pydantic 对象
+            if hasattr(item, "model_dump"):
+                d = item.model_dump()
+            elif hasattr(item, "dict"):
+                d = item.dict()
+            elif isinstance(item, dict):
+                d = item
+            else:
+                d = getattr(item, "__dict__", {})
+
+            dtype = str(d.get("type") or d.get("downloader_type") or getattr(item, "type", "")).lower()
+            name = str(d.get("name") or getattr(item, "name", "") or f"qBittorrent-{idx+1}").strip()
+
+            # 筛选 qBittorrent 下载器
+            if "qb" not in dtype and "qbittorrent" not in dtype and "qb" not in name.lower():
+                continue
+
+            cfg = d.get("config") if isinstance(d.get("config"), dict) else {}
+            host = str(d.get("host") or cfg.get("host") or d.get("url") or cfg.get("url") or getattr(item, "host", "") or "").strip()
+            port = d.get("port") or cfg.get("port") or getattr(item, "port", None)
+            username = str(d.get("username") or cfg.get("username") or getattr(item, "username", "") or "").strip()
+            password = str(d.get("password") or cfg.get("password") or getattr(item, "password", "") or "").strip()
+            dl_id = str(d.get("id") or cfg.get("id") or getattr(item, "id", "") or name or f"qb_{idx+1}")
+
+            if host and port and ":" not in host.replace("http://", "").replace("https://", ""):
+                host = f"{host}:{port}"
+            if host and not host.startswith("http://") and not host.startswith("https://"):
+                host = f"http://{host}"
+
+            host_key = f"{host}_{username}"
+            if host and host_key not in seen_hosts:
+                seen_hosts.add(host_key)
                 qb_list.append({
                     "id": dl_id,
                     "name": name,
                     "host": host,
-                    "username": getattr(item, "username", "") or "",
-                    "password": getattr(item, "password", "") or "",
+                    "username": username,
+                    "password": password,
                 })
+
+    # 1. 尝试通过 system_config_oper / SystemConfigOper 获取 (MoviePilot V3 核心配置源)
+    try:
+        from app.db.systemconfig_oper import SystemConfigOper, system_config_oper
+        oper = system_config_oper or SystemConfigOper()
+        try:
+            from app.schemas.types import SystemConfigKey
+            raw = oper.get(SystemConfigKey.Downloaders)
+            _parse_and_append(raw)
+        except Exception:
+            pass
+        if not qb_list:
+            raw = oper.get("Downloaders") or oper.get("downloaders")
+            _parse_and_append(raw)
     except Exception:
         pass
 
-    # 方式二：从 app.chain.download 检索兜底
+    # 2. 尝试直接从系统 SQLite 数据库的 systemconfig 表查询（直接读取底层持久化表）
+    if not qb_list:
+        try:
+            from app.db import Engine
+            from sqlalchemy import text
+            if Engine is not None:
+                with Engine.connect() as conn:
+                    rows = conn.execute(
+                        text("SELECT value FROM systemconfig WHERE key = 'Downloaders' OR key = 'downloaders' OR LOWER(key) LIKE '%downloader%'")
+                    ).fetchall()
+                    for r in rows:
+                        if r and r[0]:
+                            _parse_and_append(r[0])
+        except Exception:
+            pass
+
+    # 3. 尝试通过 ServiceConfigHelper 查询
+    if not qb_list:
+        try:
+            from app.helper.service import ServiceConfigHelper
+            from app.schemas.types import SystemConfigKey
+            from app.schemas import DownloaderConf
+            items = ServiceConfigHelper.get_configs(SystemConfigKey.Downloaders, DownloaderConf)
+            _parse_and_append(items)
+        except Exception:
+            pass
+
+    # 4. 尝试通过 DownloadChain 查询
     if not qb_list:
         try:
             from app.chain.download import DownloadChain
             chain = DownloadChain()
             if hasattr(chain, "get_downloaders"):
-                downloaders = chain.get_downloaders() or []
-                for dl in downloaders:
-                    dtype = str(getattr(dl, "type", "")).lower()
-                    if "qb" in dtype:
-                        dl_id = str(getattr(dl, "id", "") or getattr(dl, "name", "qb"))
-                        name = getattr(dl, "name", "qBittorrent")
-                        host = getattr(dl, "host", "") or getattr(dl, "url", "")
-                        port = getattr(dl, "port", None)
-                        if host and port and ":" not in host.replace("http://", "").replace("https://", ""):
-                            host = f"{host}:{port}"
-                        qb_list.append({
-                            "id": dl_id,
-                            "name": name,
-                            "host": host,
-                            "username": getattr(dl, "username", "") or "",
-                            "password": getattr(dl, "password", "") or "",
-                        })
+                items = chain.get_downloaders()
+                _parse_and_append(items)
         except Exception:
             pass
 
+    logger.info(f"Pan123Pilot 动态扫描发现 MoviePilot 系统 qB 下载器数量: {len(qb_list)}")
     return qb_list
 
 
@@ -117,7 +189,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -209,7 +281,7 @@ class Pan123Pilot(_PluginBase):
         if self._downloader_select and self._downloader_select != "manual":
             sys_qbs = get_system_qbittorrents()
             for q in sys_qbs:
-                if q["id"] == self._downloader_select:
+                if q["id"] == self._downloader_select or q["name"] == self._downloader_select:
                     self._qb_host = q["host"]
                     self._qb_username = q["username"]
                     self._qb_password = q["password"]

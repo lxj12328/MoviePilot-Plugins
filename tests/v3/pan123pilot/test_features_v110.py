@@ -123,6 +123,37 @@ class TestFeaturesV110(unittest.TestCase):
         self.assertTrue(plugin._symedia_enabled)
         plugin.stop_service()
 
+    def test_get_system_qbittorrents_from_mock(self):
+        from pan123pilot import get_system_qbittorrents
+        # Mock sys.modules for app.db.systemconfig_oper
+        mock_oper = MagicMock()
+        mock_oper.get.return_value = [
+            {
+                "id": "dl_qb_01",
+                "name": "我的主QB",
+                "type": "qbittorrent",
+                "host": "192.168.1.120:8088",
+                "username": "admin",
+                "password": "mypassword",
+            },
+            {
+                "id": "dl_tr_02",
+                "name": "TR下载器",
+                "type": "transmission",
+                "host": "192.168.1.121:9091",
+            }
+        ]
+
+        with patch.dict(sys.modules, {
+            "app.db.systemconfig_oper": MagicMock(system_config_oper=mock_oper, SystemConfigOper=MagicMock(return_value=mock_oper)),
+        }):
+            qbs = get_system_qbittorrents()
+            self.assertEqual(len(qbs), 1)
+            self.assertEqual(qbs[0]["name"], "我的主QB")
+            self.assertEqual(qbs[0]["host"], "http://192.168.1.120:8088")
+            self.assertEqual(qbs[0]["username"], "admin")
+            self.assertEqual(qbs[0]["password"], "mypassword")
+
 
 if __name__ == "__main__":
     unittest.main()
