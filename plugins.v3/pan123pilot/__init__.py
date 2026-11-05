@@ -47,6 +47,13 @@ except ImportError:
                 return decorator
         eventmanager = EventManagerFallback()  # type: ignore
 
+try:
+    from apscheduler.triggers.interval import IntervalTrigger
+    from apscheduler.triggers.cron import CronTrigger
+except ImportError:
+    IntervalTrigger = None
+    CronTrigger = None
+
 from .client import Pan123Client
 from .models import Pan123TaskDatabase
 from .qb_helper import QBHelper
@@ -189,7 +196,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -380,39 +387,62 @@ class Pan123Pilot(_PluginBase):
         """注册周期性服务任务"""
         if not self._enabled:
             return []
+
+        interval_min = max(1, int(self._retry_interval or 30))
+        if IntervalTrigger:
+            retry_trigger = IntervalTrigger(minutes=interval_min)
+            cleanup_trigger = IntervalTrigger(hours=1)
+        elif CronTrigger:
+            cron_min = min(interval_min, 59)
+            retry_trigger = CronTrigger.from_crontab(f"*/{cron_min} * * * *")
+            cleanup_trigger = CronTrigger.from_crontab("0 * * * *")
+        else:
+            retry_trigger = "interval"
+            cleanup_trigger = "interval"
+
         return [
             {
                 "id": "pan123_retry_job",
                 "name": "123云盘秒传定时重试",
-                "trigger": "interval",
-                "minutes": self._retry_interval,
+                "trigger": retry_trigger,
                 "func": self._service_retry_tasks,
+                "kwargs": {},
             },
             {
                 "id": "pan123_cleanup_job",
                 "name": "123云盘做种达标安全清理",
-                "trigger": "interval",
-                "minutes": 60,
+                "trigger": cleanup_trigger,
                 "func": self._service_cleanup_tasks,
+                "kwargs": {},
             },
         ]
 
     def _service_retry_tasks(self) -> None:
         """定时重试服务绑定方法"""
-        if self.scheduler and self._enabled:
-            logger.info("Pan123Pilot 开始执行秒传任务定时重试...")
-            self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload)
+        if not self.scheduler or not self._enabled:
+            return
+        retrying_tasks = self.db_helper.list_tasks_by_status(statuses=["RETRYING"]) if self.db_helper else []
+        if not retrying_tasks:
+            logger.debug("Pan123Pilot 定时重试检查：当前无待重试任务")
+            return
+        logger.info(f"Pan123Pilot 开始执行秒传任务定时重试，当前待重试任务数: {len(retrying_tasks)}...")
+        self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload)
 
     def _service_cleanup_tasks(self) -> None:
         """定时做种达标清理绑定方法"""
-        if self.scheduler and self._enabled and self._enable_auto_cleanup:
-            logger.info("Pan123Pilot 开始执行做种达标检测与自动清理...")
-            self.scheduler.cleanup_completed_tasks(
-                min_seed_time_hours=self._min_seed_time,
-                min_ratio=self._min_seed_ratio,
-                delete_torrent_file=self._delete_torrent_file,
-                delete_hardlink_file=self._delete_hardlink_file,
-            )
+        if not self.scheduler or not self._enabled or not self._enable_auto_cleanup:
+            return
+        completed_tasks = self.db_helper.list_tasks_by_status(statuses=["COMPLETED"]) if self.db_helper else []
+        if not completed_tasks:
+            logger.debug("Pan123Pilot 定时做种清理检查：当前无已完成任务")
+            return
+        logger.info(f"Pan123Pilot 开始执行做种达标检测与自动清理，当前待检测任务数: {len(completed_tasks)}...")
+        self.scheduler.cleanup_completed_tasks(
+            min_seed_time_hours=self._min_seed_time,
+            min_ratio=self._min_seed_ratio,
+            delete_torrent_file=self._delete_torrent_file,
+            delete_hardlink_file=self._delete_hardlink_file,
+        )
 
     def get_api(self) -> list[dict[str, Any]]:
         """动态 API 路由注册"""

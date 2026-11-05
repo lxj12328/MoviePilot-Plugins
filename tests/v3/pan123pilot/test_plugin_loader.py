@@ -43,9 +43,25 @@ class TestPluginLoader(unittest.TestCase):
         page = plugin.get_page()
         self.assertTrue(len(page) > 0)
 
+        # Test get_service
+        services = plugin.get_service()
+        self.assertEqual(len(services), 2)
+        job_ids = [s["id"] for s in services]
+        self.assertIn("pan123_retry_job", job_ids)
+        self.assertIn("pan123_cleanup_job", job_ids)
+        for s in services:
+            self.assertIn("trigger", s)
+            self.assertIn("func", s)
+            self.assertIn("kwargs", s)
+
+        # Test silent execution when no tasks exist
+        plugin._service_retry_tasks()
+        plugin._service_cleanup_tasks()
+
         # Test stop_service
         plugin.stop_service()
         self.assertFalse(plugin.get_state())
+        self.assertEqual(plugin.get_service(), [])
 
     def test_transfer_completed_handler(self):
         class DummyEvent:
