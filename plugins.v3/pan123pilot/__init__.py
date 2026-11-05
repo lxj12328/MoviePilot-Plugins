@@ -7,33 +7,44 @@ import os
 from typing import Any, Optional
 
 try:
-    from app.sdk.events import Event, EventType, event_manager
-    from app.sdk.logging import logger
     from app.sdk.plugin import _PluginBase
 except ImportError:
-    # 宿主环境缺失时的独立单测兼容定义
     class _PluginBase:
         def __init__(self):
             pass
 
-    class EventType:
-        TransferCompleted = "TransferCompleted"
-
-    class EventManagerFallback:
-        def register(self, event_type):
-            def decorator(func):
-                return func
-            return decorator
-
-    event_manager = EventManagerFallback()  # type: ignore
-
+try:
+    from app.sdk.logging import logger
+except ImportError:
     class DummyLogger:
         def info(self, *args, **kwargs): pass
         def warning(self, *args, **kwargs): pass
         def error(self, *args, **kwargs): pass
         def debug(self, *args, **kwargs): pass
-
     logger = DummyLogger()  # type: ignore
+
+try:
+    from app.schemas.types import EventType
+except ImportError:
+    try:
+        from app.sdk.events import EventType  # type: ignore
+    except ImportError:
+        class EventType:  # type: ignore
+            TransferCompleted = "TransferCompleted"
+            PluginAction = "PluginAction"
+
+try:
+    from app.sdk.events import Event, eventmanager
+except ImportError:
+    try:
+        from app.sdk.events import Event, event_manager as eventmanager  # type: ignore
+    except ImportError:
+        class EventManagerFallback:
+            def register(self, *args, **kwargs):
+                def decorator(func):
+                    return func
+                return decorator
+        eventmanager = EventManagerFallback()  # type: ignore
 
 from .client import Pan123Client
 from .models import Pan123TaskDatabase
@@ -144,10 +155,9 @@ class Pan123Pilot(_PluginBase):
             self.scheduler.stop()
             self.scheduler = None
 
-        if not self._enabled:
-            return
-
-        # 2. 初始化核心依赖组件
+        # 2. 基础组件初始化（即使未启用也能安全响应页面与状态查询）
+        self.db_helper = Pan123TaskDatabase()
+        self.db_helper.ensure_table()
         self.client = Pan123Client(client_id=self._client_id, client_secret=self._client_secret)
         self.qb_helper = QBHelper(
             host=self._qb_host,
@@ -155,8 +165,9 @@ class Pan123Pilot(_PluginBase):
             username=self._qb_username,
             password=self._qb_password,
         )
-        self.db_helper = Pan123TaskDatabase()
-        self.db_helper.ensure_table()
+
+        if not self._enabled:
+            return
 
         tags_config = {
             "pending": self._tag_pending,
@@ -234,18 +245,21 @@ class Pan123Pilot(_PluginBase):
                 "path": "/tasks",
                 "endpoint": self._api_get_tasks,
                 "methods": ["GET"],
+                "auth": "bear",
                 "summary": "获取123云盘同步任务列表",
             },
             {
                 "path": "/trigger_retry",
                 "endpoint": self._api_trigger_retry,
                 "methods": ["POST"],
+                "auth": "bear",
                 "summary": "手动触发一次秒传重试",
             },
             {
                 "path": "/trigger_cleanup",
                 "endpoint": self._api_trigger_cleanup,
                 "methods": ["POST"],
+                "auth": "bear",
                 "summary": "手动触发一次做种清理检查",
             },
         ]
@@ -660,25 +674,18 @@ class Pan123Pilot(_PluginBase):
 
     def get_page(self) -> list[dict]:
         """返回插件详情页展示组件"""
+        status_text = "已启用 (后台调度运行中)" if self._enabled else "未启用 (请在配置表单中启用并填入凭据)"
         return [
             {
-                "component": "VCard",
-                "props": {"class": "mb-4 pa-4", "variant": "outlined"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {"class": "font-weight-bold"},
-                        "text": "123 云盘自动化同步状态",
-                    },
-                    {
-                        "component": "VCardText",
-                        "text": (
-                            "插件当前运行状态: "
-                            + ("已启用" if self._enabled else "已停用")
-                            + f" | 目标父目录ID: {self._parent_file_id} | 最大重试: {self._max_retry_count} 次"
-                        ),
-                    },
-                ],
+                "component": "VAlert",
+                "props": {
+                    "type": "info" if self._enabled else "warning",
+                    "variant": "tonal",
+                    "text": (
+                        f"123云盘助手运行状态: {status_text} | "
+                        f"目标父目录ID: {self._parent_file_id} | 最大重试: {self._max_retry_count} 次"
+                    ),
+                },
             }
         ]
 
@@ -692,7 +699,7 @@ class Pan123Pilot(_PluginBase):
 
 
 # 注册 MoviePilot 整理刮削完成事件监听
-@event_manager.register(EventType.TransferCompleted)
+@eventmanager.register(EventType.TransferCompleted)
 def pan123_on_transfer_completed(event: Any) -> None:
     """
     当 MoviePilot 刮削整理完成时，自动将新文件录入 123 云盘同步任务表

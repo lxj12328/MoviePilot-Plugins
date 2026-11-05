@@ -9,23 +9,24 @@ from typing import Any, Optional
 try:
     from sqlalchemy import BigInteger, DateTime, Integer, String, Text, select
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
-    from app.db import Base, Engine, db_query, db_update
 except ImportError:
-    # 宿主环境缺失时的独立单测兼容定义
-    class DeclarativeBaseFallback:
-        pass
-
     class DummyColType:
         def __init__(self, *args, **kwargs): pass
         def __call__(self, *args, **kwargs): return self
 
-    Base = DeclarativeBaseFallback  # type: ignore
-    Engine = None  # type: ignore
     Mapped = Any  # type: ignore
     mapped_column = lambda *args, **kwargs: None  # type: ignore
     Integer = String = BigInteger = DateTime = Text = DummyColType  # type: ignore
     select = lambda *args, **kwargs: None  # type: ignore
     Session = Any  # type: ignore
+
+try:
+    from app.db import Base, db_query, db_update
+except ImportError:
+    class DeclarativeBaseFallback:
+        pass
+
+    Base = DeclarativeBaseFallback  # type: ignore
     db_query = lambda func: func
     db_update = lambda func: func
 
@@ -62,11 +63,12 @@ class Pan123TaskDatabase:
     @staticmethod
     def ensure_table() -> None:
         """按需创建本插件的自有表"""
-        if Engine is not None and hasattr(Pan123Task, "__table__"):
-            try:
+        try:
+            from app.db import Engine
+            if hasattr(Pan123Task, "__table__") and Engine is not None:
                 Pan123Task.__table__.create(bind=Engine, checkfirst=True)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     @db_update
     def add_or_update_task(
