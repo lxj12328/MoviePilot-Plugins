@@ -4,8 +4,8 @@
     "description": "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。",
     "labels": "网盘,上传,秒传,清理",
     "version": "1.0.0",
-    "icon": "cloud_upload.png",
-    "author": "Antigravity",
+    "icon": "123pan.png",
+    "author": "lxj12328",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
