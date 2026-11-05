@@ -101,6 +101,7 @@ class TestTaskScheduler(unittest.TestCase):
                 sha1="dummy_sha1",
                 md5="dummy_md5",
                 file_id=99999,
+                parent_file_id=0,
                 error_msg="",
             )
             self.mock_qb.update_tags.assert_any_call("hash123", "123_已上传", self.scheduler.all_plugin_tags)

@@ -155,6 +155,78 @@ class Pan123Client:
         dir_id = int(res.get("data", {}).get("dirID") or 0)
         return True, dir_id, "创建成功"
 
+    def list_files(self, parent_file_id: int = 0, limit: int = 100) -> Tuple[bool, list, str]:
+        """
+        获取文件与目录列表
+        :return: (success, file_list, message)
+        """
+        url = f"{self.API_BASE}/api/v2/file/list?parentFileId={int(parent_file_id)}&limit={int(limit)}"
+        req = urllib.request.Request(url, headers=self._auth_headers(), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return False, [], f"获取文件列表网络异常: {e}"
+
+        if res.get("code") != 0:
+            return False, [], f"获取文件列表失败 [{res.get('code')}]: {res.get('message')}"
+
+        file_list = res.get("data", {}).get("fileList") or []
+        return True, file_list, "获取成功"
+
+    def get_or_create_dir_by_path(
+        self,
+        root_parent_id: int,
+        relative_dir_path: str,
+    ) -> Tuple[bool, int, str]:
+        """
+        多级目录递归获取或创建，附带内存缓存
+        :param root_parent_id: 123云盘根目录ID（如挂载点 /video 对应的 ID）
+        :param relative_dir_path: 相对目录层级（如 "emby-movies/国产电影/流浪地球 (2019)"）
+        :return: (success, final_dir_id, message)
+        """
+        if not relative_dir_path or relative_dir_path in (".", "/", "\\"):
+            return True, int(root_parent_id), "根目录"
+
+        if not hasattr(self, "_dir_cache"):
+            self._dir_cache = {}
+
+        parts = [p.strip() for p in relative_dir_path.replace("\\", "/").split("/") if p.strip() and p.strip() != "."]
+        if not parts:
+            return True, int(root_parent_id), "根目录"
+
+        curr_parent_id = int(root_parent_id)
+        for part in parts:
+            cache_key = (curr_parent_id, part)
+            if cache_key in self._dir_cache:
+                curr_parent_id = self._dir_cache[cache_key]
+                continue
+
+            # 尝试直接创建目录
+            ok, dir_id, msg = self.mkdir(part, curr_parent_id)
+            if ok and dir_id > 0:
+                self._dir_cache[cache_key] = dir_id
+                curr_parent_id = dir_id
+                continue
+
+            # 若创建失败（可能同名目录已存在），通过列表查询现有目录
+            list_ok, file_list, _ = self.list_files(curr_parent_id, limit=100)
+            found_id = None
+            if list_ok:
+                for item in file_list:
+                    # type 1 代表目录，trashed 0 代表非回收站
+                    if item.get("type") == 1 and item.get("filename") == part and not item.get("trashed"):
+                        found_id = int(item.get("fileId") or 0)
+                        break
+
+            if found_id and found_id > 0:
+                self._dir_cache[cache_key] = found_id
+                curr_parent_id = found_id
+            else:
+                return False, curr_parent_id, f"创建或定位子目录【{part}】失败: {msg}"
+
+        return True, curr_parent_id, "定位成功"
+
     def upload_file_v2(
         self,
         filepath: str,

@@ -124,6 +124,7 @@ class Pan123TaskDatabase:
         sha1: Optional[str] = None,
         md5: Optional[str] = None,
         file_id: Optional[int] = None,
+        parent_file_id: Optional[int] = None,
         retry_increment: bool = False,
         error_msg: Optional[str] = None,
     ) -> bool:
@@ -140,6 +141,8 @@ class Pan123TaskDatabase:
             task.md5 = md5
         if file_id is not None:
             task.file_id = file_id
+        if parent_file_id is not None:
+            task.parent_file_id = parent_file_id
         if retry_increment:
             task.retry_count += 1
         if error_msg is not None:

@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from .client import Pan123Client
 from .models import Pan123TaskDatabase
 from .qb_helper import QBHelper
+from .symedia import send_symedia_file_notify
 
 
 class TaskScheduler:
@@ -26,6 +27,10 @@ class TaskScheduler:
         tags_config: dict,
         notify_callback: Optional[Callable[[str, str], None]] = None,
         notify_config: Optional[dict] = None,
+        target_parent_file_id: int = 0,
+        local_library_root: str = "",
+        enable_path_cascade: bool = True,
+        symedia_config: Optional[dict] = None,
     ):
         self.client = client
         self.qb = qb_helper
@@ -33,6 +38,10 @@ class TaskScheduler:
         self.tags = tags_config
         self.notify_callback = notify_callback
         self.notify_config = notify_config or {}
+        self.target_parent_file_id = int(target_parent_file_id or 0)
+        self.local_library_root = (local_library_root or "").strip()
+        self.enable_path_cascade = bool(enable_path_cascade)
+        self.symedia_config = symedia_config or {}
 
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -45,6 +54,48 @@ class TaskScheduler:
             tags_config.get("failed", "123_秒传失败"),
             tags_config.get("completed", "123_已上传"),
         ]
+
+    def resolve_target_parent_id(self, target_path: str) -> int:
+        """
+        根据本地路径、媒体库根路径及级联配置，递归计算最终对应的 123 云盘父目录 ID
+        """
+        root_id = int(self.target_parent_file_id or 0)
+        if not self.enable_path_cascade or not self.local_library_root:
+            return root_id
+
+        norm_root = os.path.normpath(self.local_library_root)
+        file_dir = os.path.dirname(os.path.normpath(target_path))
+        if file_dir.startswith(norm_root):
+            rel_dir = os.path.relpath(file_dir, norm_root)
+            if rel_dir and rel_dir not in (".", "/", "\\"):
+                ok, dir_id, _ = self.client.get_or_create_dir_by_path(
+                    root_parent_id=root_id,
+                    relative_dir_path=rel_dir,
+                )
+                if ok and dir_id > 0:
+                    return dir_id
+        return root_id
+
+    def _trigger_symedia_notify(self, target_path: str, action: str = "create") -> None:
+        """若启用了 Symedia 联动，发送 Webhook 通知即时生成或清理 strm"""
+        if not self.symedia_config or not self.symedia_config.get("enabled"):
+            return
+        server_url = self.symedia_config.get("url", "")
+        if not server_url:
+            return
+        try:
+            send_symedia_file_notify(
+                server_url=server_url,
+                target_path=target_path,
+                local_library_root=self.local_library_root,
+                mount_prefix=self.symedia_config.get("mount_prefix", ""),
+                auth_header=self.symedia_config.get("auth", ""),
+                action=action,
+                device_name=self.symedia_config.get("device_name", "MoviePilot-Pan123"),
+                user_name=self.symedia_config.get("user_name", "admin"),
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def format_size(size_bytes: int) -> str:
@@ -149,9 +200,9 @@ class TaskScheduler:
                     self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
                     continue
 
-            # 3. 尝试 SHA1 秒传
+            # 3. 尝试 SHA1 秒传（先计算或级联解析父目录 ID）
             filename = os.path.basename(target_path)
-            parent_id = task.get("parent_file_id", 0)
+            parent_id = self.resolve_target_parent_id(target_path)
 
             reuse, file_id, msg = self.client.sha1_reuse(
                 filename=filename,
@@ -168,9 +219,11 @@ class TaskScheduler:
                     sha1=sha1_str,
                     md5=md5_str,
                     file_id=file_id,
+                    parent_file_id=parent_id,
                     error_msg="",
                 )
                 self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+                self._trigger_symedia_notify(target_path, action="create")
                 self._notify(
                     "upload",
                     "123云盘秒传成功",
@@ -225,7 +278,8 @@ class TaskScheduler:
             )
             return
 
-        # 启动真实分片上传
+        # 启动真实分片上传（先计算或级联解析父目录 ID）
+        parent_id = self.resolve_target_parent_id(target_path)
         self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"))
         ok, file_id, err = self.client.upload_file_v2(
             filepath=target_path,
@@ -240,9 +294,11 @@ class TaskScheduler:
                 sha1=sha1_str,
                 md5=md5_str,
                 file_id=file_id,
+                parent_file_id=parent_id,
                 error_msg="分片真实上传完成",
             )
             self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+            self._trigger_symedia_notify(target_path, action="create")
             self._notify(
                 "upload",
                 "123云盘上传成功",
@@ -281,6 +337,7 @@ class TaskScheduler:
             if not sha1_str:
                 continue
 
+            parent_id = self.resolve_target_parent_id(target_path)
             reuse, file_id, _ = self.client.sha1_reuse(
                 filename=filename,
                 sha1_str=sha1_str,
@@ -293,9 +350,11 @@ class TaskScheduler:
                     task_id=task_id,
                     status="COMPLETED",
                     file_id=file_id,
+                    parent_file_id=parent_id,
                     error_msg="重试期间成功命中秒传",
                 )
                 self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+                self._trigger_symedia_notify(target_path, action="create")
                 self._notify(
                     "upload",
                     "123云盘秒传成功 (重试命中)",
@@ -355,14 +414,21 @@ class TaskScheduler:
                 except Exception:
                     pass
 
-            # 3. 清理本地硬链接文件
+            # 3. 清理本地硬链接文件并递归修剪空目录
             if delete_hardlink_file and target_path and os.path.exists(target_path):
                 try:
                     os.remove(target_path)
-                    # 尝试清理可能遗留的空父目录
+                    # 向上递归清理各级空父目录（直至媒体库根目录或遇到非空目录）
                     parent_dir = os.path.dirname(target_path)
-                    if os.path.exists(parent_dir) and not os.listdir(parent_dir):
-                        os.rmdir(parent_dir)
+                    norm_root = os.path.normpath(self.local_library_root) if self.local_library_root else None
+                    while parent_dir and os.path.exists(parent_dir):
+                        if norm_root and os.path.abspath(parent_dir) == os.path.abspath(norm_root):
+                            break
+                        if not os.listdir(parent_dir):
+                            os.rmdir(parent_dir)
+                            parent_dir = os.path.dirname(parent_dir)
+                        else:
+                            break
                 except Exception:
                     pass
 

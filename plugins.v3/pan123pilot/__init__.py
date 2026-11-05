@@ -53,13 +53,71 @@ from .qb_helper import QBHelper
 from .uploader import TaskScheduler
 
 
+def get_system_qbittorrents() -> list[dict[str, Any]]:
+    """
+    动态检测并检索 MoviePilot 系统中已配置的 qBittorrent 下载器
+    """
+    qb_list: list[dict[str, Any]] = []
+    # 方式一：从 app.db.oper.downloader 检索
+    try:
+        from app.db.oper.downloader import DownloaderOper
+        oper = DownloaderOper()
+        items = oper.list() if hasattr(oper, "list") else (oper.get_all() if hasattr(oper, "get_all") else [])
+        for item in (items or []):
+            dtype = str(getattr(item, "type", "") or getattr(item, "downloader_type", "")).lower()
+            if "qb" in dtype:
+                dl_id = str(getattr(item, "id", "") or getattr(item, "name", "qb"))
+                name = getattr(item, "name", "qBittorrent")
+                host = getattr(item, "host", "") or getattr(item, "url", "")
+                port = getattr(item, "port", None)
+                if host and port and ":" not in host.replace("http://", "").replace("https://", ""):
+                    host = f"{host}:{port}"
+                qb_list.append({
+                    "id": dl_id,
+                    "name": name,
+                    "host": host,
+                    "username": getattr(item, "username", "") or "",
+                    "password": getattr(item, "password", "") or "",
+                })
+    except Exception:
+        pass
+
+    # 方式二：从 app.chain.download 检索兜底
+    if not qb_list:
+        try:
+            from app.chain.download import DownloadChain
+            chain = DownloadChain()
+            if hasattr(chain, "get_downloaders"):
+                downloaders = chain.get_downloaders() or []
+                for dl in downloaders:
+                    dtype = str(getattr(dl, "type", "")).lower()
+                    if "qb" in dtype:
+                        dl_id = str(getattr(dl, "id", "") or getattr(dl, "name", "qb"))
+                        name = getattr(dl, "name", "qBittorrent")
+                        host = getattr(dl, "host", "") or getattr(dl, "url", "")
+                        port = getattr(dl, "port", None)
+                        if host and port and ":" not in host.replace("http://", "").replace("https://", ""):
+                            host = f"{host}:{port}"
+                        qb_list.append({
+                            "id": dl_id,
+                            "name": name,
+                            "host": host,
+                            "username": getattr(dl, "username", "") or "",
+                            "password": getattr(dl, "password", "") or "",
+                        })
+        except Exception:
+            pass
+
+    return qb_list
+
+
 class Pan123Pilot(_PluginBase):
     """123云盘自动化秒传与做种清理插件主类"""
 
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -70,10 +128,13 @@ class Pan123Pilot(_PluginBase):
     _client_id: str = ""
     _client_secret: str = ""
     _parent_file_id: int = 0
+    _local_library_root: str = ""
+    _enable_path_cascade: bool = True
     _retry_interval: int = 30
     _max_retry_count: int = 10
     _enable_real_upload: bool = True
 
+    _downloader_select: str = "manual"
     _qb_host: str = ""
     _qb_port: Optional[int] = None
     _qb_username: str = ""
@@ -84,6 +145,13 @@ class Pan123Pilot(_PluginBase):
     _tag_retrying: str = "123_待重试"
     _tag_failed: str = "123_秒传失败"
     _tag_completed: str = "123_已上传"
+
+    _symedia_enabled: bool = False
+    _symedia_url: str = ""
+    _symedia_auth: str = ""
+    _symedia_mount_prefix: str = ""
+    _symedia_device_name: str = "MoviePilot-Pan123"
+    _symedia_user_name: str = "admin"
 
     _enable_auto_cleanup: bool = False
     _min_seed_time: float = 48.0
@@ -124,21 +192,43 @@ class Pan123Pilot(_PluginBase):
         self._client_id = str(config.get("client_id") or "").strip()
         self._client_secret = str(config.get("client_secret") or "").strip()
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
+        self._local_library_root = str(config.get("local_library_root") or "").strip()
+        self._enable_path_cascade = bool(config.get("enable_path_cascade", True))
         self._retry_interval = int(config.get("retry_interval") or 30)
         self._max_retry_count = int(config.get("max_retry_count") or 10)
         self._enable_real_upload = bool(config.get("enable_real_upload", True))
 
+        self._downloader_select = str(config.get("downloader_select") or "manual").strip()
         self._qb_host = str(config.get("qb_host") or "").strip()
         qb_port_raw = config.get("qb_port")
         self._qb_port = int(qb_port_raw) if qb_port_raw else None
         self._qb_username = str(config.get("qb_username") or "").strip()
         self._qb_password = str(config.get("qb_password") or "").strip()
 
+        # 若选择使用系统 QB 下载器，自动复用系统凭据
+        if self._downloader_select and self._downloader_select != "manual":
+            sys_qbs = get_system_qbittorrents()
+            for q in sys_qbs:
+                if q["id"] == self._downloader_select:
+                    self._qb_host = q["host"]
+                    self._qb_username = q["username"]
+                    self._qb_password = q["password"]
+                    self._qb_port = None
+                    logger.info(f"Pan123Pilot 已自动绑定 MoviePilot 系统下载器: {q['name']} ({self._qb_host})")
+                    break
+
         self._tag_pending = str(config.get("tag_pending") or "123_待处理").strip()
         self._tag_uploading = str(config.get("tag_uploading") or "123_上传中").strip()
         self._tag_retrying = str(config.get("tag_retrying") or "123_待重试").strip()
         self._tag_failed = str(config.get("tag_failed") or "123_秒传失败").strip()
         self._tag_completed = str(config.get("tag_completed") or "123_已上传").strip()
+
+        self._symedia_enabled = bool(config.get("symedia_enabled", False))
+        self._symedia_url = str(config.get("symedia_url") or "").strip()
+        self._symedia_auth = str(config.get("symedia_auth") or "").strip()
+        self._symedia_mount_prefix = str(config.get("symedia_mount_prefix") or "").strip()
+        self._symedia_device_name = str(config.get("symedia_device_name") or "MoviePilot-Pan123").strip()
+        self._symedia_user_name = str(config.get("symedia_user_name") or "admin").strip()
 
         self._enable_auto_cleanup = bool(config.get("enable_auto_cleanup", False))
         self._min_seed_time = float(config.get("min_seed_time") or 48.0)
@@ -185,6 +275,15 @@ class Pan123Pilot(_PluginBase):
             "notify_failed": self._notify_on_failed,
         }
 
+        symedia_config = {
+            "enabled": self._symedia_enabled,
+            "url": self._symedia_url,
+            "auth": self._symedia_auth,
+            "mount_prefix": self._symedia_mount_prefix,
+            "device_name": self._symedia_device_name,
+            "user_name": self._symedia_user_name,
+        }
+
         # 3. 启动任务调度器
         self.scheduler = TaskScheduler(
             client=self.client,
@@ -193,6 +292,10 @@ class Pan123Pilot(_PluginBase):
             tags_config=tags_config,
             notify_callback=self.notify,
             notify_config=notify_config,
+            target_parent_file_id=self._parent_file_id,
+            local_library_root=self._local_library_root,
+            enable_path_cascade=self._enable_path_cascade,
+            symedia_config=symedia_config,
         )
         self.scheduler.start()
         logger.info("Pan123Pilot (123云盘助手) 初始化完成并已启动后台调度")
@@ -279,6 +382,13 @@ class Pan123Pilot(_PluginBase):
 
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         """Vuetify 配置表单及默认模型"""
+        sys_qbs = get_system_qbittorrents()
+        downloader_options = [
+            {"title": f"【系统下载器】{q['name']} ({q['host']})", "value": q["id"]}
+            for q in sys_qbs
+        ]
+        downloader_options.append({"title": "手动自定义配置 (手动填写 IP 与凭据)", "value": "manual"})
+
         form = [
             {
                 "component": "VForm",
@@ -339,21 +449,6 @@ class Pan123Pilot(_PluginBase):
                                     }
                                 ],
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "target_parent_file_id",
-                                            "label": "目标目录 ID (parentFileID)",
-                                            "hint": "上传至 123 网盘的目标文件夹 ID，根目录请填 0",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
                         ],
                     },
                     {
@@ -363,11 +458,54 @@ class Pan123Pilot(_PluginBase):
                     {
                         "component": "VCardTitle",
                         "props": {"class": "text-subtitle-1 font-weight-bold"},
-                        "text": "秒传与重试策略",
+                        "text": "媒体库目录与多级级联设置",
                     },
                     {
                         "component": "VRow",
                         "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 5},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "local_library_root",
+                                            "label": "本地媒体库根路径",
+                                            "hint": "如 /video 或 /media，用于计算影视相对层级，留空则直传目标ID",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "target_parent_file_id",
+                                            "label": "123 云盘根目录 ID",
+                                            "hint": "对应本地根路径的云盘文件夹 ID，根目录请填 0",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enable_path_cascade",
+                                            "label": "启用目录级联同步",
+                                        },
+                                    }
+                                ],
+                            },
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
@@ -402,7 +540,7 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "enable_real_upload",
-                                            "label": "重试超限后允许真实上传",
+                                            "label": "重试超限后允许真实分片上传",
                                         },
                                     }
                                 ],
@@ -423,13 +561,27 @@ class Pan123Pilot(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 12},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "downloader_select",
+                                            "label": "选择已配置的 qBittorrent（自动复用凭证免输密码）",
+                                            "items": downloader_options,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "qb_host",
-                                            "label": "QB 访问地址",
+                                            "label": "QB 访问地址 (手动模式生效)",
                                             "placeholder": "http://127.0.0.1:8080",
                                         },
                                     }
@@ -441,7 +593,7 @@ class Pan123Pilot(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VTextField",
-                                        "props": {"model": "qb_username", "label": "QB 用户名"},
+                                        "props": {"model": "qb_username", "label": "QB 用户名 (手动模式)"},
                                     }
                                 ],
                             },
@@ -453,7 +605,7 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "qb_password",
-                                            "label": "QB 密码",
+                                            "label": "QB 密码 (手动模式)",
                                             "type": "password",
                                         },
                                     }
@@ -492,6 +644,77 @@ class Pan123Pilot(_PluginBase):
                                 "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {"component": "VTextField", "props": {"model": "tag_completed", "label": "已上传标签"}}
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VDivider",
+                        "props": {"class": "my-3"},
+                    },
+                    {
+                        "component": "VCardTitle",
+                        "props": {"class": "text-subtitle-1 font-weight-bold"},
+                        "text": "Symedia Webhook 联动 (302直链播放与strm秒级生成)",
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "symedia_enabled",
+                                            "label": "启用 Symedia Webhook",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 5},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "symedia_url",
+                                            "label": "Symedia 服务地址",
+                                            "placeholder": "http://207.174.6.23:8095",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "symedia_mount_prefix",
+                                            "label": "Symedia 挂载前缀",
+                                            "placeholder": "/CloudNAS/123/video",
+                                            "hint": "合成发送给 Symedia 的 source_file 路径前缀",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "symedia_auth",
+                                            "label": "Authorization 请求头 (选填)",
+                                            "placeholder": "basic usernamepassword",
+                                        },
+                                    }
                                 ],
                             },
                         ],
@@ -650,9 +873,12 @@ class Pan123Pilot(_PluginBase):
             "client_id": "",
             "client_secret": "",
             "target_parent_file_id": 0,
+            "local_library_root": "",
+            "enable_path_cascade": True,
             "retry_interval": 30,
             "max_retry_count": 10,
             "enable_real_upload": True,
+            "downloader_select": "manual",
             "qb_host": "",
             "qb_username": "",
             "qb_password": "",
@@ -661,6 +887,12 @@ class Pan123Pilot(_PluginBase):
             "tag_retrying": "123_待重试",
             "tag_failed": "123_秒传失败",
             "tag_completed": "123_已上传",
+            "symedia_enabled": False,
+            "symedia_url": "",
+            "symedia_auth": "",
+            "symedia_mount_prefix": "",
+            "symedia_device_name": "MoviePilot-Pan123",
+            "symedia_user_name": "admin",
             "enable_auto_cleanup": False,
             "min_seed_time": 48.0,
             "min_seed_ratio": 2.0,
@@ -676,6 +908,9 @@ class Pan123Pilot(_PluginBase):
     def get_page(self) -> list[dict]:
         """返回插件详情页展示组件"""
         status_text = "已启用 (后台调度运行中)" if self._enabled else "未启用 (请在配置表单中启用并填入凭据)"
+        cascade_text = "开启" if self._enable_path_cascade else "关闭"
+        symedia_text = "已启用" if self._symedia_enabled else "未启用"
+        dl_text = "手动模式" if self._downloader_select == "manual" else f"系统下载器 ({self._qb_host or '已绑定'})"
         return [
             {
                 "component": "VAlert",
@@ -684,7 +919,8 @@ class Pan123Pilot(_PluginBase):
                     "variant": "tonal",
                     "text": (
                         f"123云盘助手运行状态: {status_text} | "
-                        f"目标父目录ID: {self._parent_file_id} | 最大重试: {self._max_retry_count} 次"
+                        f"目录级联: {cascade_text} (根: {self._local_library_root or '未指定'} -> ID: {self._parent_file_id}) | "
+                        f"下载器: {dl_text} | Symedia 联动: {symedia_text}"
                     ),
                 },
             }
