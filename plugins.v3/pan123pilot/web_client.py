@@ -21,7 +21,8 @@ except ImportError:
 class Pan123WebClient:
     """123云盘 Web/App 协议客户端"""
 
-    WEB_BASE_URL = "https://www.123pan.com"
+    WEB_BASE_URL = "https://www.123684.com"
+    BACKUP_BASE_URL = "https://yun.123pan.com"
     USER_API_URL = "https://user.123pan.cn"
 
     DEFAULT_USER_AGENT = (
@@ -70,12 +71,14 @@ class Pan123WebClient:
     def _get_headers(self, with_auth: bool = True, extra_headers: Optional[dict] = None) -> dict[str, str]:
         """构造 Web 端标准请求头"""
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
             "Platform": "web",
             "App-Version": "3",
             "User-Agent": self.DEFAULT_USER_AGENT,
-            "Origin": self.WEB_BASE_URL,
-            "Referer": f"{self.WEB_BASE_URL}/",
+            "Origin": "https://www.123pan.com",
+            "Referer": "https://www.123pan.com/",
+            "Connection": "keep-alive",
         }
         if with_auth and self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -87,53 +90,77 @@ class Pan123WebClient:
         self,
         url: str,
         with_auth: bool = True,
-        timeout: int = 15,
+        timeout: int = 30,
         extra_headers: Optional[dict] = None,
+        max_retries: int = 2,
     ) -> tuple[bool, dict, str]:
-        """统一 HTTP GET 请求方法"""
+        """统一 HTTP GET 请求方法，支持 SSL 上下文与超时自动重试"""
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
         headers = self._get_headers(with_auth=with_auth, extra_headers=extra_headers)
-        try:
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                res_json = json.loads(raw)
-                return True, res_json, "ok"
-        except urllib.error.HTTPError as e:
+        last_err = "未知错误"
+        for attempt in range(max_retries + 1):
             try:
-                err_raw = e.read().decode("utf-8")
-                err_json = json.loads(err_raw)
-                return False, err_json, f"HTTP {e.code}: {err_json.get('message', e.reason)}"
-            except Exception:
-                return False, {}, f"HTTP {e.code}: {e.reason}"
-        except Exception as e:
-            return False, {}, str(e)
+                req = urllib.request.Request(url, headers=headers, method="GET")
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    raw = resp.read().decode("utf-8")
+                    res_json = json.loads(raw)
+                    return True, res_json, "ok"
+            except urllib.error.HTTPError as e:
+                try:
+                    err_raw = e.read().decode("utf-8")
+                    err_json = json.loads(err_raw)
+                    return False, err_json, f"HTTP {e.code}: {err_json.get('message', e.reason)}"
+                except Exception:
+                    return False, {}, f"HTTP {e.code}: {e.reason}"
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue
+        return False, {}, last_err
 
     def _http_post(
         self,
         url: str,
         data: dict,
         with_auth: bool = True,
-        timeout: int = 15,
+        timeout: int = 30,
         extra_headers: Optional[dict] = None,
+        max_retries: int = 2,
     ) -> tuple[bool, dict, str]:
-        """统一 HTTP POST 请求方法"""
+        """统一 HTTP POST 请求方法，支持 SSL 上下文与超时自动重试"""
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
         headers = self._get_headers(with_auth=with_auth, extra_headers=extra_headers)
-        try:
-            body_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                res_json = json.loads(raw)
-                return True, res_json, "ok"
-        except urllib.error.HTTPError as e:
+        last_err = "未知错误"
+        for attempt in range(max_retries + 1):
             try:
-                err_raw = e.read().decode("utf-8")
-                err_json = json.loads(err_raw)
-                return False, err_json, f"HTTP {e.code}: {err_json.get('message', e.reason)}"
-            except Exception:
-                return False, {}, f"HTTP {e.code}: {e.reason}"
-        except Exception as e:
-            return False, {}, str(e)
+                body_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    raw = resp.read().decode("utf-8")
+                    res_json = json.loads(raw)
+                    return True, res_json, "ok"
+            except urllib.error.HTTPError as e:
+                try:
+                    err_raw = e.read().decode("utf-8")
+                    err_json = json.loads(err_raw)
+                    return False, err_json, f"HTTP {e.code}: {err_json.get('message', e.reason)}"
+                except Exception:
+                    return False, {}, f"HTTP {e.code}: {e.reason}"
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_retries:
+                    time.sleep(1)
+                    continue
+        return False, {}, last_err
 
     def check_token_validity(self) -> bool:
         """检查当前 Token 是否有效 (支持 user/info 探活与列表双重校验)"""
@@ -244,7 +271,6 @@ class Pan123WebClient:
         if not ok_auth:
             return False, None, auth_msg
 
-        url = f"{self.WEB_BASE_URL}/b/api/file/upload_request"
         # 123 Web 端使用 etag (文件 MD5) 进行秒传识别
         etag = (md5_str or sha1_str or "").lower()
         payload = {
@@ -256,36 +282,46 @@ class Pan123WebClient:
             "duplicate": 1,
         }
 
-        ok, res, msg = self._http_post(url, payload, with_auth=True)
-        if not ok:
-            if "401" in msg or "Token" in msg or "token" in msg:
+        candidate_urls = [
+            f"{self.WEB_BASE_URL}/b/api/file/upload_request",
+            f"{self.BACKUP_BASE_URL}/b/api/file/upload_request",
+        ]
+
+        last_fail_msg = "未知错误"
+        for url in candidate_urls:
+            ok, res, msg = self._http_post(url, payload, with_auth=True)
+            if not ok:
+                if "401" in msg or "Token" in msg or "token" in msg:
+                    self._last_token_check = 0.0
+                    if self.auth_mode == "web_account" and self.username and self.password:
+                        ok_relogin, _ = self.login_by_password()
+                        if ok_relogin:
+                            return self.sha1_reuse(filename, sha1_str, size, parent_file_id, md5_str)
+                    return False, None, f"TOKEN_EXPIRED: 123云盘 Web Token 已过期 ({msg})，请在插件配置中更新 authorToken"
+                last_fail_msg = msg
+                continue
+
+            code = res.get("code")
+            if code == 0:
+                data = res.get("data") or {}
+                reuse = bool(data.get("reuse") or data.get("Reuse"))
+                file_id = data.get("fileId") or data.get("FileId")
+                if reuse:
+                    return True, int(file_id or 0), "秒传命中成功"
+                else:
+                    return False, None, "云端未命中秒传特征"
+            elif code in (401, 20101):
+                # Token 偶发失效或未登录
                 self._last_token_check = 0.0
                 if self.auth_mode == "web_account" and self.username and self.password:
                     ok_relogin, _ = self.login_by_password()
                     if ok_relogin:
                         return self.sha1_reuse(filename, sha1_str, size, parent_file_id, md5_str)
-                return False, None, f"TOKEN_EXPIRED: 123云盘 Web Token 已过期 ({msg})，请在插件配置中更新 authorToken"
-            return False, None, f"请求秒传接口失败: {msg}"
-
-        code = res.get("code")
-        if code == 0:
-            data = res.get("data") or {}
-            reuse = bool(data.get("reuse") or data.get("Reuse"))
-            file_id = data.get("fileId") or data.get("FileId")
-            if reuse:
-                return True, int(file_id or 0), "秒传命中成功"
+                return False, None, "TOKEN_EXPIRED: 123云盘 Web Token 已过期，请在插件配置中更新 authorToken"
             else:
-                return False, None, "云端未命中秒传特征"
-        elif code == 401:
-            # Token 偶发失效
-            self._last_token_check = 0.0
-            if self.auth_mode == "web_account" and self.username and self.password:
-                ok_relogin, _ = self.login_by_password()
-                if ok_relogin:
-                    return self.sha1_reuse(filename, sha1_str, size, parent_file_id, md5_str)
-            return False, None, "TOKEN_EXPIRED: 123云盘 Web Token 已过期，请在插件配置中更新 authorToken"
-        else:
-            return False, None, f"秒传返回错误 [{code}]: {res.get('message', '未知错误')}"
+                return False, None, f"秒传返回错误 [{code}]: {res.get('message', '未知错误')}"
+
+        return False, None, f"请求秒传接口失败: {last_fail_msg}"
 
     def list_files(self, parent_file_id: int = 0) -> tuple[bool, list[dict], str]:
         """获取指定目录下的文件及子文件夹列表"""
@@ -293,16 +329,16 @@ class Pan123WebClient:
         if not ok_auth:
             return False, [], auth_msg
 
-        url = f"{self.WEB_BASE_URL}/b/api/file/list/new"
-        payload = {
+        query_params = urllib.parse.urlencode({
             "parentFileId": int(parent_file_id or 0),
             "page": 1,
             "limit": 100,
             "order": "filename",
             "orderBy": "asc",
-        }
+        })
+        url = f"{self.WEB_BASE_URL}/api/file/list/new?{query_params}"
 
-        ok, res, msg = self._http_post(url, payload, with_auth=True)
+        ok, res, msg = self._http_get(url, with_auth=True)
         if ok and res.get("code") == 0:
             data = res.get("data") or {}
             items = data.get("fileList") or data.get("InfoList") or []
@@ -315,7 +351,6 @@ class Pan123WebClient:
         if not ok_auth:
             return False, 0, auth_msg
 
-        url = f"{self.WEB_BASE_URL}/b/api/file/upload_request"
         payload = {
             "parentFileId": int(parent_file_id or 0),
             "filename": dirname,
@@ -325,12 +360,21 @@ class Pan123WebClient:
             "duplicate": 1,
         }
 
-        ok, res, msg = self._http_post(url, payload, with_auth=True)
-        if ok and res.get("code") == 0:
-            data = res.get("data") or {}
-            dir_id = data.get("fileId") or data.get("FileId")
-            if dir_id:
-                return True, int(dir_id), "创建文件夹成功"
+        candidate_urls = [
+            f"{self.WEB_BASE_URL}/b/api/file/upload_request",
+            f"{self.BACKUP_BASE_URL}/b/api/file/upload_request",
+        ]
+
+        last_msg = ""
+        for url in candidate_urls:
+            ok, res, msg = self._http_post(url, payload, with_auth=True)
+            if ok and res.get("code") == 0:
+                data = res.get("data") or {}
+                dir_id = data.get("fileId") or data.get("FileId")
+                if dir_id:
+                    return True, int(dir_id), "创建文件夹成功"
+            last_msg = res.get("message") if ok else msg
+        return False, 0, last_msg
         return False, 0, res.get("message") if ok else msg
 
     def get_or_create_dir_by_path(
