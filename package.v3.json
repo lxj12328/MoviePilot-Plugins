@@ -11,5 +11,18 @@
     "history": {
       "v1.4.0": "首个正式稳定版：全面采用 Web 原生秒传协议与 Web Token 直填模式，彻底免除官方开发者包付费与滑块异地风控；完整支持影视库多级树形目录级联同步与智能缓存；全面支持视频及刮削伴生文件（字幕、海报图片与 NFO 元数据）同步秒传与清理；支持 qBittorrent 状态标签全链路流转回写与做种安全清理；新增 qBittorrent 磁盘剩余空间实时监控与紧急空间腾退机制（磁盘告急时自动清理已完成任务，防止系统瘫痪）；支持强制全量重新同步已完成的媒体及一键重置。"
     }
+  },
+  "Pan123TgPilot": {
+    "name": "123云盘TG转存助手",
+    "description": "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。实时监控指定 TG 频道影视更新，智能识别电影/剧集并分类转存，支持标准分享链接与秒传链接解析，支持画质评分与自动洗版升级。",
+    "labels": "网盘,Telegram,TG转存,秒传,洗版,123云盘",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png",
+    "author": "lxj12328",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首发版本：实时监控指定 Telegram 频道影视推送；智能解析标题、年份、TMDB ID 与清晰度规格；精准分类电影与剧集并转存到对应 123 云盘目录；支持 123 网页端标准分享链接与 123FSLinkV2 秒传链接转存；内置多维画质评分与洗版机制，自动升级优质资源并安全清理旧版；支持 MoviePilot 系统消息通知。"
+    }
   }
 }
