@@ -96,7 +96,7 @@ class TestHistoryScannerV120(unittest.TestCase):
         mock_db.add_or_update_task.return_value = 101
 
         pilot = Pan123Pilot()
-        pilot._db = mock_db
+        pilot.db_helper = mock_db
         pilot._enabled = True
         pilot._local_library_root = library_dir
         pilot._client_id = "test"

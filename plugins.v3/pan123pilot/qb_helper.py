@@ -99,15 +99,25 @@ class QBHelper:
         except Exception:
             return None
 
-    def match_torrent_by_path(self, target_or_source_path: str) -> Optional[str]:
+    def get_all_torrents(self) -> list[dict]:
+        """获取 qBittorrent 当前所有种子列表"""
+        ok, res = self._request("/api/v2/torrents/info")
+        if not ok:
+            return []
+        try:
+            return json.loads(res)
+        except Exception:
+            return []
+
+    def match_torrent_by_path(
+        self, target_or_source_path: str, torrents: Optional[list] = None
+    ) -> Optional[str]:
         """通过文件或目录路径逆向在 QB 中搜寻对应种子 Hash"""
         if not target_or_source_path:
             return None
-        ok, res = self._request("/api/v2/torrents/info")
-        if not ok:
-            return None
+        if torrents is None:
+            torrents = self.get_all_torrents()
         try:
-            torrents = json.loads(res)
             target_name = os.path.basename(target_or_source_path)
             # 去除扩展名后的纯文件名
             base_name, _ = os.path.splitext(target_name)

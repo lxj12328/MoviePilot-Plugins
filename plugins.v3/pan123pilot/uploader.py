@@ -10,6 +10,12 @@ import threading
 import time
 from typing import Callable, Optional
 
+try:
+    from app.log import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger("pan123pilot")
+
 from .client import Pan123Client
 from .models import Pan123TaskDatabase
 from .qb_helper import QBHelper
@@ -166,6 +172,10 @@ class TaskScheduler:
     def process_pending_tasks(self, enable_real_upload: bool = True) -> None:
         """处理新录入或处于待处理状态的任务"""
         pending_tasks = self.db.list_tasks_by_status(statuses=["PENDING"])
+        if not pending_tasks:
+            return
+
+        logger.info(f"Pan123Pilot 待处理任务队列共 {len(pending_tasks)} 个媒体任务待执行")
         for task in pending_tasks:
             if self._stop_event.is_set():
                 break
@@ -173,13 +183,17 @@ class TaskScheduler:
             task_id = task["id"]
             target_path = task["target_path"]
             torrent_hash = task["torrent_hash"]
+            filename = os.path.basename(target_path)
 
             if not os.path.exists(target_path):
+                logger.error(f"Pan123Pilot 任务【{filename}】(ID: {task_id}) 目标文件在磁盘上不存在: {target_path}")
                 self.db.update_task_status(
                     task_id=task_id, status="FAILED", error_msg="目标文件不存在"
                 )
                 self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
                 continue
+
+            logger.info(f"Pan123Pilot 开始执行待同步任务: 【{filename}】(ID: {task_id})")
 
             # 1. 标记为处理中
             self.db.update_task_status(task_id=task_id, status="UPLOADING")
@@ -192,8 +206,11 @@ class TaskScheduler:
 
             if not sha1_str or not md5_str:
                 try:
+                    logger.info(f"Pan123Pilot 正在计算哈希 (SHA1/MD5): 【{filename}】...")
                     sha1_str, md5_str, file_size = self.calculate_file_hashes(target_path)
+                    logger.info(f"Pan123Pilot 哈希计算完成: 【{filename}】(SHA1: {sha1_str[:8]}..., 大小: {self.format_size(file_size)})")
                 except Exception as e:
+                    logger.error(f"Pan123Pilot 计算哈希失败: 【{filename}】: {e}")
                     self.db.update_task_status(
                         task_id=task_id, status="FAILED", error_msg=f"计算哈希失败: {e}"
                     )
@@ -201,8 +218,8 @@ class TaskScheduler:
                     continue
 
             # 3. 尝试 SHA1 秒传（先计算或级联解析父目录 ID）
-            filename = os.path.basename(target_path)
             parent_id = self.resolve_target_parent_id(target_path)
+            logger.info(f"Pan123Pilot 发起 123 云盘 SHA1 秒传: 【{filename}】(云盘 ParentID: {parent_id})...")
 
             reuse, file_id, msg = self.client.sha1_reuse(
                 filename=filename,
@@ -213,6 +230,7 @@ class TaskScheduler:
 
             if reuse:
                 # 秒传成功！
+                logger.info(f"Pan123Pilot 【{filename}】秒传成功！云盘 FileID: {file_id}")
                 self.db.update_task_status(
                     task_id=task_id,
                     status="COMPLETED",
@@ -233,6 +251,9 @@ class TaskScheduler:
                 # 秒传未命中，进入重试流转
                 retry_count = task.get("retry_count", 0) + 1
                 max_retry = task.get("max_retry", 10)
+                logger.warning(
+                    f"Pan123Pilot 【{filename}】秒传未命中 ({msg})，进入重试流转 (进度: {retry_count}/{max_retry})"
+                )
 
                 if retry_count < max_retry:
                     self.db.update_task_status(
@@ -280,6 +301,7 @@ class TaskScheduler:
 
         # 启动真实分片上传（先计算或级联解析父目录 ID）
         parent_id = self.resolve_target_parent_id(target_path)
+        logger.info(f"Pan123Pilot 【{os.path.basename(target_path)}】达到重试上限，启动 123 官方 V2 分片真实上传 (ParentID: {parent_id})...")
         self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"))
         ok, file_id, err = self.client.upload_file_v2(
             filepath=target_path,
@@ -288,6 +310,7 @@ class TaskScheduler:
         )
 
         if ok:
+            logger.info(f"Pan123Pilot 【{os.path.basename(target_path)}】分片真实上传完成！云盘 FileID: {file_id}")
             self.db.update_task_status(
                 task_id=task_id,
                 status="COMPLETED",

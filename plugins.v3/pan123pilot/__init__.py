@@ -204,7 +204,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -406,6 +406,8 @@ class Pan123Pilot(_PluginBase):
         # 检查是否需要扫描本地历史已整理媒体
         if self._enabled and (self._scan_history_on_save or self._auto_scan_history):
             logger.info("Pan123Pilot 已开启历史媒体扫描，正在启动后台异步补录...")
+            if self._scan_history_on_save:
+                self._scan_history_on_save = False
             threading.Thread(
                 target=self._scan_and_sync_history_library,
                 daemon=True,
@@ -547,14 +549,18 @@ class Pan123Pilot(_PluginBase):
         深度扫描本地已整理好的历史媒体文件，自动关联 MoviePilot 整理历史或 qB 种子，
         补录入库并触发全链路秒传与标签回写。
         """
-        if not self._local_library_root or not os.path.exists(self._local_library_root):
-            logger.warning(f"Pan123Pilot 历史媒体库扫描跳过：路径不存在或未配置 ({self._local_library_root})")
-            return 0
+        try:
+            if not self._local_library_root or not os.path.exists(self._local_library_root):
+                logger.warning(f"Pan123Pilot 历史媒体库扫描跳过：路径不存在或未配置 ({self._local_library_root})")
+                return 0
 
-        logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} ...")
-        task_ids = _record_transferred_target(self._local_library_root)
-        logger.info(f"Pan123Pilot 本地历史媒体扫描完成，共识别与补录 {len(task_ids)} 个媒体文件")
-        return len(task_ids)
+            logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} ...")
+            task_ids = _record_transferred_target(self._local_library_root)
+            logger.info(f"Pan123Pilot 本地历史媒体扫描完成，共识别与补录 {len(task_ids)} 个媒体文件")
+            return len(task_ids)
+        except Exception as e:
+            logger.error(f"Pan123Pilot 历史媒体库扫描异常: {e}", exc_info=True)
+            return 0
 
     def _api_scan_library(self) -> dict:
         """手动扫描本地媒体库根目录，将未录入的任务录入数据库并立即触发同步"""
@@ -1342,12 +1348,15 @@ def _record_transferred_target(
 
     global _plugin_instance
     task_ids = []
-    db = _plugin_instance._db if (_plugin_instance and _plugin_instance._db) else Pan123TaskDatabase()
+    db = getattr(_plugin_instance, "db_helper", None) if _plugin_instance else None
+    if not db:
+        db = Pan123TaskDatabase()
     db.ensure_table()
 
     # 待处理的文件清单：[(file_full_path, file_name)]
     target_files: list[tuple[str, str]] = []
     if os.path.isdir(target_path):
+        logger.info(f"Pan123Pilot 正在递归检索视频文件: {target_path} ...")
         for root, _, files in os.walk(target_path):
             for f in sorted(files):
                 ext = os.path.splitext(f)[1].lower()
@@ -1357,6 +1366,22 @@ def _record_transferred_target(
         ext = os.path.splitext(target_path)[1].lower()
         if ext in VIDEO_EXTENSIONS:
             target_files.append((target_path, os.path.basename(target_path)))
+
+    logger.info(f"Pan123Pilot 在【{target_path}】下共检索到 {len(target_files)} 个符合条件的视频文件")
+    if not target_files:
+        logger.warning(
+            f"Pan123Pilot 在【{target_path}】下未发现视频文件 (支持格式: {', '.join(sorted(VIDEO_EXTENSIONS))})，若这是媒体库根路径，请检查路径映射是否正确。"
+        )
+        return []
+
+    # 预获取 qBittorrent 当前所有种子，避免每检查一个文件都发起一次网络请求
+    qb_torrents = None
+    if _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
+        try:
+            qb_torrents = _plugin_instance.qb_helper.get_all_torrents()
+            logger.info(f"Pan123Pilot 已从 qBittorrent 预获取 {len(qb_torrents)} 个种子用于智能关联")
+        except Exception as e:
+            logger.warning(f"Pan123Pilot 预获取 qBittorrent 种子列表失败: {e}")
 
     all_plugin_tags: list[str] = []
     if _plugin_instance:
@@ -1373,6 +1398,7 @@ def _record_transferred_target(
             # 检查是否已存在于数据库且已处理完成
             existing = db.get_task_by_target(target_path=file_full)
             if existing and existing.get("status") in ("COMPLETED", "CLEANED"):
+                logger.debug(f"Pan123Pilot 媒体已处理完成，跳过: {fname} (状态: {existing.get('status')})")
                 continue
 
             f_size = os.path.getsize(file_full) if os.path.exists(file_full) else 0
@@ -1388,7 +1414,7 @@ def _record_transferred_target(
 
             # 2. 若仍未匹配到 hash，尝试从 qBittorrent 逆向搜寻
             if not cur_hash and _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
-                cur_hash = _plugin_instance.qb_helper.match_torrent_by_path(file_full)
+                cur_hash = _plugin_instance.qb_helper.match_torrent_by_path(file_full, torrents=qb_torrents)
 
             # 3. 录入或更新任务
             tid = db.add_or_update_task(
@@ -1419,10 +1445,11 @@ def _record_transferred_target(
 
     # 5. 若有新任务入库且调度器正在运行，即刻启动处理
     if task_ids and _plugin_instance and _plugin_instance.scheduler and _plugin_instance.get_state():
+        logger.info(f"Pan123Pilot 本次共新增/更新 {len(task_ids)} 个待同步任务，立即启动后台流式处理...")
         try:
             threading.Thread(target=_plugin_instance.scheduler.process_pending_tasks, daemon=True).start()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Pan123Pilot 启动上传处理线程失败: {e}")
 
     return task_ids
 
