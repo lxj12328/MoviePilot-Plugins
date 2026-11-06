@@ -221,12 +221,21 @@ class TaskScheduler:
             parent_id = self.resolve_target_parent_id(target_path)
             logger.info(f"Pan123Pilot 发起 123 云盘 SHA1 秒传: 【{filename}】(云盘 ParentID: {parent_id})...")
 
-            reuse, file_id, msg = self.client.sha1_reuse(
-                filename=filename,
-                sha1_str=sha1_str,
-                size=file_size,
-                parent_file_id=parent_id,
-            )
+            try:
+                reuse, file_id, msg = self.client.sha1_reuse(
+                    filename=filename,
+                    sha1_str=sha1_str,
+                    size=file_size,
+                    parent_file_id=parent_id,
+                    md5_str=md5_str,
+                )
+            except TypeError:
+                reuse, file_id, msg = self.client.sha1_reuse(
+                    filename=filename,
+                    sha1_str=sha1_str,
+                    size=file_size,
+                    parent_file_id=parent_id,
+                )
 
             if reuse:
                 # 秒传成功！
@@ -381,12 +390,22 @@ class TaskScheduler:
                         pass
 
             parent_id = self.resolve_target_parent_id(target_path)
-            reuse, file_id, _ = self.client.sha1_reuse(
-                filename=filename,
-                sha1_str=sha1_str,
-                size=file_size,
-                parent_file_id=parent_id,
-            )
+            md5_str = task.get("md5")
+            try:
+                reuse, file_id, _ = self.client.sha1_reuse(
+                    filename=filename,
+                    sha1_str=sha1_str,
+                    size=file_size,
+                    parent_file_id=parent_id,
+                    md5_str=md5_str,
+                )
+            except TypeError:
+                reuse, file_id, _ = self.client.sha1_reuse(
+                    filename=filename,
+                    sha1_str=sha1_str,
+                    size=file_size,
+                    parent_file_id=parent_id,
+                )
 
             if reuse:
                 self.db.update_task_status(

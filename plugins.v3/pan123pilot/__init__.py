@@ -60,6 +60,7 @@ from .client import Pan123Client
 from .models import Pan123TaskDatabase
 from .qb_helper import QBHelper
 from .uploader import TaskScheduler
+from .web_client import Pan123WebClient
 
 _plugin_instance: Optional["Pan123Pilot"] = None
 
@@ -204,7 +205,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.0"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -212,6 +213,10 @@ class Pan123Pilot(_PluginBase):
     auth_level = 1
 
     _enabled: bool = False
+    _auth_mode: str = "web_token"
+    _pan123_token: str = ""
+    _pan123_username: str = ""
+    _pan123_password: str = ""
     _client_id: str = ""
     _client_secret: str = ""
     _parent_file_id: int = 0
@@ -279,6 +284,10 @@ class Pan123Pilot(_PluginBase):
         """读取配置并初始化插件运行时状态，必须支持重复调用"""
         config = config or {}
         self._enabled = bool(config.get("enabled"))
+        self._auth_mode = str(config.get("auth_mode") or "web_token").strip()
+        self._pan123_token = str(config.get("pan123_token") or "").strip()
+        self._pan123_username = str(config.get("pan123_username") or "").strip()
+        self._pan123_password = str(config.get("pan123_password") or "").strip()
         self._client_id = str(config.get("client_id") or "").strip()
         self._client_secret = str(config.get("client_secret") or "").strip()
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
@@ -350,7 +359,15 @@ class Pan123Pilot(_PluginBase):
         # 2. 基础组件初始化（即使未启用也能安全响应页面与状态查询）
         self.db_helper = Pan123TaskDatabase()
         self.db_helper.ensure_table()
-        self.client = Pan123Client(client_id=self._client_id, client_secret=self._client_secret)
+        if self._auth_mode in ("web_token", "web_account"):
+            self.client = Pan123WebClient(
+                username=self._pan123_username,
+                password=self._pan123_password,
+                token=self._pan123_token,
+                auth_mode=self._auth_mode,
+            )
+        else:
+            self.client = Pan123Client(client_id=self._client_id, client_secret=self._client_secret)
         self.qb_helper = QBHelper(
             host=self._qb_host,
             port=self._qb_port,
@@ -529,6 +546,27 @@ class Pan123Pilot(_PluginBase):
                 "auth": "bear",
                 "summary": "手动扫描本地媒体库并补录待同步媒体文件",
             },
+            {
+                "path": "/send_sms",
+                "endpoint": self._api_send_sms,
+                "methods": ["POST", "GET"],
+                "auth": "bear",
+                "summary": "发送 123 云盘登录短信验证码",
+            },
+            {
+                "path": "/verify_sms",
+                "endpoint": self._api_verify_sms,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "提交短信验证码登录并自动保存 Token",
+            },
+            {
+                "path": "/test_auth",
+                "endpoint": self._api_test_auth,
+                "methods": ["POST", "GET"],
+                "auth": "bear",
+                "summary": "测试当前 123 云盘认证与秒传通道状态",
+            },
         ]
 
     def _api_get_tasks(self) -> dict:
@@ -543,6 +581,43 @@ class Pan123Pilot(_PluginBase):
     def _api_trigger_cleanup(self) -> dict:
         self._service_cleanup_tasks()
         return {"code": 0, "message": "已手动触发做种达标清理"}
+
+    def _api_send_sms(self, phone: Optional[str] = None) -> dict:
+        """向指定手机号发送 123 短信验证码"""
+        target = phone or self._pan123_username
+        if isinstance(self.client, Pan123WebClient):
+            ok, msg = self.client.send_sms_code(target)
+            return {"code": 0 if ok else 1, "message": msg}
+        return {"code": 1, "message": "仅在 Web 模式下支持短信验证码发送"}
+
+    def _api_verify_sms(self, code: str, phone: Optional[str] = None) -> dict:
+        """校验短信验证码并保存 Token"""
+        target = phone or self._pan123_username
+        if isinstance(self.client, Pan123WebClient):
+            ok, msg = self.client.login_by_sms_code(code=code, phone=target)
+            if ok:
+                self._pan123_token = self.client.token
+                try:
+                    self.save_data("pan123_token", self._pan123_token)
+                except Exception:
+                    pass
+                return {"code": 0, "message": "短信验证成功！已自动保存 Token", "token": self._pan123_token}
+            return {"code": 1, "message": msg}
+        return {"code": 1, "message": "仅在 Web 模式下支持短信验证"}
+
+    def _api_test_auth(self) -> dict:
+        """测试 123 云盘认证状态"""
+        if isinstance(self.client, Pan123WebClient):
+            ok, msg = self.client.ensure_authenticated()
+            if ok:
+                return {"code": 0, "message": f"Web 鉴权成功！当前 Token 有效 (前缀: {self.client.token[:10]}...)"}
+            return {"code": 1, "message": f"Web 鉴权失败: {msg}"}
+        elif isinstance(self.client, Pan123Client):
+            token = self.client.get_access_token()
+            if token:
+                return {"code": 0, "message": f"OpenAPI Token 获取成功: {token[:10]}..."}
+            return {"code": 1, "message": "OpenAPI Token 获取失败，请检查 Client ID / Secret"}
+        return {"code": 1, "message": "客户端未初始化"}
 
     def _scan_and_sync_history_library(self) -> int:
         """
@@ -609,7 +684,80 @@ class Pan123Pilot(_PluginBase):
                     {
                         "component": "VCardTitle",
                         "props": {"class": "text-subtitle-1 font-weight-bold"},
-                        "text": "123 云盘开放平台凭证",
+                        "text": "123 云盘登录凭证与认证模式 (免开发者包付费)",
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "auth_mode",
+                                            "label": "认证方式 (强烈推荐 Web Token 直填模式，100% 免疫滑块风控)",
+                                            "items": [
+                                                {"title": "Web Token 直填模式 (强烈推荐，免输密码防风控)", "value": "web_token"},
+                                                {"title": "账号密码模式 (模拟 Web 登录)", "value": "web_account"},
+                                                {"title": "OpenAPI 开放平台模式 (需购买官方开发者包)", "value": "openapi"},
+                                            ],
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "pan123_token",
+                                            "label": "123 云盘 Web Token (authorToken)",
+                                            "placeholder": "浏览器打开 123pan.com 登录后，F12 -> Application -> Local Storage 复制 authorToken",
+                                            "hint": "填入后直接免密调用秒传接口，100% 避开任何滑块与验证码拦截",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "pan123_username",
+                                            "label": "123 账号 / 手机号",
+                                            "placeholder": "账号密码模式下填写绑定的手机号",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "pan123_password",
+                                            "label": "123 登录密码",
+                                            "type": "password",
+                                            "placeholder": "账号密码模式下填写 123 登录密码",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                     {
                         "component": "VRow",
@@ -622,8 +770,8 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "client_id",
-                                            "label": "Client ID",
-                                            "placeholder": "请输入 123 开放平台 Client ID",
+                                            "label": "OpenAPI Client ID (仅 openapi 模式需填)",
+                                            "placeholder": "自建应用 Client ID",
                                         },
                                     }
                                 ],
@@ -636,9 +784,9 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "client_secret",
-                                            "label": "Client Secret",
+                                            "label": "OpenAPI Client Secret (仅 openapi 模式需填)",
                                             "type": "password",
-                                            "placeholder": "请输入 123 开放平台 Client Secret",
+                                            "placeholder": "自建应用 Client Secret",
                                         },
                                     }
                                 ],
@@ -1123,6 +1271,10 @@ class Pan123Pilot(_PluginBase):
 
         defaults = {
             "enabled": False,
+            "auth_mode": "web_token",
+            "pan123_token": "",
+            "pan123_username": "",
+            "pan123_password": "",
             "client_id": "",
             "client_secret": "",
             "target_parent_file_id": 0,
