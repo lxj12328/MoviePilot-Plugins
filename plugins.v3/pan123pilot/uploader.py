@@ -21,6 +21,16 @@ from .models import Pan123TaskDatabase
 from .qb_helper import QBHelper
 from .symedia import send_symedia_file_notify
 
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
+    ".iso", ".rmvb", ".webm", ".strm",
+}
+SCRAPED_EXTENSIONS = {
+    ".nfo", ".xml",
+    ".srt", ".vtt", ".ass", ".ssa", ".sub", ".idx",
+    ".jpg", ".jpeg", ".png", ".webp", ".tbn",
+}
+
 
 class TaskScheduler:
     """任务调度与后台执行器"""
@@ -287,7 +297,15 @@ class TaskScheduler:
                     self._handle_token_expired(str(msg))
                     break
 
-                # 正常秒传未命中，进入重试流转
+                # 针对刮削伴生文件（字幕、海报、NFO 等小文件），秒传未命中时无需轮询等待，直接启动极速上传
+                ext = os.path.splitext(filename)[1].lower()
+                if ext in SCRAPED_EXTENSIONS or file_size < 10 * 1024 * 1024:
+                    if enable_real_upload:
+                        logger.info(f"Pan123Pilot 【{filename}】为刮削伴生小文件 ({self.format_size(file_size)})，秒传未命中立即执行快速真实上传...")
+                        self._handle_max_retry_reached(task, sha1_str, md5_str, enable_real_upload=True)
+                        continue
+
+                # 正常大文件秒传未命中，进入重试流转
                 retry_count = task.get("retry_count", 0) + 1
                 max_retry = task.get("max_retry", 10)
                 logger.warning(
@@ -483,10 +501,24 @@ class TaskScheduler:
         min_ratio: float = 2.0,
         delete_torrent_file: bool = True,
         delete_hardlink_file: bool = True,
+        emergency_free_space_gb: float = 5.0,
     ) -> None:
         """
-        自动清理已同步完成且满足做种指标的任务
+        自动清理已同步完成且满足做种指标的任务。
+        支持实时监控 qB 磁盘空间：当剩余空间不足阈值时，自动触发紧急空间腾退，无视做种指标强制清理。
         """
+        # 0. 检查 qBittorrent 磁盘剩余空间
+        is_emergency = False
+        current_free_gb = 9999.0
+        if self.qb and emergency_free_space_gb > 0:
+            free_bytes = self.qb.get_free_space_bytes(local_path=self.local_library_root)
+            current_free_gb = free_bytes / (1024.0 ** 3)
+            if current_free_gb < emergency_free_space_gb:
+                is_emergency = True
+                logger.warning(
+                    f"🚨 Pan123Pilot 检测到 qBittorrent 磁盘剩余空间仅剩 {current_free_gb:.2f} GB (低于安全阈值 {emergency_free_space_gb:.1f} GB)，启动紧急磁盘腾退机制！"
+                )
+
         completed_tasks = self.db.list_tasks_by_status(statuses=["COMPLETED"])
         for task in completed_tasks:
             if self._stop_event.is_set():
@@ -496,10 +528,13 @@ class TaskScheduler:
             torrent_hash = task.get("torrent_hash")
             target_path = task.get("target_path")
 
-            # 1. 检查做种条件是否达标
+            # 1. 检查做种条件是否达标（若触发紧急空间腾退，则无视指标直接强制放行）
             qualified = True
             reason = "无对应 QB 种子"
-            if torrent_hash and self.qb.is_configured():
+            if is_emergency:
+                qualified = True
+                reason = f"🚨 磁盘空间告急 (剩余 {current_free_gb:.2f}GB < 阈值 {emergency_free_space_gb:.1f}GB)，紧急腾退强制清理"
+            elif torrent_hash and self.qb.is_configured():
                 qualified, reason = self.qb.check_seeding_criteria(
                     torrent_hash=torrent_hash,
                     min_seed_time_hours=min_seed_time_hours,
@@ -516,12 +551,37 @@ class TaskScheduler:
                 except Exception:
                     pass
 
-            # 3. 清理本地硬链接文件并递归修剪空目录
+            # 3. 清理本地硬链接文件、伴生刮削文件（字幕/海报/NFO）并递归修剪空目录
             if delete_hardlink_file and target_path and os.path.exists(target_path):
                 try:
                     os.remove(target_path)
-                    # 向上递归清理各级空父目录（直至媒体库根目录或遇到非空目录）
+                    # 清理同级伴生刮削文件（同名前缀的 .nfo, .srt, .ass, .jpg 等）
                     parent_dir = os.path.dirname(target_path)
+                    base_prefix = os.path.splitext(target_path)[0]
+                    if os.path.exists(parent_dir):
+                        for fname in os.listdir(parent_dir):
+                            fpath = os.path.join(parent_dir, fname)
+                            ext = os.path.splitext(fname)[1].lower()
+                            if ext in SCRAPED_EXTENSIONS:
+                                if fpath.startswith(base_prefix) or fname.lower() in (
+                                    "folder.jpg", "poster.jpg", "fanart.jpg", "backdrop.jpg", "season.nfo", "tvshow.nfo"
+                                ):
+                                    try:
+                                        # 公共海报文件：若目录下已无其他视频文件则一并清理
+                                        if fname.lower() in ("folder.jpg", "poster.jpg", "fanart.jpg", "backdrop.jpg", "season.nfo", "tvshow.nfo"):
+                                            has_other_videos = any(
+                                                os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
+                                                for f in os.listdir(parent_dir)
+                                                if os.path.join(parent_dir, f) != target_path
+                                            )
+                                            if not has_other_videos:
+                                                os.remove(fpath)
+                                        else:
+                                            os.remove(fpath)
+                                    except Exception:
+                                        pass
+
+                    # 向上递归清理各级空父目录（直至媒体库根目录或遇到非空目录）
                     norm_root = os.path.normpath(self.local_library_root) if self.local_library_root else None
                     while parent_dir and os.path.exists(parent_dir):
                         if norm_root and os.path.abspath(parent_dir) == os.path.abspath(norm_root):
@@ -538,16 +598,17 @@ class TaskScheduler:
             self.db.update_task_status(
                 task_id=task_id,
                 status="CLEANED",
-                error_msg=f"做种达标并已完成自动清理: {reason}",
+                error_msg=f"已完成自动清理: {reason}",
             )
+            notify_title = "123云盘空间紧急腾退完成" if is_emergency else "123云盘做种达标清理完成"
             self._notify(
                 "cleanup",
-                "123云盘做种达标清理完成",
+                notify_title,
                 (
-                    f"媒体【{os.path.basename(target_path)}】已在 123 云盘就绪且满足做种要求！\n"
-                    f"做种考核结果: {reason}\n"
+                    f"媒体【{os.path.basename(target_path)}】已在 123 云盘就绪并执行清理！\n"
+                    f"清理结果: {reason}\n"
                     f"清理动作: {'已删除 qBittorrent 种子与源文件 ' if delete_torrent_file else ''}"
-                    f"{'已删除本地刮削硬链接文件' if delete_hardlink_file else ''}"
+                    f"{'已删除本地刮削硬链接及伴生文件' if delete_hardlink_file else ''}"
                 ),
             )
 

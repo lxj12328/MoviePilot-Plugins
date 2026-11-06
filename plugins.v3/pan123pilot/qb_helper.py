@@ -212,3 +212,28 @@ class QBHelper:
             data={"hashes": torrent_hash, "deleteFiles": "true" if delete_files else "false"},
         )
         return ok
+
+    def get_free_space_bytes(self, local_path: Optional[str] = None) -> int:
+        """
+        获取 qBittorrent 所在下载磁盘的剩余可用空间 (字节)。
+        优先调用 qB Web API /api/v2/sync/maindata 获取 server_state.free_space_on_disk；
+        若 API 未就绪或未返回则通过 local_path 使用 shutil.disk_usage 兜底。
+        """
+        if self.is_configured():
+            ok, data = self._request("/api/v2/sync/maindata")
+            if ok and isinstance(data, dict):
+                server_state = data.get("server_state") or {}
+                free_space = server_state.get("free_space_on_disk")
+                if free_space is not None and isinstance(free_space, (int, float)) and free_space >= 0:
+                    return int(free_space)
+
+        if local_path and os.path.exists(local_path):
+            import shutil
+            try:
+                usage = shutil.disk_usage(local_path)
+                return int(usage.free)
+            except Exception:
+                pass
+
+        # 默认返回极大值（防止误触紧急腾退）
+        return 1024 * 1024 * 1024 * 1024 * 10  # 10 TB

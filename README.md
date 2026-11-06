@@ -10,7 +10,7 @@
 
 | 插件名称 (Plugin Name) | 目录位置 (Directory) | 版本 (Version) | 功能简介 (Description) | 状态 (Status) |
 | :--- | :--- | :--- | :--- | :--- |
-| **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.3.9` | 123云盘自动化零流量 Web 原生秒传 (免开发者包付费)、Web Token 直填 (100%免滑块与风控)、Token过期主动报警与队列保护、影视目录多级级联、支持一键全量强制重新同步、qB联动与做种清理 | 活跃 (Active) |
+| **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.4.0` | 123云盘助手首个正式稳定版：Web原生秒传与直填Token、影视多级目录级联同步、视频与刮削伴生文件(字幕/海报/NFO)全量同步与清理、qB状态标签联动、独创qB磁盘剩余空间监控与紧急空间腾退机制 | 活跃 (Active) |
 
 > 💡 **提示**：每当新增或更新插件工具时，请同步更新此表格，确保项目工具目录与功能状态清晰可查。
 

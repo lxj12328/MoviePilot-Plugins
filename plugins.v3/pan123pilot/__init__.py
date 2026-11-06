@@ -65,7 +65,12 @@ from .web_client import Pan123WebClient
 _plugin_instance: Optional["Pan123Pilot"] = None
 
 VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".ts", ".iso", ".rmvb", ".avi", ".mov", ".flv", ".m2ts", ".wmv"
+    ".mp4", ".mkv", ".ts", ".iso", ".rmvb", ".avi", ".mov", ".flv", ".m2ts", ".wmv", ".webm", ".strm"
+}
+SCRAPED_EXTENSIONS = {
+    ".nfo", ".xml",
+    ".srt", ".vtt", ".ass", ".ssa", ".sub", ".idx",
+    ".jpg", ".jpeg", ".png", ".webp", ".tbn",
 }
 
 
@@ -205,7 +210,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.3.9"
+    plugin_version = "1.4.0"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -224,6 +229,8 @@ class Pan123Pilot(_PluginBase):
     _local_library_root: str = ""
     _enable_path_cascade: bool = True
     _force_resync_completed: bool = False
+    _sync_scraped_assets: bool = True
+    _emergency_cleanup_space_gb: float = 5.0
     _scan_history_on_save: bool = False
     _auto_scan_history: bool = False
     _retry_interval: int = 30
@@ -336,6 +343,12 @@ class Pan123Pilot(_PluginBase):
         self._local_library_root = str(config.get("local_library_root") or "").strip()
         self._enable_path_cascade = bool(config.get("enable_path_cascade", True))
         self._force_resync_completed = bool(config.get("force_resync_completed", False))
+        self._sync_scraped_assets = bool(config.get("sync_scraped_assets", True))
+        try:
+            val_space = config.get("emergency_cleanup_space_gb")
+            self._emergency_cleanup_space_gb = max(0.0, float(val_space if val_space is not None else 5.0))
+        except (ValueError, TypeError):
+            self._emergency_cleanup_space_gb = 5.0
         self._scan_history_on_save = bool(config.get("scan_history_on_save", False))
         self._auto_scan_history = bool(config.get("auto_scan_history", False))
         try:
@@ -633,6 +646,7 @@ class Pan123Pilot(_PluginBase):
             min_ratio=self._min_seed_ratio,
             delete_torrent_file=self._delete_torrent_file,
             delete_hardlink_file=self._delete_hardlink_file,
+            emergency_free_space_gb=self._emergency_cleanup_space_gb,
         )
 
     def get_api(self) -> list[dict[str, Any]]:
@@ -720,8 +734,12 @@ class Pan123Pilot(_PluginBase):
                 logger.warning(f"Pan123Pilot 历史媒体库扫描跳过：路径不存在或未配置 ({self._local_library_root})")
                 return 0
 
-            logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} (强制重新同步: {force_resync}) ...")
-            task_ids = _record_transferred_target(self._local_library_root, force_resync=force_resync)
+            logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} (强制重新同步: {force_resync}, 刮削伴生同步: {self._sync_scraped_assets}) ...")
+            task_ids = _record_transferred_target(
+                self._local_library_root,
+                force_resync=force_resync,
+                sync_scraped_assets=self._sync_scraped_assets,
+            )
             logger.info(f"Pan123Pilot 本地历史媒体扫描完成，共识别与补录 {len(task_ids)} 个媒体文件")
             return len(task_ids)
         except Exception as e:
@@ -1045,6 +1063,26 @@ class Pan123Pilot(_PluginBase):
                         ],
                     },
                     {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 12},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "sync_scraped_assets",
+                                            "label": "同步上传刮削伴生文件 (字幕、海报图片与 NFO 元数据)",
+                                            "hint": "开启后，影视对应的 .srt/.ass/.vtt 字幕、.nfo 元数据及 .jpg/.png/.webp 海报图片将一并上传至 123 云盘对应目录",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
                         "component": "VDivider",
                         "props": {"class": "my-3"},
                     },
@@ -1309,7 +1347,28 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "delete_hardlink_file",
-                                            "label": "清理本地硬链接文件",
+                                            "label": "清理本地硬链接及伴生文件",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "emergency_cleanup_space_gb",
+                                            "label": "qB 磁盘剩余空间紧急清理安全阈值 (GB)",
+                                            "placeholder": "5.0",
+                                            "hint": "实时监控 qBittorrent 磁盘剩余空间：当空间低于此阈值时，无视做种时间和分享率指标，强制提前清理已完成任务以释放空间防止服务停止工作（默认 5.0 GB，设为 0 则关闭紧急清理）",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -1398,6 +1457,8 @@ class Pan123Pilot(_PluginBase):
             "local_library_root": "",
             "enable_path_cascade": True,
             "force_resync_completed": False,
+            "sync_scraped_assets": True,
+            "emergency_cleanup_space_gb": 5.0,
             "scan_history_on_save": False,
             "auto_scan_history": False,
             "retry_interval": 30,
@@ -1613,6 +1674,7 @@ def _record_transferred_target(
     source_path: Optional[str] = None,
     torrent_hash: Optional[str] = None,
     force_resync: bool = False,
+    sync_scraped_assets: bool = True,
 ) -> list[int]:
     """
     将整理后的目标文件或目录内的媒体录入任务库并触发处理。
@@ -1628,24 +1690,27 @@ def _record_transferred_target(
         db = Pan123TaskDatabase()
     db.ensure_table()
 
+    # 允许同步的文件格式：视频文件 + 可选的刮削伴生文件 (字幕、图片、NFO)
+    allowed_exts = VIDEO_EXTENSIONS | (SCRAPED_EXTENSIONS if sync_scraped_assets else set())
+
     # 待处理的文件清单：[(file_full_path, file_name)]
     target_files: list[tuple[str, str]] = []
     if os.path.isdir(target_path):
-        logger.info(f"Pan123Pilot 正在递归检索视频文件: {target_path} ...")
+        logger.info(f"Pan123Pilot 正在递归检索媒体与伴生文件: {target_path} ...")
         for root, _, files in os.walk(target_path):
             for f in sorted(files):
                 ext = os.path.splitext(f)[1].lower()
-                if ext in VIDEO_EXTENSIONS:
+                if ext in allowed_exts:
                     target_files.append((os.path.join(root, f), f))
     else:
         ext = os.path.splitext(target_path)[1].lower()
-        if ext in VIDEO_EXTENSIONS:
+        if ext in allowed_exts:
             target_files.append((target_path, os.path.basename(target_path)))
 
-    logger.info(f"Pan123Pilot 在【{target_path}】下共检索到 {len(target_files)} 个符合条件的视频文件")
+    logger.info(f"Pan123Pilot 在【{target_path}】下共检索到 {len(target_files)} 个符合条件的媒体及刮削伴生文件")
     if not target_files:
         logger.warning(
-            f"Pan123Pilot 在【{target_path}】下未发现视频文件 (支持格式: {', '.join(sorted(VIDEO_EXTENSIONS))})，若这是媒体库根路径，请检查路径映射是否正确。"
+            f"Pan123Pilot 在【{target_path}】下未发现媒体或刮削文件，若这是媒体库根路径，请检查路径映射是否正确。"
         )
         return []
 
@@ -1747,7 +1812,8 @@ def pan123_on_transfer_completed(event: Any) -> None:
             logger.debug(f"Pan123Pilot TransferComplete 事件中未能解析出目标文件路径: {getattr(event, 'event_data', event)}")
             return
         logger.info(f"Pan123Pilot 监听到整理完成事件: target={target_path}, hash={torrent_hash}")
-        _record_transferred_target(target_path, source_path, torrent_hash)
+        sync_scraped = _plugin_instance._sync_scraped_assets if _plugin_instance else True
+        _record_transferred_target(target_path, source_path, torrent_hash, sync_scraped_assets=sync_scraped)
     except Exception as e:
         logger.error(f"Pan123Pilot 处理 TransferComplete 事件异常: {e}")
 
