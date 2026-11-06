@@ -44,6 +44,14 @@ class Pan123WebClient:
         self._last_token_check = 0.0
         self.user_info: dict = {}
 
+    def is_configured(self) -> bool:
+        """检查 Web 客户端配置是否就绪"""
+        if self.auth_mode == "web_token":
+            return bool(self.token)
+        elif self.auth_mode == "web_account":
+            return bool((self.username and self.password) or self.token)
+        return bool(self.token or (self.username and self.password))
+
     @staticmethod
     def _clean_token(raw_token: Any) -> str:
         """清洗 Token：去除首尾空格、包裹的双引号/单引号及重复的 Bearer 前缀"""

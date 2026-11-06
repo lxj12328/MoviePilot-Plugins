@@ -205,7 +205,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.3.5"
+    plugin_version = "1.3.6"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -528,6 +528,18 @@ class Pan123Pilot(_PluginBase):
                 target=self._scan_and_sync_history_library,
                 daemon=True,
             ).start()
+        elif self._enabled and self.scheduler:
+            # 若未开启历史全量扫描，保存配置时也自动触发一次队列任务唤醒检测
+            def _wake_tasks():
+                import time
+                time.sleep(1)
+                if self.scheduler and self._enabled:
+                    try:
+                        self.scheduler.process_pending_tasks(enable_real_upload=self._enable_real_upload)
+                        self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload, retry_interval_minutes=0)
+                    except Exception as ex:
+                        logger.error(f"Pan123Pilot 唤醒任务队列异常: {ex}")
+            threading.Thread(target=_wake_tasks, daemon=True).start()
 
     def get_state(self) -> bool:
         """返回插件是否启用"""
@@ -660,8 +672,9 @@ class Pan123Pilot(_PluginBase):
 
     def _api_trigger_retry(self) -> dict:
         if self.scheduler and self._enabled:
+            self.scheduler.process_pending_tasks(enable_real_upload=self._enable_real_upload)
             self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload, retry_interval_minutes=0)
-        return {"code": 0, "message": "已手动触发秒传重试"}
+        return {"code": 0, "message": "已手动触发待处理与秒传重试任务"}
 
     def _api_trigger_cleanup(self) -> dict:
         self._service_cleanup_tasks()
@@ -1665,7 +1678,14 @@ def _record_transferred_target(
     if task_ids and _plugin_instance and _plugin_instance.scheduler and _plugin_instance.get_state():
         logger.info(f"Pan123Pilot 本次共新增/更新 {len(task_ids)} 个待同步任务，立即启动后台流式处理...")
         try:
-            threading.Thread(target=_plugin_instance.scheduler.process_pending_tasks, daemon=True).start()
+            enable_real = getattr(_plugin_instance, "_enable_real_upload", True)
+            def _runner():
+                try:
+                    _plugin_instance.scheduler.process_pending_tasks(enable_real_upload=enable_real)
+                    _plugin_instance.scheduler.retry_retrying_tasks(enable_real_upload=enable_real, retry_interval_minutes=0)
+                except Exception as ex:
+                    logger.error(f"Pan123Pilot 异步执行任务异常: {ex}", exc_info=True)
+            threading.Thread(target=_runner, daemon=True).start()
         except Exception as e:
             logger.error(f"Pan123Pilot 启动上传处理线程失败: {e}")
 

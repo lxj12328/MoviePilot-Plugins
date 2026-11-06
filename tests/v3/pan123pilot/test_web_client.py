@@ -12,6 +12,16 @@ from pan123pilot.web_client import Pan123WebClient
 
 
 class TestPan123WebClient(unittest.TestCase):
+    def test_web_client_is_configured(self):
+        c1 = Pan123WebClient(token="my_token", auth_mode="web_token")
+        self.assertTrue(c1.is_configured())
+
+        c2 = Pan123WebClient(token="", auth_mode="web_token")
+        self.assertFalse(c2.is_configured())
+
+        c3 = Pan123WebClient(username="13800000000", password="pwd", auth_mode="web_account")
+        self.assertTrue(c3.is_configured())
+
     def test_token_validity_check(self):
         client = Pan123WebClient(token="mock_valid_token_123")
         with patch.object(client, "_http_post") as mock_post:

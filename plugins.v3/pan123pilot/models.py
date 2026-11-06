@@ -99,6 +99,11 @@ class Pan123TaskDatabase:
             task.parent_file_id = parent_file_id
             task.max_retry = max_retry
             task.updated_at = datetime.now()
+            # 若已有任务处于未完成状态 (PENDING / RETRYING / FAILED)，重新扫描录入时重置为 PENDING 立即触发流转
+            if task.status not in ("COMPLETED", "CLEANED"):
+                task.status = "PENDING"
+                task.retry_count = 0
+                task.error_msg = ""
         else:
             task = Pan123Task(
                 target_path=target_path,

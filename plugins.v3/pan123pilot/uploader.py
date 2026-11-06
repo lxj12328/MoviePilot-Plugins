@@ -550,10 +550,15 @@ class TaskScheduler:
         """后台轮询主循环"""
         while not self._stop_event.is_set():
             try:
-                if self.client.is_configured():
+                is_conf = False
+                if hasattr(self.client, "is_configured"):
+                    is_conf = self.client.is_configured()
+                else:
+                    is_conf = bool(getattr(self.client, "token", None))
+                if is_conf:
                     self.process_pending_tasks()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Pan123Pilot 后台主循环异常: {e}")
             # 每隔 10 秒唤醒一次检测是否有新增的待处理任务
             for _ in range(10):
                 if self._stop_event.is_set():
