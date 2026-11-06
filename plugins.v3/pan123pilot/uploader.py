@@ -37,6 +37,7 @@ class TaskScheduler:
         local_library_root: str = "",
         enable_path_cascade: bool = True,
         symedia_config: Optional[dict] = None,
+        on_token_expired: Optional[Callable[[str], None]] = None,
     ):
         self.client = client
         self.qb = qb_helper
@@ -48,6 +49,7 @@ class TaskScheduler:
         self.local_library_root = (local_library_root or "").strip()
         self.enable_path_cascade = bool(enable_path_cascade)
         self.symedia_config = symedia_config or {}
+        self.on_token_expired = on_token_expired
 
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -102,6 +104,15 @@ class TaskScheduler:
             )
         except Exception:
             pass
+
+    def _handle_token_expired(self, reason: str = "") -> None:
+        """统一处理 123 云盘 Web Token 过期事件，触发回调并不扣减任务重试上限"""
+        logger.error(f"Pan123Pilot 触发 Token 过期拦截: {reason}")
+        if self.on_token_expired:
+            try:
+                self.on_token_expired(reason)
+            except Exception as e:
+                logger.error(f"Pan123Pilot 调用 on_token_expired 回调失败: {e}")
 
     @staticmethod
     def format_size(size_bytes: int) -> str:
@@ -257,7 +268,21 @@ class TaskScheduler:
                     f"媒体文件【{filename}】已成功零流量秒传至 123 云盘！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
                 )
             else:
-                # 秒传未命中，进入重试流转
+                # 若因 Token 过期导致鉴权失败，不消耗重试次数并触发报警
+                if "TOKEN_EXPIRED" in str(msg):
+                    logger.error(f"Pan123Pilot 【{filename}】秒传中断: Web Token 已过期，将任务保留在重试队列中")
+                    self.db.update_task_status(
+                        task_id=task_id,
+                        status="RETRYING",
+                        sha1=sha1_str,
+                        md5=md5_str,
+                        error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
+                    )
+                    self._sync_qb_tag(torrent_hash, self.tags.get("retrying", "123_待重试"))
+                    self._handle_token_expired(str(msg))
+                    break
+
+                # 正常秒传未命中，进入重试流转
                 retry_count = task.get("retry_count", 0) + 1
                 max_retry = task.get("max_retry", 10)
                 logger.warning(
@@ -392,7 +417,7 @@ class TaskScheduler:
             parent_id = self.resolve_target_parent_id(target_path)
             md5_str = task.get("md5")
             try:
-                reuse, file_id, _ = self.client.sha1_reuse(
+                reuse, file_id, msg = self.client.sha1_reuse(
                     filename=filename,
                     sha1_str=sha1_str,
                     size=file_size,
@@ -400,7 +425,7 @@ class TaskScheduler:
                     md5_str=md5_str,
                 )
             except TypeError:
-                reuse, file_id, _ = self.client.sha1_reuse(
+                reuse, file_id, msg = self.client.sha1_reuse(
                     filename=filename,
                     sha1_str=sha1_str,
                     size=file_size,
@@ -423,6 +448,16 @@ class TaskScheduler:
                     f"媒体文件【{filename}】在重试期间成功命中秒传！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
                 )
             else:
+                if "TOKEN_EXPIRED" in str(msg):
+                    logger.error(f"Pan123Pilot 周期重试中断: 123云盘 Web Token 已过期，暂停重试轮询")
+                    self.db.update_task_status(
+                        task_id=task_id,
+                        status="RETRYING",
+                        error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
+                    )
+                    self._handle_token_expired(str(msg))
+                    break
+
                 retry_count = task.get("retry_count", 0) + 1
                 max_retry = task.get("max_retry", 10)
                 if retry_count < max_retry:

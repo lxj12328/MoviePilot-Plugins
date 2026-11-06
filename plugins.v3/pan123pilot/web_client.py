@@ -200,215 +200,17 @@ class Pan123WebClient:
 
         return False, last_error
 
-    def send_sms_code(self, phone: Optional[str] = None) -> tuple[bool, str]:
-        """向手机号发送登录短信验证码"""
-        target_phone = (phone or self.username).strip()
-        if not target_phone:
-            return False, "手机号不能为空"
-
-        endpoints = [
-            f"{self.USER_API_URL}/api/user/send_sms_code",
-            f"{self.WEB_BASE_URL}/api/user/send_sms_code",
-            f"{self.USER_API_URL}/api/user/send_code",
-        ]
-        payloads = [
-            {"passport": target_phone, "type": 0},
-            {"passport": target_phone, "type": 1},
-            {"phone": target_phone, "type": 0},
-            {"mobile": target_phone, "type": 0},
-        ]
-
-        last_err = "发送短信接口无响应"
-        for url in endpoints:
-            for payload in payloads:
-                ok, res, msg = self._http_post(url, payload, with_auth=False)
-                if ok:
-                    code = res.get("code")
-                    if code == 0:
-                        return True, "短信验证码已成功发送，请查收手机短信并在表单中填入！"
-                    else:
-                        last_err = f"发送失败 [{code}]: {res.get('message', msg)}"
-                else:
-                    last_err = msg
-
-        return False, last_err
-
-    def login_by_sms_code(self, code: str, phone: Optional[str] = None) -> tuple[bool, str]:
-        """提交短信验证码完成登录"""
-        target_phone = (phone or self.username).strip()
-        code_str = (code or "").strip()
-        if not target_phone or not code_str:
-            return False, "手机号与验证码均不能为空"
-
-        endpoints = [
-            f"{self.USER_API_URL}/api/user/sign_in",
-            f"{self.WEB_BASE_URL}/api/user/sign_in",
-        ]
-        payloads = [
-            {"passport": target_phone, "code": code_str, "type": 0},
-            {"passport": target_phone, "code": code_str, "type": 1},
-            {"passport": target_phone, "sms_code": code_str, "type": 0},
-            {"phone": target_phone, "code": code_str, "type": 0},
-        ]
-
-        last_err = "短信登录接口异常"
-        for url in endpoints:
-            for payload in payloads:
-                ok, res, msg = self._http_post(url, payload, with_auth=False)
-                if ok:
-                    code_res = res.get("code")
-                    if code_res == 0:
-                        data = res.get("data") or {}
-                        token = data.get("token") or data.get("accessToken")
-                        if token:
-                            self.token = token
-                            self._last_token_check = time.time()
-                            logger.info("Pan123Pilot 短信验证码登录成功！已获取有效 Token")
-                            return True, "登录成功"
-                    else:
-                        last_err = f"验证码登录失败 [{code_res}]: {res.get('message', msg)}"
-                else:
-                    last_err = msg
-
-        return False, last_err
-
-    def generate_qr_login(self) -> tuple[bool, dict, str]:
-        """
-        初始化 123 云盘微信/App 扫码登录会话
-        返回: (ok, {"uuid": uuid, "url": qr_url, "img_url": img_url}, msg)
-        """
-        import uuid
-
-        session_uuid = uuid.uuid4().hex
-
-        # 尝试官方二维码创建接口
-        generate_urls = [
-            f"{self.WEB_BASE_URL}/api/user/qr-code/generate",
-            f"{self.USER_API_URL}/api/user/qr-code/generate",
-        ]
-        remote_data = None
-        for g_url in generate_urls:
-            ok, res, _ = self._http_post(g_url, {"uuid": session_uuid}, with_auth=False)
-            if ok and res.get("code") == 0:
-                remote_data = res.get("data") or {}
-                if remote_data.get("uuid"):
-                    session_uuid = remote_data.get("uuid")
-                break
-
-        # 123 云盘前端页面基于 uni-app / uni-id 开发，强制校验 uniID 字段
-        target_url = (
-            f"{self.WEB_BASE_URL}/wx-app-login.html?"
-            f"env=production&uniID={session_uuid}&uuid={session_uuid}&source=123pan&type=login"
-        )
-
-        encoded_url = urllib.parse.quote(target_url)
-        # 生成可直接渲染的二维码图片直链
-        img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={encoded_url}"
-
-        return True, {
-            "uuid": session_uuid,
-            "uniID": session_uuid,
-            "url": target_url,
-            "img_url": img_url,
-        }, "ok"
-
-    def check_qr_login_status(self, session_uuid: str) -> tuple[bool, Optional[str], str]:
-        """
-        轮询检查扫码登录状态
-        :return: (is_done, token, status_message)
-        """
-        if not session_uuid:
-            return False, None, "UUID 无效"
-
-        endpoints = [
-            f"{self.WEB_BASE_URL}/api/user/qr-code/wx_code",
-            f"{self.USER_API_URL}/api/user/qr-code/wx_code",
-        ]
-
-        payload = {
-            "uniID": session_uuid,
-            "uuid": session_uuid,
-            "source": "123pan",
-            "type": "login",
-        }
-        wx_code = None
-        last_msg = "等待扫码"
-
-        for url in endpoints:
-            ok, res, msg = self._http_post(
-                url,
-                payload,
-                with_auth=False,
-                extra_headers={"loginuuid": session_uuid},
-            )
-            if ok:
-                code = res.get("code")
-                if code == 0:
-                    data = res.get("data") or {}
-                    wx_code = data.get("code") or data.get("wechat_code") or data.get("wx_code")
-                    if wx_code:
-                        break
-                elif code in (1, 1001, 1002):
-                    last_msg = res.get("message") or "等待微信/App扫码"
-                elif code == 1003:
-                    last_msg = "已扫码，请在手机上点击确认授权"
-                elif code in (1004, 1005):
-                    last_msg = "二维码已过期，请刷新二维码重新扫描"
-                else:
-                    last_msg = res.get("message") or msg
-            else:
-                last_msg = msg
-
-        if not wx_code:
-            return False, None, last_msg
-
-        # 获取到 wechat_code 后换取正式 Token
-        sign_in_urls = [
-            f"{self.WEB_BASE_URL}/api/user/sign_in",
-            f"{self.USER_API_URL}/api/user/sign_in",
-        ]
-        sign_payloads = [
-            {"code": wx_code, "type": 4},
-            {"wechat_code": wx_code, "type": 4},
-            {"code": wx_code, "type": 1},
-        ]
-        for s_url in sign_in_urls:
-            for s_pay in sign_payloads:
-                ok_s, res_s, msg_s = self._http_post(s_url, s_pay, with_auth=False)
-                if ok_s and res_s.get("code") == 0:
-                    data_s = res_s.get("data") or {}
-                    tok = data_s.get("token") or data_s.get("accessToken")
-                    if tok:
-                        self.token = self._clean_token(tok)
-                        self._last_token_check = time.time()
-                        logger.info("Pan123Pilot 微信扫码授权登录成功！已获取正式有效 Token")
-                        return True, self.token, "微信扫码授权登录成功"
-
-        return False, None, "换取登录 Token 失败"
-
     def ensure_authenticated(self) -> tuple[bool, str]:
         """确保客户端处于已鉴权状态，严格遵循选定的 auth_mode 隔离执行"""
-        # 1. 直填 Token 模式 (web_token): 严格以用户填写的 authorToken 为准，绝不擅自越权调用账号密码登录
+        # 1. 直填 Token 模式 (web_token): 严格以用户填写的 authorToken 为准，绝不越权调用账号密码登录
         if self.auth_mode == "web_token":
             if not self.token:
                 return False, "未配置 Web Token，请在插件表单中填入 123 网页端 authorToken"
             if self.check_token_validity():
                 return True, "Web Token 有效"
-            return False, "当前配置的 Web Token 已失效或校验未通过，请在 123 网页端重新复制 authorToken 填入"
+            return False, "TOKEN_EXPIRED: Web Token 校验未通过或已失效，请重新复制 authorToken 填入"
 
-        # 2. 扫码登录模式 (web_qr): 使用扫码获取并缓存的 Token
-        if self.auth_mode == "web_qr":
-            if self.token and self.check_token_validity():
-                return True, "扫码登录 Token 有效"
-            return False, "扫码登录凭证已失效，请在插件详情页扫描二维码重新授权登录"
-
-        # 3. 短信验证码模式 (web_sms): 使用短信验证码换取的 Token，失效时提示重新获取验证码
-        if self.auth_mode == "web_sms":
-            if self.token and self.check_token_validity():
-                return True, "短信登录 Token 有效"
-            return False, "短信登录 Token 已失效，请在插件配置中勾选「立即发送短信验证码」并输入验证码重新登录"
-
-        # 3. 账号密码模式 (web_account): 若已有有效 Token 优先复用，否则尝试账号密码登录
+        # 2. 账号密码模式 (web_account): 若已有有效 Token 优先复用，否则尝试账号密码登录
         if self.token and self.check_token_validity():
             return True, "Token 有效"
 
@@ -448,6 +250,13 @@ class Pan123WebClient:
 
         ok, res, msg = self._http_post(url, payload, with_auth=True)
         if not ok:
+            if "401" in msg or "Token" in msg or "token" in msg:
+                self._last_token_check = 0.0
+                if self.auth_mode == "web_account" and self.username and self.password:
+                    ok_relogin, _ = self.login_by_password()
+                    if ok_relogin:
+                        return self.sha1_reuse(filename, sha1_str, size, parent_file_id, md5_str)
+                return False, None, f"TOKEN_EXPIRED: 123云盘 Web Token 已过期 ({msg})，请在插件配置中更新 authorToken"
             return False, None, f"请求秒传接口失败: {msg}"
 
         code = res.get("code")
@@ -466,7 +275,7 @@ class Pan123WebClient:
                 ok_relogin, _ = self.login_by_password()
                 if ok_relogin:
                     return self.sha1_reuse(filename, sha1_str, size, parent_file_id, md5_str)
-            return False, None, "Token 已过期，请在插件表单中更新 Web Token 或重新短信登录"
+            return False, None, "TOKEN_EXPIRED: 123云盘 Web Token 已过期，请在插件配置中更新 authorToken"
         else:
             return False, None, f"秒传返回错误 [{code}]: {res.get('message', '未知错误')}"
 

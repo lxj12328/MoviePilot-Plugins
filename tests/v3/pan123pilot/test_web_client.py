@@ -31,17 +31,19 @@ class TestPan123WebClient(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(client.token, "mock_login_token_abc")
 
-    def test_sms_code_login_success(self):
-        client = Pan123WebClient(username="13800000000")
-        with patch.object(client, "_http_post") as mock_post:
-            mock_post.return_value = (
-                True,
-                {"code": 0, "data": {"token": "mock_sms_token_xyz"}},
-                "ok",
-            )
-            ok, msg = client.login_by_sms_code("123456")
+    def test_ensure_authenticated_token_valid(self):
+        client = Pan123WebClient(token="mock_valid_token", auth_mode="web_token")
+        with patch.object(client, "check_token_validity", return_value=True):
+            ok, msg = client.ensure_authenticated()
             self.assertTrue(ok)
-            self.assertEqual(client.token, "mock_sms_token_xyz")
+            self.assertIn("有效", msg)
+
+    def test_ensure_authenticated_token_expired(self):
+        client = Pan123WebClient(token="mock_expired_token", auth_mode="web_token")
+        with patch.object(client, "check_token_validity", return_value=False):
+            ok, msg = client.ensure_authenticated()
+            self.assertFalse(ok)
+            self.assertIn("authorToken", msg)
 
     def test_sha1_reuse_hit(self):
         client = Pan123WebClient(token="mock_token")
@@ -128,35 +130,81 @@ class TestPan123WebClient(unittest.TestCase):
             self.assertEqual(client.user_info.get("nickname"), "TestUser")
 
 
-    def test_generate_qr_login(self):
-        client = Pan123WebClient()
-        ok, data, msg = client.generate_qr_login()
-        self.assertTrue(ok)
-        self.assertIn("uuid", data)
-        self.assertIn("img_url", data)
-        self.assertIn("url", data)
+    def test_sha1_reuse_token_expired_response(self):
+        client = Pan123WebClient(token="mock_expired_token")
+        with patch.object(client, "check_token_validity", return_value=True):
+            with patch.object(client, "_http_post") as mock_post:
+                # 模拟 123 接口在请求时返回 401 或 token 失效
+                mock_post.return_value = (False, None, "HTTP 401: Unauthorized")
+                reuse, file_id, msg = client.sha1_reuse(
+                    filename="sample.mkv",
+                    sha1_str="dummy_sha1",
+                    size=1024,
+                    parent_file_id=0,
+                    md5_str="dummy_md5",
+                )
+                self.assertFalse(reuse)
+                self.assertIsNone(file_id)
+                self.assertIn("TOKEN_EXPIRED", msg)
 
-    def test_check_qr_login_status_waiting(self):
-        client = Pan123WebClient()
-        with patch.object(client, "_http_post") as mock_post:
-            mock_post.return_value = (True, {"code": 1001, "message": "等待扫码"}, "ok")
-            is_done, tok, msg = client.check_qr_login_status("mock_uuid_123")
-            self.assertFalse(is_done)
-            self.assertIsNone(tok)
-            self.assertIn("等待", msg)
+    def test_pilot_token_expired_notification_debounce(self):
+        from pan123pilot import Pan123Pilot
+        pilot = Pan123Pilot()
+        notifications = []
+        pilot.notify = lambda title, text: notifications.append((title, text))
 
-    def test_check_qr_login_status_success(self):
-        client = Pan123WebClient()
-        # 第一次请求获取 wechat_code，第二次换取 token
-        with patch.object(client, "_http_post") as mock_post:
-            mock_post.side_effect = [
-                (True, {"code": 0, "data": {"code": "mock_wx_code_abc"}}, "ok"),
-                (True, {"code": 0, "data": {"token": "mock_qr_token_success_999"}}, "ok"),
-            ]
-            is_done, tok, msg = client.check_qr_login_status("mock_uuid_123")
-            self.assertTrue(is_done)
-            self.assertEqual(tok, "mock_qr_token_success_999")
-            self.assertEqual(client.token, "mock_qr_token_success_999")
+        # 首次触发：应发送通知并更新状态
+        pilot._notify_token_expired("Token 已失效")
+        self.assertEqual(len(notifications), 1)
+        self.assertIn("报警", notifications[0][0])
+        self.assertIn("🚨", pilot._auth_status_msg)
+
+        # 立即再次触发：24小时防刷屏静默期，不应重复发送
+        pilot._notify_token_expired("Token 再次检测失效")
+        self.assertEqual(len(notifications), 1)
+
+    def test_scheduler_token_expired_callback(self):
+        from pan123pilot.uploader import TaskScheduler
+        mock_client = MagicMock()
+        mock_qb = MagicMock()
+        mock_db = MagicMock()
+        expired_calls = []
+
+        scheduler = TaskScheduler(
+            client=mock_client,
+            qb_helper=mock_qb,
+            db_helper=mock_db,
+            tags_config={},
+            on_token_expired=lambda reason: expired_calls.append(reason),
+        )
+
+        mock_db.list_tasks_by_status.return_value = [
+            {
+                "id": 101,
+                "target_path": "/video/test.mkv",
+                "torrent_hash": "hash123",
+                "sha1": "dummy_sha1",
+                "md5": "dummy_md5",
+                "file_size": 100,
+                "retry_count": 1,
+                "max_retry": 10,
+            }
+        ]
+        mock_client.sha1_reuse.return_value = (False, None, "TOKEN_EXPIRED: 401 Unauthorized")
+
+        with patch("os.path.exists", return_value=True):
+            scheduler.process_pending_tasks(enable_real_upload=True)
+
+        self.assertEqual(len(expired_calls), 1)
+        self.assertIn("TOKEN_EXPIRED", expired_calls[0])
+        # 验证任务未被当作正常失败，未扣减重试上限
+        mock_db.update_task_status.assert_called_with(
+            task_id=101,
+            status="RETRYING",
+            sha1="dummy_sha1",
+            md5="dummy_md5",
+            error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
+        )
 
 
 if __name__ == "__main__":

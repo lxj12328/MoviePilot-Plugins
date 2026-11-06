@@ -205,7 +205,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.3.4"
+    plugin_version = "1.3.5"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -217,9 +217,7 @@ class Pan123Pilot(_PluginBase):
     _pan123_token: str = ""
     _pan123_username: str = ""
     _pan123_password: str = ""
-    _qr_session: dict = {}
-    _qr_poll_thread: Optional[threading.Thread] = None
-    _qr_stop_event = threading.Event()
+    _last_token_expired_notify_time: float = 0.0
     _client_id: str = ""
     _client_secret: str = ""
     _parent_file_id: int = 0
@@ -267,46 +265,32 @@ class Pan123Pilot(_PluginBase):
     db_helper: Optional[Pan123TaskDatabase] = None
     scheduler: Optional[TaskScheduler] = None
 
-    def _start_qr_polling(self, session_uuid: str) -> None:
-        """启动后台异步轮询微信扫码状态线程"""
+    def _notify_token_expired(self, reason: str = "") -> None:
+        """
+        当检测到 123 云盘 Web Token 过期失效时，更新状态并发送高优先级系统报警
+        采用 24 小时频次防刷屏机制，秒传任务自动在队列中保持挂起重试，不损耗最大重试次数
+        """
         import time
+        now = time.time()
+        self._auth_status_msg = f"🚨 123云盘 Web Token 已过期失效: {reason or '请在插件配置中更新 authorToken'}"
+        if now - self._last_token_expired_notify_time < 86400:
+            logger.warning(f"Pan123Pilot Token 失效报警处于 24 小时静默期，已跳过重复提醒: {reason}")
+            return
+        self._last_token_expired_notify_time = now
 
-        if self._qr_poll_thread and self._qr_poll_thread.is_alive():
-            self._qr_stop_event.set()
-            try:
-                self._qr_poll_thread.join(timeout=1.0)
-            except Exception:
-                pass
-
-        self._qr_stop_event.clear()
-
-        def _poll_worker():
-            logger.info(f"Pan123Pilot 开始监听 123 微信扫码授权 (UUID: {session_uuid[:8]}...)...")
-            for _ in range(90):  # 轮询 180 秒 (90 * 2s)
-                if self._qr_stop_event.is_set():
-                    break
-                time.sleep(2)
-                if not isinstance(self.client, Pan123WebClient):
-                    break
-                is_done, tok, msg = self.client.check_qr_login_status(session_uuid)
-                if is_done and tok:
-                    self._pan123_token = tok
-                    try:
-                        self.save_data("pan123_token", self._pan123_token)
-                    except Exception:
-                        pass
-                    self._auth_status_msg = "已连接 (微信扫码登录成功，Token 已保存)"
-                    logger.info("Pan123Pilot 微信扫码登录成功！已成功持久化保存 Token")
-                    self.notify("123云盘登录成功", "微信扫码授权登录成功！已自动持久化保存 Token，后续免扫码免密自动运行！")
-                    break
-                elif "过期" in msg:
-                    self._auth_status_msg = "扫码二维码已过期，请刷新二维码重新扫描"
-                    break
-                else:
-                    self._auth_status_msg = f"等待微信扫码授权 ({msg})"
-
-        self._qr_poll_thread = threading.Thread(target=_poll_worker, daemon=True)
-        self._qr_poll_thread.start()
+        title = "🚨 123云盘 Web Token 失效报警"
+        text = (
+            f"123云盘助手检测到当前配置的 Web Token (authorToken) 已失效或过期！\n"
+            f"详细原因: {reason or '授权凭证过期'}\n\n"
+            f"⚠️ 保护机制已生效：当前所有待同步媒体任务已自动暂停并安全保留在重试队列中，不会损耗重试次数。\n\n"
+            f"【更新方法 (仅需 10 秒)】:\n"
+            f"1. 电脑浏览器访问 123pan.com 并登录\n"
+            f"2. 按 F12 打开开发者工具 -> Application (应用程序) -> Local Storage (本地存储)\n"
+            f"3. 复制 key 为 authorToken 的值\n"
+            f"4. 粘贴到 MoviePilot「123云盘助手」插件表单中保存即可立即恢复秒传！"
+        )
+        self.notify(title=title, text=text)
+        logger.error(f"Pan123Pilot 已发送 Token 失效高优先级报警通知: {reason}")
 
     def notify(self, title: str, text: str) -> None:
         """调用 MoviePilot 渠道发送消息通知"""
@@ -345,9 +329,6 @@ class Pan123Pilot(_PluginBase):
                 pass
         self._pan123_username = str(config.get("pan123_username") or "").strip()
         self._pan123_password = str(config.get("pan123_password") or "").strip()
-        action_send_sms = bool(config.get("action_send_sms", False))
-        pan123_sms_code = str(config.get("pan123_sms_code") or "").strip()
-        action_refresh_qrcode = bool(config.get("action_refresh_qrcode", False))
         self._client_id = str(config.get("client_id") or "").strip()
         self._client_secret = str(config.get("client_secret") or "").strip()
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
@@ -419,7 +400,7 @@ class Pan123Pilot(_PluginBase):
         # 2. 基础组件初始化（即使未启用也能安全响应页面与状态查询）
         self.db_helper = Pan123TaskDatabase()
         self.db_helper.ensure_table()
-        if self._auth_mode in ("web_token", "web_qr", "web_sms", "web_account"):
+        if self._auth_mode in ("web_token", "web_account"):
             self.client = Pan123WebClient(
                 username=self._pan123_username,
                 password=self._pan123_password,
@@ -462,7 +443,7 @@ class Pan123Pilot(_PluginBase):
             "user_name": self._symedia_user_name,
         }
 
-        # 3. 启动任务调度器
+        # 3. 启动任务调度器 (接入 Token 过期主动报警机制)
         self.scheduler = TaskScheduler(
             client=self.client,
             qb_helper=self.qb_helper,
@@ -474,6 +455,7 @@ class Pan123Pilot(_PluginBase):
             local_library_root=self._local_library_root,
             enable_path_cascade=self._enable_path_cascade,
             symedia_config=symedia_config,
+            on_token_expired=self._notify_token_expired,
         )
         self.scheduler.start()
         global _plugin_instance
@@ -483,61 +465,8 @@ class Pan123Pilot(_PluginBase):
         # 4. 严格按照选定的 auth_mode 校验状态与鉴权，彻底杜绝跨模式越权降级
         self._auth_status_msg = "待检测"
         if isinstance(self.client, Pan123WebClient):
-            # 场景 A：用户在表单中勾选了「立即发送短信验证码」
-            if action_send_sms:
-                if not self._pan123_username:
-                    self._auth_status_msg = "发送短信失败: 未填写手机号"
-                    logger.error("Pan123Pilot 发送短信验证码失败：未填写手机号，请在「123 账号 / 手机号」中输入！")
-                else:
-                    logger.info(f"Pan123Pilot 正在向手机号 {self._pan123_username} 请求发送短信验证码...")
-                    ok_sms, msg_sms = self.client.send_sms_code(self._pan123_username)
-                    if ok_sms:
-                        self._auth_status_msg = f"短信已发送至 {self._pan123_username}，请查收并在表单中填入验证码后再次点击保存完成登录！"
-                        logger.info(f"Pan123Pilot 短信验证码发送成功: {msg_sms}")
-                        self.notify("123云盘短信验证码", f"短信验证码已下发至手机 {self._pan123_username}，请在插件表单填入 6 位验证码后点击保存完成登录！")
-                    else:
-                        self._auth_status_msg = f"发送短信失败: {msg_sms}"
-                        logger.error(f"Pan123Pilot 发送短信失败: {msg_sms}")
-
-            # 场景 B：用户填入了短信验证码，触发提交登录
-            elif pan123_sms_code:
-                logger.info(f"Pan123Pilot 正在使用短信验证码提交登录 (手机号: {self._pan123_username})...")
-                ok_sms_login, msg_sms_login = self.client.login_by_sms_code(code=pan123_sms_code, phone=self._pan123_username)
-                if ok_sms_login:
-                    self._pan123_token = self.client.token
-                    try:
-                        self.save_data("pan123_token", self._pan123_token)
-                    except Exception:
-                        pass
-                    self._auth_status_msg = "已连接 (短信登录成功，Token 已自动永久保存)"
-                    logger.info(f"Pan123Pilot 短信登录成功！已成功持久化保存 Token (前缀: {self._pan123_token[:10]}...)")
-                    self.notify("123云盘登录成功", "短信验证码校验成功！已永久保存登录 Token，后续秒传完全免密自动运行！")
-                else:
-                    self._auth_status_msg = f"短信登录失败: {msg_sms_login}"
-                    logger.error(f"Pan123Pilot 短信登录失败: {msg_sms_login}")
-
-            # 场景 C：微信/APP 扫码登录模式 (web_qr) 或勾选了「生成/刷新微信登录二维码」
-            elif self._auth_mode == "web_qr" or action_refresh_qrcode:
-                if self._pan123_token and not action_refresh_qrcode and self.client.check_token_validity():
-                    u_name = self.client.user_info.get("nickname") or self.client.user_info.get("username") or ""
-                    user_desc = f" (用户: {u_name})" if u_name else ""
-                    self._auth_status_msg = f"已连接 (扫码登录 Token 有效{user_desc})"
-                    logger.info(f"Pan123Pilot 123云盘扫码登录 Token 校验有效，连接正常！{user_desc}")
-                else:
-                    logger.info("Pan123Pilot 正在生成 123 微信/App 扫码登录凭证与二维码...")
-                    ok_qr, qr_data, msg_qr = self.client.generate_qr_login()
-                    if ok_qr and qr_data:
-                        self._qr_session = qr_data
-                        self._auth_status_msg = "待扫码 (请进入插件详情页用微信扫码授权)"
-                        logger.info(f"Pan123Pilot 微信登录二维码已生成！授权链接: {qr_data.get('url')}")
-                        self._start_qr_polling(qr_data["uuid"])
-                        self.notify("123云盘扫码登录", "已为您生成 123 微信扫码授权二维码，请进入 MoviePilot 插件详情页用微信扫码授权登录！")
-                    else:
-                        self._auth_status_msg = f"生成二维码失败: {msg_qr}"
-                        logger.error(f"Pan123Pilot 生成二维码失败: {msg_qr}")
-
-            # 场景 D：Web Token 直填模式 (web_token) —— 严格使用填入的 Token，100% 免疫密码登录风控与滑块，绝不自动降级！
-            elif self._auth_mode == "web_token":
+            # 模式 1：Web Token 直填模式 (web_token) —— 强烈推荐，100% 免疫密码登录风控与滑块
+            if self._auth_mode == "web_token":
                 if not self._pan123_token:
                     self._auth_status_msg = "未配置 Web Token (请在表单中粘贴 authorToken)"
                     logger.warning("Pan123Pilot 当前选择 Web Token 直填模式，但未填写 Token。请在浏览器按 F12 复制 authorToken 粘贴保存！")
@@ -553,10 +482,9 @@ class Pan123Pilot(_PluginBase):
                         except Exception:
                             pass
                     else:
-                        self._auth_status_msg = "Web Token 校验未通过: Token 无效或已过期，请在 123 网页端重新复制 authorToken 填入"
-                        logger.error("Pan123Pilot 123云盘 Web Token 校验未通过，请检查是否完整复制了 authorToken！")
+                        self._notify_token_expired("Web Token 校验未通过或已过期，请在 123 网页端重新复制 authorToken 填入")
 
-            # 场景 D：账号密码模式 (web_account)
+            # 模式 2：账号密码模式 (web_account)
             elif self._auth_mode == "web_account":
                 if not self._pan123_username or not self._pan123_password:
                     self._auth_status_msg = "未配置 123 账号或密码"
@@ -576,12 +504,11 @@ class Pan123Pilot(_PluginBase):
                         self._auth_status_msg = f"登录失败: {msg}"
                         logger.error(f"Pan123Pilot 123云盘登录失败: {msg}")
 
-            # 场景 E：短信验证码模式 (web_sms) 下无新操作时的探活
-            elif self._auth_mode == "web_sms":
+            else:
                 if self._pan123_token and self.client.check_token_validity():
-                    self._auth_status_msg = "已连接 (短信登录 Token 有效)"
+                    self._auth_status_msg = "已连接 (Web Token 有效)"
                 else:
-                    self._auth_status_msg = "未登录 (请在下方勾选「立即发送短信验证码」并输入验证码完成登录)"
+                    self._auth_status_msg = "未连接 (请检查认证配置)"
 
         elif isinstance(self.client, Pan123Client):
             tok = self.client.get_access_token()
@@ -719,27 +646,6 @@ class Pan123Pilot(_PluginBase):
                 "summary": "手动扫描本地媒体库并补录待同步媒体文件",
             },
             {
-                "path": "/qr_code",
-                "endpoint": self._api_get_qr_code,
-                "methods": ["GET", "POST"],
-                "auth": "bear",
-                "summary": "获取或刷新 123 微信扫码登录二维码及状态",
-            },
-            {
-                "path": "/send_sms",
-                "endpoint": self._api_send_sms,
-                "methods": ["POST", "GET"],
-                "auth": "bear",
-                "summary": "发送 123 云盘登录短信验证码",
-            },
-            {
-                "path": "/verify_sms",
-                "endpoint": self._api_verify_sms,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "提交短信验证码登录并自动保存 Token",
-            },
-            {
                 "path": "/test_auth",
                 "endpoint": self._api_test_auth,
                 "methods": ["POST", "GET"],
@@ -760,42 +666,6 @@ class Pan123Pilot(_PluginBase):
     def _api_trigger_cleanup(self) -> dict:
         self._service_cleanup_tasks()
         return {"code": 0, "message": "已手动触发做种达标清理"}
-
-    def _api_get_qr_code(self, refresh: bool = False) -> dict:
-        """获取或刷新当前微信扫码登录信息"""
-        if not isinstance(self.client, Pan123WebClient):
-            return {"code": 1, "message": "仅在 Web 模式下支持微信扫码登录"}
-        if refresh or not self._qr_session or not self._qr_session.get("uuid"):
-            ok, data, msg = self.client.generate_qr_login()
-            if ok and data:
-                self._qr_session = data
-                self._start_qr_polling(data["uuid"])
-                return {"code": 0, "message": "二维码已生成", "data": self._qr_session}
-            return {"code": 1, "message": f"生成二维码失败: {msg}"}
-        return {"code": 0, "message": "ok", "data": self._qr_session}
-
-    def _api_send_sms(self, phone: Optional[str] = None) -> dict:
-        """向指定手机号发送 123 短信验证码"""
-        target = phone or self._pan123_username
-        if isinstance(self.client, Pan123WebClient):
-            ok, msg = self.client.send_sms_code(target)
-            return {"code": 0 if ok else 1, "message": msg}
-        return {"code": 1, "message": "仅在 Web 模式下支持短信验证码发送"}
-
-    def _api_verify_sms(self, code: str, phone: Optional[str] = None) -> dict:
-        """校验短信验证码并保存 Token"""
-        target = phone or self._pan123_username
-        if isinstance(self.client, Pan123WebClient):
-            ok, msg = self.client.login_by_sms_code(code=code, phone=target)
-            if ok:
-                self._pan123_token = self.client.token
-                try:
-                    self.save_data("pan123_token", self._pan123_token)
-                except Exception:
-                    pass
-                return {"code": 0, "message": "短信验证成功！已自动保存 Token", "token": self._pan123_token}
-            return {"code": 1, "message": msg}
-        return {"code": 1, "message": "仅在 Web 模式下支持短信验证"}
 
     def _api_test_auth(self) -> dict:
         """测试 123 云盘认证状态"""
@@ -891,9 +761,7 @@ class Pan123Pilot(_PluginBase):
                                             "model": "auth_mode",
                                             "label": "认证方式 (强烈推荐 Web Token 直填模式，100% 免疫滑块风控)",
                                             "items": [
-                                                {"title": "微信/APP 扫码登录 (强烈推荐，免输密码防 [7012] 境外风控)", "value": "web_qr"},
                                                 {"title": "Web Token 直填模式 (强烈推荐，100% 免疫境外/机房风控与滑块)", "value": "web_token"},
-                                                {"title": "手机短信验证码登录 (解决境外/机房 IP [7012] 风险)", "value": "web_sms"},
                                                 {"title": "账号密码模式 (模拟网页端自动登录)", "value": "web_account"},
                                                 {"title": "OpenAPI 开放平台模式 (需购买官方开发者权益包)", "value": "openapi"},
                                             ],
@@ -931,7 +799,7 @@ class Pan123Pilot(_PluginBase):
                                         "props": {
                                             "model": "pan123_username",
                                             "label": "123 账号 / 手机号",
-                                            "placeholder": "账号密码模式或短信模式下填写绑定的手机号",
+                                            "placeholder": "账号密码模式下填写 123 手机号或账号",
                                         },
                                     }
                                 ],
@@ -946,53 +814,7 @@ class Pan123Pilot(_PluginBase):
                                             "model": "pan123_password",
                                             "label": "123 登录密码",
                                             "type": "password",
-                                            "placeholder": "账号密码模式下填写 123 登录密码 (短信与 Token 模式无需填写)",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 12},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "action_refresh_qrcode",
-                                            "label": "生成/刷新微信登录二维码 (勾选后点保存)",
-                                            "hint": "保存后插件后台将生成最新微信授权登录二维码，可在插件详情页用手机扫码完成免密登录",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "action_send_sms",
-                                            "label": "立即发送短信验证码 (勾选后点保存，发送6位验证码到手机)",
-                                            "hint": "填好手机号后开启此项并点击保存，插件将向手机发送短信验证码",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "pan123_sms_code",
-                                            "label": "短信验证码 (收到后填入6位验证码，再次点击保存完成登录)",
-                                            "placeholder": "6位数字验证码",
-                                            "hint": "填入收到的短信验证码后点击保存，插件将自动完成登录并永久保存 Token",
-                                            "persistent-hint": True,
+                                            "placeholder": "账号密码模式下填写 123 登录密码 (Web Token 直填模式无需填写)",
                                         },
                                     }
                                 ],
@@ -1515,9 +1337,6 @@ class Pan123Pilot(_PluginBase):
             "pan123_token": "",
             "pan123_username": "",
             "pan123_password": "",
-            "action_refresh_qrcode": False,
-            "action_send_sms": False,
-            "pan123_sms_code": "",
             "client_id": "",
             "client_secret": "",
             "target_parent_file_id": 0,
@@ -1565,7 +1384,7 @@ class Pan123Pilot(_PluginBase):
         symedia_text = "已启用" if self._symedia_enabled else "未启用"
         dl_text = "手动模式" if self._downloader_select == "manual" else f"系统下载器 ({self._qb_host or '已绑定'})"
 
-        components = [
+        return [
             {
                 "component": "VAlert",
                 "props": {
@@ -1582,45 +1401,10 @@ class Pan123Pilot(_PluginBase):
             }
         ]
 
-        # 若未成功连接且已生成扫码会话，在页面直观渲染二维码供用户手机扫码
-        if not is_auth_ok and isinstance(self._qr_session, dict) and self._qr_session.get("img_url"):
-            components.append({
-                "component": "VCard",
-                "props": {"class": "mt-3 pa-4 text-center"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {"class": "text-h6 font-weight-bold justify-center"},
-                        "text": "📱 123云盘 微信/APP 扫码登录 (免输密码，100% 避开 [7012] 境外风控)",
-                    },
-                    {
-                        "component": "VCardSubtitle",
-                        "props": {"class": "text-body-2 mb-2"},
-                        "text": "打开手机微信或 123云盘 App 扫描下方二维码，点击「授权登录」后插件将自动保存 Token 永久使用",
-                    },
-                    {
-                        "component": "VImg",
-                        "props": {
-                            "src": self._qr_session.get("img_url"),
-                            "max-width": 220,
-                            "class": "mx-auto my-3 elevation-2 rounded",
-                        },
-                    },
-                    {
-                        "component": "VCardText",
-                        "props": {"class": "text-caption text-grey"},
-                        "text": f"若手机无法直接扫码，可在微信中打开此授权链接：{self._qr_session.get('url')}",
-                    },
-                ],
-            })
-
-        return components
-
     def stop_service(self) -> None:
         """彻底释放插件后台线程及资源"""
         global _plugin_instance
         _plugin_instance = None
-        self._qr_stop_event.set()
         if self.scheduler:
             self.scheduler.stop()
             self.scheduler = None
