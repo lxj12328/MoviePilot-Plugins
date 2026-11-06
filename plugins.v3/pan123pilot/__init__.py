@@ -205,7 +205,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -285,16 +285,24 @@ class Pan123Pilot(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._auth_mode = str(config.get("auth_mode") or "web_token").strip()
-        self._pan123_token = str(config.get("pan123_token") or "").strip()
-        if not self._pan123_token:
+        raw_token = str(config.get("pan123_token") or "").strip()
+        if raw_token:
+            self._pan123_token = Pan123WebClient._clean_token(raw_token)
+            try:
+                self.save_data("pan123_token", self._pan123_token)
+            except Exception:
+                pass
+        else:
             try:
                 cached_tok = self.get_data("pan123_token")
                 if cached_tok:
-                    self._pan123_token = str(cached_tok).strip()
+                    self._pan123_token = Pan123WebClient._clean_token(cached_tok)
             except Exception:
                 pass
         self._pan123_username = str(config.get("pan123_username") or "").strip()
         self._pan123_password = str(config.get("pan123_password") or "").strip()
+        action_send_sms = bool(config.get("action_send_sms", False))
+        pan123_sms_code = str(config.get("pan123_sms_code") or "").strip()
         self._client_id = str(config.get("client_id") or "").strip()
         self._client_secret = str(config.get("client_secret") or "").strip()
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
@@ -366,7 +374,7 @@ class Pan123Pilot(_PluginBase):
         # 2. 基础组件初始化（即使未启用也能安全响应页面与状态查询）
         self.db_helper = Pan123TaskDatabase()
         self.db_helper.ensure_table()
-        if self._auth_mode in ("web_token", "web_account"):
+        if self._auth_mode in ("web_token", "web_sms", "web_account"):
             self.client = Pan123WebClient(
                 username=self._pan123_username,
                 password=self._pan123_password,
@@ -427,49 +435,89 @@ class Pan123Pilot(_PluginBase):
         _plugin_instance = self
         logger.info("Pan123Pilot (123云盘助手) 初始化完成并已启动后台调度")
 
-        # 4. 立即检验 123 云盘登录与鉴权状态并输出详细反馈
+        # 4. 严格按照选定的 auth_mode 校验状态与鉴权，彻底杜绝跨模式越权降级
         self._auth_status_msg = "待检测"
         if isinstance(self.client, Pan123WebClient):
-            if self._auth_mode == "web_account" or (not self._pan123_token and self._pan123_username and self._pan123_password):
-                logger.info(f"Pan123Pilot 正在使用 123 账号密码登录 (账号: {self._pan123_username})...")
-                ok, msg = self.client.login_by_password()
-                if ok:
-                    self._auth_status_msg = "已连接 (账号密码登录成功)"
-                    logger.info(f"Pan123Pilot 123云盘登录成功！已成功获取并缓存 Token (前缀: {self.client.token[:10]}...)")
+            # 场景 A：用户在表单中勾选了「立即发送短信验证码」
+            if action_send_sms:
+                if not self._pan123_username:
+                    self._auth_status_msg = "发送短信失败: 未填写手机号"
+                    logger.error("Pan123Pilot 发送短信验证码失败：未填写手机号，请在「123 账号 / 手机号」中输入！")
+                else:
+                    logger.info(f"Pan123Pilot 正在向手机号 {self._pan123_username} 请求发送短信验证码...")
+                    ok_sms, msg_sms = self.client.send_sms_code(self._pan123_username)
+                    if ok_sms:
+                        self._auth_status_msg = f"短信已发送至 {self._pan123_username}，请查收并在表单中填入验证码后再次点击保存完成登录！"
+                        logger.info(f"Pan123Pilot 短信验证码发送成功: {msg_sms}")
+                        self.notify("123云盘短信验证码", f"短信验证码已下发至手机 {self._pan123_username}，请在插件表单填入 6 位验证码后点击保存完成登录！")
+                    else:
+                        self._auth_status_msg = f"发送短信失败: {msg_sms}"
+                        logger.error(f"Pan123Pilot 发送短信失败: {msg_sms}")
+
+            # 场景 B：用户填入了短信验证码，触发提交登录
+            elif pan123_sms_code:
+                logger.info(f"Pan123Pilot 正在使用短信验证码提交登录 (手机号: {self._pan123_username})...")
+                ok_sms_login, msg_sms_login = self.client.login_by_sms_code(code=pan123_sms_code, phone=self._pan123_username)
+                if ok_sms_login:
                     self._pan123_token = self.client.token
                     try:
                         self.save_data("pan123_token", self._pan123_token)
                     except Exception:
                         pass
+                    self._auth_status_msg = "已连接 (短信登录成功，Token 已自动永久保存)"
+                    logger.info(f"Pan123Pilot 短信登录成功！已成功持久化保存 Token (前缀: {self._pan123_token[:10]}...)")
+                    self.notify("123云盘登录成功", "短信验证码校验成功！已永久保存登录 Token，后续秒传完全免密自动运行！")
                 else:
-                    self._auth_status_msg = f"登录失败: {msg}"
-                    logger.error(f"Pan123Pilot 123云盘登录失败: {msg}")
-            elif self._pan123_token:
-                logger.info("Pan123Pilot 正在校验 123 云盘 Web Token 有效性...")
-                if self.client.check_token_validity():
-                    self._auth_status_msg = "已连接 (Token 有效)"
-                    logger.info(f"Pan123Pilot 123云盘 Web Token 校验成功，连接正常！(前缀: {self._pan123_token[:10]}...)")
+                    self._auth_status_msg = f"短信登录失败: {msg_sms_login}"
+                    logger.error(f"Pan123Pilot 短信登录失败: {msg_sms_login}")
+
+            # 场景 C：Web Token 直填模式 (web_token) —— 严格使用填入的 Token，100% 免疫密码登录风控与滑块，绝不自动降级！
+            elif self._auth_mode == "web_token":
+                if not self._pan123_token:
+                    self._auth_status_msg = "未配置 Web Token (请在表单中粘贴 authorToken)"
+                    logger.warning("Pan123Pilot 当前选择 Web Token 直填模式，但未填写 Token。请在浏览器按 F12 复制 authorToken 粘贴保存！")
                 else:
-                    if self._pan123_username and self._pan123_password:
-                        logger.warning("Pan123Pilot Web Token 已失效，正在尝试使用账号密码自动重新登录刷新 Token...")
-                        ok_relogin, msg_relogin = self.client.login_by_password()
-                        if ok_relogin:
-                            self._auth_status_msg = "已连接 (已自动刷新 Token)"
-                            logger.info(f"Pan123Pilot 账号密码重新登录成功！已自动更新 Token")
-                            self._pan123_token = self.client.token
-                            try:
-                                self.save_data("pan123_token", self._pan123_token)
-                            except Exception:
-                                pass
-                        else:
-                            self._auth_status_msg = f"Token 失效且自动登录失败: {msg_relogin}"
-                            logger.error(f"Pan123Pilot 自动刷新 Token 失败: {msg_relogin}")
+                    logger.info(f"Pan123Pilot 正在校验 Web Token 有效性 (前缀: {self._pan123_token[:10]}...)...")
+                    if self.client.check_token_validity():
+                        u_name = self.client.user_info.get("nickname") or self.client.user_info.get("username") or ""
+                        user_desc = f" (用户: {u_name})" if u_name else ""
+                        self._auth_status_msg = f"已连接 (Web Token 有效{user_desc})"
+                        logger.info(f"Pan123Pilot 123云盘 Web Token 校验成功，连接正常！{user_desc}")
+                        try:
+                            self.save_data("pan123_token", self._pan123_token)
+                        except Exception:
+                            pass
                     else:
-                        self._auth_status_msg = "Token 已失效"
-                        logger.error("Pan123Pilot 123云盘 Web Token 已失效，请在网页端按 F12 重新复制 authorToken 填入！")
-            else:
-                self._auth_status_msg = "未配置凭据"
-                logger.warning("Pan123Pilot 未配置 123 云盘 Token 或账号密码，请在插件配置中输入！")
+                        self._auth_status_msg = "Web Token 校验未通过: Token 无效或已过期，请在 123 网页端重新复制 authorToken 填入"
+                        logger.error("Pan123Pilot 123云盘 Web Token 校验未通过，请检查是否完整复制了 authorToken！")
+
+            # 场景 D：账号密码模式 (web_account)
+            elif self._auth_mode == "web_account":
+                if not self._pan123_username or not self._pan123_password:
+                    self._auth_status_msg = "未配置 123 账号或密码"
+                    logger.warning("Pan123Pilot 账号密码模式下未完整配置账号与密码！")
+                else:
+                    logger.info(f"Pan123Pilot 正在使用 123 账号密码登录 (账号: {self._pan123_username})...")
+                    ok, msg = self.client.login_by_password()
+                    if ok:
+                        self._auth_status_msg = "已连接 (账号密码登录成功)"
+                        self._pan123_token = self.client.token
+                        logger.info(f"Pan123Pilot 123云盘账号密码登录成功！(前缀: {self.client.token[:10]}...)")
+                        try:
+                            self.save_data("pan123_token", self._pan123_token)
+                        except Exception:
+                            pass
+                    else:
+                        self._auth_status_msg = f"登录失败: {msg}"
+                        logger.error(f"Pan123Pilot 123云盘登录失败: {msg}")
+
+            # 场景 E：短信验证码模式 (web_sms) 下无新操作时的探活
+            elif self._auth_mode == "web_sms":
+                if self._pan123_token and self.client.check_token_validity():
+                    self._auth_status_msg = "已连接 (短信登录 Token 有效)"
+                else:
+                    self._auth_status_msg = "未登录 (请在下方勾选「立即发送短信验证码」并输入验证码完成登录)"
+
         elif isinstance(self.client, Pan123Client):
             tok = self.client.get_access_token()
             if tok:
@@ -758,9 +806,10 @@ class Pan123Pilot(_PluginBase):
                                             "model": "auth_mode",
                                             "label": "认证方式 (强烈推荐 Web Token 直填模式，100% 免疫滑块风控)",
                                             "items": [
-                                                {"title": "Web Token 直填模式 (强烈推荐，免输密码防风控)", "value": "web_token"},
-                                                {"title": "账号密码模式 (模拟 Web 登录)", "value": "web_account"},
-                                                {"title": "OpenAPI 开放平台模式 (需购买官方开发者包)", "value": "openapi"},
+                                                {"title": "Web Token 直填模式 (强烈推荐，100% 免疫境外/机房风控与滑块)", "value": "web_token"},
+                                                {"title": "手机短信验证码登录 (解决境外/机房 IP [7012] 风险)", "value": "web_sms"},
+                                                {"title": "账号密码模式 (模拟网页端自动登录)", "value": "web_account"},
+                                                {"title": "OpenAPI 开放平台模式 (需购买官方开发者权益包)", "value": "openapi"},
                                             ],
                                         },
                                     }
@@ -781,7 +830,7 @@ class Pan123Pilot(_PluginBase):
                                             "model": "pan123_token",
                                             "label": "123 云盘 Web Token (authorToken)",
                                             "placeholder": "浏览器打开 123pan.com 登录后，F12 -> Application -> Local Storage 复制 authorToken",
-                                            "hint": "填入后直接免密调用秒传接口，100% 避开任何滑块与验证码拦截",
+                                            "hint": "填入后直接免密调用秒传接口，100% 避开任何滑块与验证码拦截 (支持自动去除首尾引号与 Bearer 前缀)",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -796,7 +845,7 @@ class Pan123Pilot(_PluginBase):
                                         "props": {
                                             "model": "pan123_username",
                                             "label": "123 账号 / 手机号",
-                                            "placeholder": "账号密码模式下填写绑定的手机号",
+                                            "placeholder": "账号密码模式或短信模式下填写绑定的手机号",
                                         },
                                     }
                                 ],
@@ -811,7 +860,38 @@ class Pan123Pilot(_PluginBase):
                                             "model": "pan123_password",
                                             "label": "123 登录密码",
                                             "type": "password",
-                                            "placeholder": "账号密码模式下填写 123 登录密码",
+                                            "placeholder": "账号密码模式下填写 123 登录密码 (短信与 Token 模式无需填写)",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "action_send_sms",
+                                            "label": "立即发送短信验证码 (勾选后点保存，发送6位验证码到手机)",
+                                            "hint": "填好手机号后开启此项并点击保存，插件将向手机发送短信验证码",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "pan123_sms_code",
+                                            "label": "短信验证码 (收到后填入6位验证码，再次点击保存完成登录)",
+                                            "placeholder": "6位数字验证码",
+                                            "hint": "填入收到的短信验证码后点击保存，插件将自动完成登录并永久保存 Token",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -1334,6 +1414,8 @@ class Pan123Pilot(_PluginBase):
             "pan123_token": "",
             "pan123_username": "",
             "pan123_password": "",
+            "action_send_sms": False,
+            "pan123_sms_code": "",
             "client_id": "",
             "client_secret": "",
             "target_parent_file_id": 0,

@@ -96,5 +96,37 @@ class TestPan123WebClient(unittest.TestCase):
             self.assertEqual(dir_id, 2001)
 
 
+    def test_token_cleaner(self):
+        # 测试自动剔除双引号、单引号与 Bearer 前缀
+        self.assertEqual(Pan123WebClient._clean_token('"my_token_123"'), "my_token_123")
+        self.assertEqual(Pan123WebClient._clean_token("'my_token_456'"), "my_token_456")
+        self.assertEqual(Pan123WebClient._clean_token('Bearer my_token_789'), "my_token_789")
+        self.assertEqual(Pan123WebClient._clean_token('Bearer "my_token_000"'), "my_token_000")
+        self.assertEqual(Pan123WebClient._clean_token('  "bearer token_abc"  '), "token_abc")
+
+    def test_auth_mode_isolation_web_token_never_calls_password_login(self):
+        # 在 web_token 直填模式下，即使配置了账号密码且 Token 失效，也绝不擅自调用账号密码登录
+        client = Pan123WebClient(
+            username="13800000000",
+            password="mock_password",
+            token="invalid_token",
+            auth_mode="web_token",
+        )
+        with patch.object(client, "check_token_validity", return_value=False):
+            with patch.object(client, "login_by_password") as mock_login_pwd:
+                ok, msg = client.ensure_authenticated()
+                self.assertFalse(ok)
+                self.assertIn("authorToken", msg)
+                mock_login_pwd.assert_not_called()
+
+    def test_user_info_validity_check(self):
+        client = Pan123WebClient(token="mock_valid_token_123")
+        with patch.object(client, "_http_get") as mock_get:
+            mock_get.return_value = (True, {"code": 0, "data": {"nickname": "TestUser", "uid": 12345}}, "ok")
+            valid = client.check_token_validity()
+            self.assertTrue(valid)
+            self.assertEqual(client.user_info.get("nickname"), "TestUser")
+
+
 if __name__ == "__main__":
     unittest.main()

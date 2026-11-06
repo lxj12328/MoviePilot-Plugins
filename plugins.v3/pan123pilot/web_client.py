@@ -38,14 +38,26 @@ class Pan123WebClient:
     ):
         self.username = (username or "").strip()
         self.password = (password or "").strip()
-        self.token = (token or "").strip()
-        self.auth_mode = auth_mode  # web_token / web_account
+        self.token = self._clean_token(token)
+        self.auth_mode = auth_mode  # web_token / web_sms / web_account
         self._dir_cache: dict[str, int] = {}
         self._last_token_check = 0.0
+        self.user_info: dict = {}
+
+    @staticmethod
+    def _clean_token(raw_token: Any) -> str:
+        """清洗 Token：去除首尾空格、包裹的双引号/单引号及重复的 Bearer 前缀"""
+        if not raw_token:
+            return ""
+        tok = str(raw_token).strip().strip('"').strip("'").strip()
+        if tok.lower().startswith("bearer "):
+            tok = tok[7:].strip().strip('"').strip("'").strip()
+        return tok
 
     def set_token(self, token: str) -> None:
-        """动态更新 Token"""
-        self.token = (token or "").strip()
+        """动态更新 Token 并自动清洗"""
+        self.token = self._clean_token(token)
+        self._last_token_check = 0.0
 
     def _get_headers(self, with_auth: bool = True) -> dict[str, str]:
         """构造 Web 端标准请求头"""
@@ -60,6 +72,30 @@ class Pan123WebClient:
         if with_auth and self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
+
+    def _http_get(
+        self,
+        url: str,
+        with_auth: bool = True,
+        timeout: int = 15,
+    ) -> tuple[bool, dict, str]:
+        """统一 HTTP GET 请求方法"""
+        headers = self._get_headers(with_auth=with_auth)
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                res_json = json.loads(raw)
+                return True, res_json, "ok"
+        except urllib.error.HTTPError as e:
+            try:
+                err_raw = e.read().decode("utf-8")
+                err_json = json.loads(err_raw)
+                return False, err_json, f"HTTP {e.code}: {err_json.get('message', e.reason)}"
+            except Exception:
+                return False, {}, f"HTTP {e.code}: {e.reason}"
+        except Exception as e:
+            return False, {}, str(e)
 
     def _http_post(
         self,
@@ -88,7 +124,7 @@ class Pan123WebClient:
             return False, {}, str(e)
 
     def check_token_validity(self) -> bool:
-        """检查当前 Token 是否有效"""
+        """检查当前 Token 是否有效 (支持 user/info 探活与列表双重校验)"""
         if not self.token:
             return False
 
@@ -96,12 +132,26 @@ class Pan123WebClient:
         if time.time() - self._last_token_check < 300:
             return True
 
-        url = f"{self.WEB_BASE_URL}/b/api/file/list/new"
+        # 1. 优先调用 123 官方 Web 端用户信息接口 GET api/user/info
+        user_info_urls = [
+            f"{self.WEB_BASE_URL}/api/user/info",
+            f"{self.USER_API_URL}/api/user/info",
+        ]
+        for url in user_info_urls:
+            ok, res, _ = self._http_get(url, with_auth=True)
+            if ok and res.get("code") == 0:
+                self.user_info = res.get("data") or {}
+                self._last_token_check = time.time()
+                return True
+
+        # 2. 备用调用 POST /b/api/file/list/new 进行探活
+        list_url = f"{self.WEB_BASE_URL}/b/api/file/list/new"
         payload = {"parentFileId": 0, "page": 1, "limit": 1}
-        ok, res, msg = self._http_post(url, payload, with_auth=True)
-        if ok and res.get("code") == 0:
+        ok_l, res_l, _ = self._http_post(list_url, payload, with_auth=True)
+        if ok_l and res_l.get("code") == 0:
             self._last_token_check = time.time()
             return True
+
         return False
 
     def login_by_password(self) -> tuple[bool, str]:
@@ -155,17 +205,29 @@ class Pan123WebClient:
         endpoints = [
             f"{self.USER_API_URL}/api/user/send_sms_code",
             f"{self.WEB_BASE_URL}/api/user/send_sms_code",
+            f"{self.USER_API_URL}/api/user/send_code",
         ]
-        payload = {"passport": target_phone, "type": 0}
+        payloads = [
+            {"passport": target_phone, "type": 0},
+            {"passport": target_phone, "type": 1},
+            {"phone": target_phone, "type": 0},
+            {"mobile": target_phone, "type": 0},
+        ]
 
+        last_err = "发送短信接口无响应"
         for url in endpoints:
-            ok, res, msg = self._http_post(url, payload, with_auth=False)
-            if ok and res.get("code") == 0:
-                return True, "短信验证码已成功发送，请查收手机短信"
-            elif ok:
-                return False, f"发送失败 [{res.get('code')}]: {res.get('message')}"
+            for payload in payloads:
+                ok, res, msg = self._http_post(url, payload, with_auth=False)
+                if ok:
+                    code = res.get("code")
+                    if code == 0:
+                        return True, "短信验证码已成功发送，请查收手机短信并在表单中填入！"
+                    else:
+                        last_err = f"发送失败 [{code}]: {res.get('message', msg)}"
+                else:
+                    last_err = msg
 
-        return False, "发送短信接口无响应"
+        return False, last_err
 
     def login_by_sms_code(self, code: str, phone: Optional[str] = None) -> tuple[bool, str]:
         """提交短信验证码完成登录"""
@@ -178,40 +240,58 @@ class Pan123WebClient:
             f"{self.USER_API_URL}/api/user/sign_in",
             f"{self.WEB_BASE_URL}/api/user/sign_in",
         ]
-        payload = {
-            "passport": target_phone,
-            "code": code_str,
-            "type": 0,
-        }
+        payloads = [
+            {"passport": target_phone, "code": code_str, "type": 0},
+            {"passport": target_phone, "code": code_str, "type": 1},
+            {"passport": target_phone, "sms_code": code_str, "type": 0},
+            {"phone": target_phone, "code": code_str, "type": 0},
+        ]
 
+        last_err = "短信登录接口异常"
         for url in endpoints:
-            ok, res, msg = self._http_post(url, payload, with_auth=False)
-            if ok and res.get("code") == 0:
-                data = res.get("data") or {}
-                token = data.get("token") or data.get("accessToken")
-                if token:
-                    self.token = token
-                    self._last_token_check = time.time()
-                    logger.info("Pan123Pilot 短信验证码登录成功！已获取有效 Token")
-                    return True, "登录成功"
-            elif ok:
-                return False, f"验证码登录失败 [{res.get('code')}]: {res.get('message')}"
+            for payload in payloads:
+                ok, res, msg = self._http_post(url, payload, with_auth=False)
+                if ok:
+                    code_res = res.get("code")
+                    if code_res == 0:
+                        data = res.get("data") or {}
+                        token = data.get("token") or data.get("accessToken")
+                        if token:
+                            self.token = token
+                            self._last_token_check = time.time()
+                            logger.info("Pan123Pilot 短信验证码登录成功！已获取有效 Token")
+                            return True, "登录成功"
+                    else:
+                        last_err = f"验证码登录失败 [{code_res}]: {res.get('message', msg)}"
+                else:
+                    last_err = msg
 
-        return False, "短信登录接口异常"
+        return False, last_err
 
     def ensure_authenticated(self) -> tuple[bool, str]:
-        """确保客户端处于已鉴权状态"""
-        # 1. 若已有 Token 且校验有效，直接放行
+        """确保客户端处于已鉴权状态，严格遵循选定的 auth_mode 隔离执行"""
+        # 1. 直填 Token 模式 (web_token): 严格以用户填写的 authorToken 为准，绝不擅自越权调用账号密码登录
+        if self.auth_mode == "web_token":
+            if not self.token:
+                return False, "未配置 Web Token，请在插件表单中填入 123 网页端 authorToken"
+            if self.check_token_validity():
+                return True, "Web Token 有效"
+            return False, "当前配置的 Web Token 已失效或校验未通过，请在 123 网页端重新复制 authorToken 填入"
+
+        # 2. 短信验证码模式 (web_sms): 使用短信验证码换取的 Token，失效时提示重新获取验证码
+        if self.auth_mode == "web_sms":
+            if self.token and self.check_token_validity():
+                return True, "短信登录 Token 有效"
+            return False, "短信登录 Token 已失效，请在插件配置中勾选「立即发送短信验证码」并输入验证码重新登录"
+
+        # 3. 账号密码模式 (web_account): 若已有有效 Token 优先复用，否则尝试账号密码登录
         if self.token and self.check_token_validity():
             return True, "Token 有效"
 
-        # 2. 若配置了账号密码，自动尝试静默登录
         if self.username and self.password:
             return self.login_by_password()
 
-        if self.token:
-            return False, "当前配置的 Web Token 已失效，请在网页端重新复制 authorToken"
-        return False, "未配置有效 Token 且未填写账号密码"
+        return False, "未配置有效的 123 账号或密码"
 
     def sha1_reuse(
         self,
@@ -256,13 +336,13 @@ class Pan123WebClient:
             else:
                 return False, None, "云端未命中秒传特征"
         elif code == 401:
-            # Token 偶发失效，重置检查并尝试重新登录
+            # Token 偶发失效
             self._last_token_check = 0.0
-            if self.username and self.password:
+            if self.auth_mode == "web_account" and self.username and self.password:
                 ok_relogin, _ = self.login_by_password()
                 if ok_relogin:
                     return self.sha1_reuse(filename, sha1_str, size, parent_file_id, md5_str)
-            return False, None, "Token 已过期，请重新配置 Web Token 或账号密码"
+            return False, None, "Token 已过期，请在插件表单中更新 Web Token 或重新短信登录"
         else:
             return False, None, f"秒传返回错误 [{code}]: {res.get('message', '未知错误')}"
 
