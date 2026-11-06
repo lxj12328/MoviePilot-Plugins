@@ -71,11 +71,13 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
     PAGE_FETCH_LIMIT = 500
+    # 详情页每页展示条数
+    PAGE_SIZE = 20
 
     def __init__(self):
         super().__init__()
@@ -740,6 +742,32 @@ class Pan123TgPilot(_PluginBase):
             "time": str(r.get("updated_at") or r.get("created_at") or "-")[:19],
         }
 
+    @staticmethod
+    def _records_table(rows_data: list[dict]) -> dict:
+        """用 VTable 逐行渲染一页记录 (移动端可横向滚动)"""
+        heads = ["影视名称", "画质 (分辨率/编码/HDR)", "大小", "评分", "来源频道", "类型", "转存时间"]
+        keys = ["title", "spec", "size", "score", "channel", "status", "time"]
+        if rows_data:
+            trs = [
+                {"component": "tr", "content": [{"component": "td", "text": str(row[k])} for k in keys]}
+                for row in rows_data
+            ]
+        else:
+            trs = [{"component": "tr", "content": [{
+                "component": "td", "props": {"colspan": len(keys), "class": "text-center text-grey py-4"},
+                "text": "暂无转存记录，抓取并转存资源后将在此展示",
+            }]}]
+        return {
+            "component": "VTable",
+            "props": {"density": "compact", "hover": True, "class": "text-no-wrap"},
+            "content": [
+                {"component": "thead", "content": [
+                    {"component": "tr", "content": [{"component": "th", "text": h} for h in heads]}
+                ]},
+                {"component": "tbody", "content": trs},
+            ],
+        }
+
     def get_page(self) -> list[dict]:
         """插件详情页：状态统计 + 带分页/排序的已转存资源数据表"""
         status_text = "运行中" if self._enabled else "未启用"
@@ -788,40 +816,39 @@ class Pan123TgPilot(_PluginBase):
             except Exception as e:
                 logger.error(f"Pan123TgPilot 读取转存记录失败: {e}")
 
-        headers = [
-            {"title": "影视名称", "key": "title", "sortable": True},
-            {"title": "画质 (分辨率/编码/HDR)", "key": "spec", "sortable": True},
-            {"title": "大小", "key": "size", "sortable": False},
-            {"title": "评分", "key": "score", "sortable": True},
-            {"title": "来源频道", "key": "channel", "sortable": True},
-            {"title": "类型", "key": "status", "sortable": True},
-            {"title": "转存时间", "key": "time", "sortable": True},
-        ]
-        table_card = {
-            "component": "VCard",
-            "props": {"variant": "outlined"},
+        # 注意：VDataTable 在 MoviePilot Vuetify JSON 渲染器下只渲染分页条、不渲染行，
+        # 因此改用 VTable + tr/td 逐行输出，并把记录按页分组：第 1 页直接展示，其余页放入折叠面板。
+        page_size = self.PAGE_SIZE
+        pages = [items[k:k + page_size] for k in range(0, len(items), page_size)]
+
+        body: list[dict] = [{
+            "component": "VCardItem",
             "content": [
-                {"component": "VCardItem", "content": [
-                    {"component": "VCardTitle", "text": f"已转存资源清单 (共 {total} 条)"},
-                    {"component": "VCardSubtitle",
-                     "text": f"按时间倒序，最多加载最近 {self.PAGE_FETCH_LIMIT} 条；点击表头可排序。"
-                             "按关键词/状态检索或翻阅全部请调用 /records?keyword=&page=&page_size="},
-                ]},
-                {
-                    "component": "VDataTable",
-                    "props": {
-                        "headers": headers,
-                        "items": items,
-                        "items-per-page": 10,
-                        "items-per-page-options": [10, 20, 50, 100],
-                        "items-per-page-text": "每页",
-                        "no-data-text": "暂无转存记录，抓取并转存资源后将在此展示",
-                        "density": "compact",
-                        "hover": True,
-                    },
-                },
+                {"component": "VCardTitle", "text": f"已转存资源清单 (共 {total} 条)"},
+                {"component": "VCardSubtitle",
+                 "text": f"按时间倒序，每页 {page_size} 条，更早的页请展开下方折叠面板；"
+                         "按关键词/状态检索请调用 /records?keyword=&page=&page_size="},
             ],
-        }
+        }]
+        body.append(self._records_table(pages[0] if pages else []))
+        if len(pages) > 1:
+            panels = []
+            for n, chunk in enumerate(pages[1:], start=2):
+                start, end = (n - 1) * page_size + 1, (n - 1) * page_size + len(chunk)
+                panels.append({
+                    "component": "VExpansionPanel",
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": f"第 {n} 页 (第 {start}-{end} 条)"},
+                        {"component": "VExpansionPanelText", "content": [self._records_table(chunk)]},
+                    ],
+                })
+            body.append({
+                "component": "VExpansionPanels",
+                "props": {"variant": "accordion", "class": "mt-2"},
+                "content": panels,
+            })
+
+        table_card = {"component": "VCard", "props": {"variant": "outlined"}, "content": body}
         return [status_card, table_card]
 
     def get_api(self) -> list[dict[str, Any]]:

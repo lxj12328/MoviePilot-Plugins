@@ -230,13 +230,27 @@ S05E217 4K WEB-DL H.265
         table_card = page[1]
         self.assertIn("共 1 条", table_card["content"][0]["content"][0]["text"])
         table = table_card["content"][1]
-        self.assertEqual(table["component"], "VDataTable")
-        self.assertEqual(table["props"]["items-per-page"], 10)
-        item = table["props"]["items"][0]
-        self.assertEqual(item["title"], "八仙！ (2026)")
-        self.assertEqual(item["spec"], "2160p / H.265 / DoVi")
-        self.assertEqual(item["status"], "首发转存")
-        self.assertEqual(item["score"], 120)
+        self.assertEqual(table["component"], "VTable")
+        rows = table["content"][1]["content"]
+        self.assertEqual(len(rows), 1)
+        cells = [c["text"] for c in rows[0]["content"]]
+        self.assertEqual(cells[0], "八仙！ (2026)")
+        self.assertEqual(cells[1], "2160p / H.265 / DoVi")
+        self.assertEqual(cells[3], "120")
+        self.assertEqual(cells[5], "首发转存")
+
+    def test_get_page_groups_rows_into_pages(self):
+        self.plugin.init_plugin({"enabled": True})
+        self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 45
+        self.plugin._db.list_records.return_value = [
+            {"media_title": f"片{i}", "status": "saved", "updated_at": "2026-11-06 20:00:00"} for i in range(45)
+        ]
+        card = self.plugin.get_page()[1]
+        first = card["content"][1]
+        self.assertEqual(len(first["content"][1]["content"]), self.plugin.PAGE_SIZE)
+        panels = card["content"][2]["content"]
+        self.assertEqual(len(panels), 2)  # 45 条 / 每页 20 → 共 3 页，其余 2 页折叠
 
     def test_api_records_pagination(self):
         self.plugin.init_plugin({"enabled": True})

@@ -126,11 +126,14 @@ flowchart LR
 - 记录存放在 MoviePilot 宿主数据库的自有表 `plugin_pan123_tg_record` 中（`link_hash`、`updated_at`、`status` 等均有索引），无需额外数据库文件。
 - 链接去重基于带索引的 `link_hash`（分享链接短码 `s:<key>` / 秒传文件哈希 `f:<etag>`），不再使用全表 `LIKE` 扫描。
 - 升级到 v1.1.0 时自动执行可重复运行的迁移：补齐 `link_hash` 列与索引并回填历史数据。
-- 详情页清单使用数据表：每页 10/20/50/100 条可选，点击表头排序，最多加载最近 500 条。
+- 详情页清单：每页 20 条，第 1 页直接展示，更早的页在折叠面板中展开，最多加载最近 500 条。
 - 完整检索与翻页使用 API：`GET /api/v1/plugin/Pan123TgPilot/records?keyword=八仙&status=saved&page=1&page_size=20`，返回 `total` / `pages` / `data`。
 - 手动清理：`/purge`（保留天数为 0 时不会删除任何数据）。
 
 ## 6. 版本历史 (Changelog)
+
+### v1.1.1
+- **修复详情页清单不显示行内容**：VDataTable 在 MoviePilot Vuetify JSON 渲染器下只显示分页条（如 `1-9 of 9`）而不渲染数据行，改用 `VTable` 逐行输出，每页 20 条，更早的页放入折叠面板。数据库中的记录本身是完整的。
 
 ### v1.1.0
 - **数据保留、分页、性能与移动端配置优化**：
