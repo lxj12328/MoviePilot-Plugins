@@ -187,10 +187,32 @@ class QBHelper:
         seeding_hours = seeding_time_sec / 3600.0
         ratio = float(torrent.get("ratio") or 0.0)
 
-        # 判定条件：做种时长或分享率其一达标（或根据策略兼顾）
-        time_qualified = seeding_hours >= min_seed_time_hours
-        ratio_qualified = ratio >= min_ratio
+        # 判定条件：做种时长与分享率达标判定 (只有设置 > 0 的指标才纳入考核)
+        time_check_enabled = min_seed_time_hours > 0
+        ratio_check_enabled = min_ratio > 0
 
+        time_qualified = (seeding_hours >= min_seed_time_hours) if time_check_enabled else False
+        ratio_qualified = (ratio >= min_ratio) if ratio_check_enabled else False
+
+        # 若两者均未启用 (<= 0)，代表无做种考核要求，立即放行
+        if not time_check_enabled and not ratio_check_enabled:
+            return True, "未配置做种考核指标 (做种时长与分享率均设为 0)"
+
+        # 若仅启用了做种时长考核 (例如设置做种 2 小时，分享率设为 0)
+        if time_check_enabled and not ratio_check_enabled:
+            if time_qualified:
+                return True, f"做种时长已达标 (做种时长: {seeding_hours:.1f}h / 目标: {min_seed_time_hours}h, 分享率考核已停用)"
+            else:
+                return False, f"未达做种时长目标 (做种时长: {seeding_hours:.1f}h / 目标: {min_seed_time_hours}h)"
+
+        # 若仅启用了分享率考核 (例如做种时长设为 0，分享率设为 2.0)
+        if not time_check_enabled and ratio_check_enabled:
+            if ratio_qualified:
+                return True, f"分享率已达标 (分享率: {ratio:.2f} / 目标: {min_ratio}, 时长考核已停用)"
+            else:
+                return False, f"未达分享率目标 (分享率: {ratio:.2f} / 目标: {min_ratio})"
+
+        # 若两者均启用：满足其一即视为达标 (PT 站点标准 H&R 豁免机制)
         if time_qualified or ratio_qualified:
             return (
                 True,

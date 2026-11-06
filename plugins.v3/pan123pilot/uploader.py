@@ -544,6 +544,33 @@ class TaskScheduler:
             if not qualified:
                 continue
 
+            # 安全防护：若同级目录下仍存在未完成同步的刮削伴生文件，暂缓清理本地与种子
+            parent_dir = os.path.dirname(target_path) if target_path else None
+            if parent_dir and os.path.exists(parent_dir) and not is_emergency:
+                has_pending_companions = False
+                for fname in os.listdir(parent_dir):
+                    fpath = os.path.join(parent_dir, fname)
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in SCRAPED_EXTENSIONS:
+                        c_task = self.db.get_task_by_target(target_path=fpath)
+                        # 若已有任务但状态仍为处理中或重试中
+                        if c_task and c_task.get("status") in ("PENDING", "UPLOADING", "RETRYING"):
+                            has_pending_companions = True
+                            break
+                        # 若本地存在伴生文件但尚未入库同步（如刮削完成稍晚），立即自动补充入库并暂缓本次清理
+                        elif not c_task and os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                            has_pending_companions = True
+                            self.db.add_task(
+                                target_path=fpath,
+                                torrent_hash=torrent_hash,
+                                status="PENDING",
+                            )
+                            logger.info(f"Pan123Pilot 补充发现尚未同步的刮削伴生文件，自动录入同步队列: {fname}")
+                            break
+                if has_pending_companions:
+                    logger.info(f"Pan123Pilot 同目录下尚有刮削伴生文件未完成同步，暂不执行清理: {target_path}")
+                    continue
+
             # 2. 清理 QB 种子与源文件
             if torrent_hash and delete_torrent_file and self.qb.is_configured():
                 try:

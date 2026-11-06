@@ -210,7 +210,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -1703,9 +1703,36 @@ def _record_transferred_target(
                 if ext in allowed_exts:
                     target_files.append((os.path.join(root, f), f))
     else:
+        # 单一文件整理事件：录入视频主文件
         ext = os.path.splitext(target_path)[1].lower()
         if ext in allowed_exts:
             target_files.append((target_path, os.path.basename(target_path)))
+
+        # 若开启了刮削伴生文件同步，检索同目录下的字幕、NFO、海报等伴生文件
+        if sync_scraped_assets:
+            parent_dir = os.path.dirname(target_path)
+            base_stem = os.path.splitext(os.path.basename(target_path))[0]
+            if os.path.exists(parent_dir):
+                for fname in sorted(os.listdir(parent_dir)):
+                    fpath = os.path.join(parent_dir, fname)
+                    if not os.path.isfile(fpath) or fpath == target_path:
+                        continue
+                    fext = os.path.splitext(fname)[1].lower()
+                    if fext not in SCRAPED_EXTENSIONS:
+                        continue
+                    # 匹配规则：
+                    # a. 同名或以此视频名作为前缀的伴生文件（如 xxx.nfo, xxx.zh-CN.srt, xxx-poster.jpg）
+                    # b. 目录级影视元数据与海报（如 poster.jpg, fanart.jpg, folder.jpg, backdrop.jpg, season.nfo, tvshow.nfo）
+                    is_companion = (
+                        fname.startswith(base_stem)
+                        or fname.lower() in (
+                            "folder.jpg", "poster.jpg", "fanart.jpg", "backdrop.jpg",
+                            "banner.jpg", "logo.png", "clearart.png", "disc.png",
+                            "season.nfo", "tvshow.nfo", "movie.nfo",
+                        )
+                    )
+                    if is_companion:
+                        target_files.append((fpath, fname))
 
     logger.info(f"Pan123Pilot 在【{target_path}】下共检索到 {len(target_files)} 个符合条件的媒体及刮削伴生文件")
     if not target_files:

@@ -133,6 +133,61 @@ class TestV140Features(unittest.TestCase):
                 error_msg="分片真实上传完成",
             )
 
+    def test_seeding_criteria_zero_ratio_only_checks_time(self):
+        qb = QBHelper(host="http://127.0.0.1:8080", username="admin", password="pwd")
+        with patch.object(qb, "get_torrent") as mock_get_torrent:
+            # 模拟种子已做种 0.5 小时，分享率 0.05
+            mock_get_torrent.return_value = {
+                "seeding_time": 1800,  # 0.5h
+                "ratio": 0.05,
+            }
+            # 当用户设置最低做种时间 2.0h，最低分享率 0.0 时（代表不考核分享率）
+            qualified, reason = qb.check_seeding_criteria(
+                torrent_hash="test_hash",
+                min_seed_time_hours=2.0,
+                min_ratio=0.0,
+            )
+            # 必须判定为未达标，严禁因 0.05 >= 0.0 导致提前清理
+            self.assertFalse(qualified)
+            self.assertIn("未达做种时长目标", reason)
+
+            # 当做种满 2.5 小时后
+            mock_get_torrent.return_value = {
+                "seeding_time": 9000,  # 2.5h
+                "ratio": 0.05,
+            }
+            qualified, reason = qb.check_seeding_criteria(
+                torrent_hash="test_hash",
+                min_seed_time_hours=2.0,
+                min_ratio=0.0,
+            )
+            self.assertTrue(qualified)
+            self.assertIn("做种时长已达标", reason)
+
+    def test_single_file_transfer_includes_companions(self):
+        from pan123pilot import _record_transferred_target
+        with tempfile.TemporaryDirectory() as tmpdir:
+            media_folder = os.path.join(tmpdir, "假如爱有如果 (2026)")
+            os.makedirs(media_folder, exist_ok=True)
+            video_file = os.path.join(media_folder, "假如爱有如果.mkv")
+            nfo_file = os.path.join(media_folder, "假如爱有如果.nfo")
+            srt_file = os.path.join(media_folder, "假如爱有如果.zh-CN.srt")
+            poster_file = os.path.join(media_folder, "poster.jpg")
+
+            for f in [video_file, nfo_file, srt_file, poster_file]:
+                with open(f, "w") as fp:
+                    fp.write("dummy")
+
+            # 模拟 MoviePilot TransferComplete 事件传入单个视频文件路径
+            with patch("pan123pilot._plugin_instance", None):
+                task_ids = _record_transferred_target(
+                    target_path=video_file,
+                    torrent_hash="hash_abc",
+                    sync_scraped_assets=True,
+                )
+                # 必须检索到视频本身 + nfo + srt + poster 全部 4 个文件
+                self.assertEqual(len(task_ids), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
