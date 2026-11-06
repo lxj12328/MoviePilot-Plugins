@@ -32,6 +32,12 @@ except ImportError:
     Session = Any  # type: ignore
 
 try:
+    from app.sdk.logging import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger("pan123tgpilot")  # type: ignore
+
+try:
     from app.db import Base, db_query, db_update
 except ImportError:
     class DeclarativeBaseFallback:
@@ -44,6 +50,40 @@ except ImportError:
     Base = DeclarativeBaseFallback  # type: ignore
     db_query = lambda func: func
     db_update = lambda func: func
+
+
+# 表结构版本：升级时在 ensure_table 中执行可重复运行的迁移
+SCHEMA_VERSION = 2
+
+
+def compute_link_hash(share_url: Optional[str] = None, fslink: Optional[str] = None) -> str:
+    """
+    计算链接指纹：优先使用分享链接短码 (s:<key>)，否则使用秒传码文件哈希 (f:<etag>)。
+    用于带索引的等值查询，替代全表 LIKE 扫描。
+    """
+    if share_url:
+        m = re.search(r"/s/([a-zA-Z0-9_-]+)", str(share_url))
+        if m:
+            return f"s:{m.group(1)}"
+    if fslink:
+        m = re.search(r"\$([a-fA-F0-9]{32,40})#", str(fslink))
+        if m:
+            return f"f:{m.group(1).lower()}"
+    return ""
+
+
+def link_hash_candidates(share_url: Optional[str] = None, fslink: Optional[str] = None) -> list[str]:
+    """返回一条消息可能命中的全部链接指纹"""
+    out = []
+    if share_url:
+        m = re.search(r"/s/([a-zA-Z0-9_-]+)", str(share_url))
+        if m:
+            out.append(f"s:{m.group(1)}")
+    if fslink:
+        m = re.search(r"\$([a-fA-F0-9]{32,40})#", str(fslink))
+        if m:
+            out.append(f"f:{m.group(1).lower()}")
+    return out
 
 
 class Pan123TgRecord(Base):
@@ -65,64 +105,123 @@ class Pan123TgRecord(Base):
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     share_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     fslink: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    link_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     target_dir_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     cloud_file_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="SAVED", index=True)
     error_msg: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
 
 
 class Pan123TgDatabase:
     """数据持久化门面类"""
 
-    @db_update
-    def ensure_table(self, *args, **kwargs) -> None:
-        """确保数据库表存在并清理历史异常空记录"""
+    @staticmethod
+    def _extract_db(args: tuple, kwargs: dict) -> Any:
         db = kwargs.get("db")
         for arg in args:
             if hasattr(arg, "execute"):
                 db = arg
                 break
+        return db
+
+    @db_update
+    def ensure_table(self, *args, **kwargs) -> None:
+        """确保数据库表存在，并执行可重复运行的结构迁移 (新增 link_hash 列与索引、回填)"""
+        db = self._extract_db(args, kwargs)
         try:
             from app.db import Engine
             if Engine is not None and hasattr(Base, "metadata"):
                 Base.metadata.create_all(bind=Engine, tables=[Pan123TgRecord.__table__], checkfirst=True)
         except Exception:
             pass
+        if db is None:
+            return
         try:
-            self.clean_invalid_records(db=db)
+            self._migrate(db)
+        except Exception as e:
+            logger.warning(f"Pan123TgPilot 数据库迁移异常 (不影响基础功能): {e}")
+        try:
+            self._delete_empty_records(db)
+        except Exception as e:
+            logger.debug(f"Pan123TgPilot 清理空记录异常: {e}")
+
+    @staticmethod
+    def _migrate(db: Any) -> None:
+        """可重复执行的迁移：补齐 link_hash 列、索引，并回填历史记录"""
+        from sqlalchemy import inspect, select, text
+
+        table = Pan123TgRecord.__tablename__
+        conn = db.connection()
+        cols = {c["name"] for c in inspect(conn).get_columns(table)}
+        if "link_hash" not in cols:
+            db.execute(text(f"ALTER TABLE {table} ADD COLUMN link_hash VARCHAR(64)"))
+        db.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_link_hash ON {table} (link_hash)"))
+        db.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_updated_at ON {table} (updated_at)"))
+
+        rows = db.execute(
+            select(Pan123TgRecord).where(Pan123TgRecord.link_hash.is_(None))
+        ).scalars().all()
+        for rec in rows:
+            rec.link_hash = compute_link_hash(rec.share_url, rec.fslink)
+        db.flush()
+        try:
+            db.commit()
         except Exception:
             pass
+
+    @staticmethod
+    def _delete_empty_records(db: Any) -> int:
+        from sqlalchemy import delete
+        res = db.execute(
+            delete(Pan123TgRecord).where(
+                or_(Pan123TgRecord.media_title == "", Pan123TgRecord.media_title.is_(None))
+            )
+        )
+        db.flush()
+        try:
+            db.commit()
+        except Exception:
+            pass
+        return getattr(res, "rowcount", 0) or 0
 
     @db_update
     def clean_invalid_records(self, *args, **kwargs) -> int:
         """清理历史因传参异常导致的空记录 (media_title 为空)"""
-        db = kwargs.get("db")
-        for arg in args:
-            if hasattr(arg, "execute"):
-                db = arg
-                break
+        db = self._extract_db(args, kwargs)
         if db is None:
             return 0
         try:
-            from sqlalchemy import delete
-            stmt = delete(Pan123TgRecord).where(
-                or_(
-                    Pan123TgRecord.media_title == "",
-                    Pan123TgRecord.media_title.is_(None),
-                )
-            )
-            res = db.execute(stmt)
-            db.flush()
-            try:
-                db.commit()
-            except Exception:
-                pass
-            return getattr(res, "rowcount", 0) or 0
+            return self._delete_empty_records(db)
         except Exception as e:
-            logger.debug(f"Pan123TgDatabase 清理无效记录异常: {e}")
+            logger.debug(f"Pan123TgPilot 清理无效记录异常: {e}")
             return 0
+
+    @db_update
+    def purge_expired(self, *args, **kwargs) -> int:
+        """删除 updated_at 早于 days 天前的记录；days<=0 表示永久保留，不执行任何删除"""
+        db = self._extract_db(args, kwargs)
+        days = kwargs.get("days", 0)
+        for arg in args:
+            if isinstance(arg, int) and not isinstance(arg, bool):
+                days = arg
+        try:
+            days = int(days or 0)
+        except (ValueError, TypeError):
+            days = 0
+        if db is None or days <= 0:
+            return 0
+        from datetime import timedelta
+        from sqlalchemy import delete
+        cutoff = datetime.now() - timedelta(days=days)
+        res = db.execute(delete(Pan123TgRecord).where(Pan123TgRecord.updated_at < cutoff))
+        db.flush()
+        try:
+            db.commit()
+        except Exception:
+            pass
+        return getattr(res, "rowcount", 0) or 0
 
     @db_query
     def get_record_by_media_key(self, *args, **kwargs) -> Optional[dict]:
@@ -197,29 +296,13 @@ class Pan123TgDatabase:
         if db is None:
             return False
 
-        conditions = []
-        if share_url:
-            conditions.append(Pan123TgRecord.share_url == share_url)
-            m_key = re.search(r"/s/([a-zA-Z0-9_-]+)", share_url)
-            if m_key:
-                conditions.append(Pan123TgRecord.share_url.like(f"%{m_key.group(1)}%"))
-        if fslink:
-            conditions.append(Pan123TgRecord.fslink == fslink)
-            m_hash = re.search(r"\$([a-fA-F0-9]{32,40})#", fslink)
-            if m_hash:
-                conditions.append(Pan123TgRecord.fslink.like(f"%{m_hash.group(1)}%"))
-
-        if not conditions:
+        tokens = link_hash_candidates(share_url, fslink)
+        if not tokens:
             return False
 
-        stmt = select(Pan123TgRecord)
-        if len(conditions) == 1:
-            stmt = stmt.where(conditions[0])
-        else:
-            stmt = stmt.where(or_(*conditions))
-
-        rec = db.execute(stmt.limit(1)).scalar_one_or_none()
-        return rec is not None
+        # 走 link_hash 索引的等值/IN 查询，避免 LIKE 全表扫描
+        stmt = select(Pan123TgRecord.id).where(Pan123TgRecord.link_hash.in_(tokens)).limit(1)
+        return db.execute(stmt).first() is not None
 
     @db_update
     def save_or_update_record(self, *args, **kwargs) -> int:
@@ -295,6 +378,9 @@ class Pan123TgDatabase:
                 existing.share_url = share_url
             if fslink:
                 existing.fslink = fslink
+            lh = compute_link_hash(share_url, fslink)
+            if lh:
+                existing.link_hash = lh
             existing.target_dir_id = target_dir_id
             if cloud_file_id:
                 existing.cloud_file_id = cloud_file_id
@@ -321,6 +407,7 @@ class Pan123TgDatabase:
                 file_size=file_size,
                 share_url=share_url,
                 fslink=fslink,
+                link_hash=compute_link_hash(share_url, fslink),
                 target_dir_id=target_dir_id,
                 cloud_file_id=cloud_file_id,
                 status=status,
@@ -336,45 +423,72 @@ class Pan123TgDatabase:
                 pass
             return new_rec.id
 
-    @db_query
-    def list_records(self, *args, **kwargs) -> list[dict]:
-        """获取最近转存记录，支持关键词检索 (自适应适配 MoviePilot @db_query 注入)"""
-        db = kwargs.get("db")
-        limit = kwargs.get("limit")
-        keyword = kwargs.get("keyword") or kwargs.get("search")
-        for arg in args:
-            if hasattr(arg, "execute"):
-                db = arg
-            elif isinstance(arg, int):
-                limit = arg
-            elif isinstance(arg, str):
-                keyword = arg
-
-        limit = int(limit or 100)
-        if db is None:
-            return []
-
-        # 默认过滤掉标题为空的异常历史记录
-        stmt = select(Pan123TgRecord).where(
+    @staticmethod
+    def _build_filter(keyword: Any = None, status: Any = None):
+        """构造列表/计数共用的过滤条件"""
+        stmt_filters = [
             Pan123TgRecord.media_title != "",
             Pan123TgRecord.media_title.is_not(None),
-        )
+        ]
         if keyword and str(keyword).strip():
             kw = f"%{str(keyword).strip()}%"
-            stmt = stmt.where(
+            stmt_filters.append(
                 or_(
                     Pan123TgRecord.media_title.like(kw),
                     Pan123TgRecord.channel.like(kw),
                     Pan123TgRecord.resolution.like(kw),
                     Pan123TgRecord.codec.like(kw),
+                    Pan123TgRecord.dovi_hdr.like(kw),
                     Pan123TgRecord.media_key.like(kw),
                 )
             )
+        if status and str(status).strip():
+            stmt_filters.append(Pan123TgRecord.status == str(status).strip().lower())
+        return stmt_filters
+
+    @db_query
+    def list_records(self, *args, **kwargs) -> list[dict]:
+        """分页获取转存记录，支持关键词与状态筛选 (自适应适配 MoviePilot @db_query 注入)"""
+        db = kwargs.get("db")
+        limit = kwargs.get("limit")
+        offset = kwargs.get("offset") or 0
+        keyword = kwargs.get("keyword") or kwargs.get("search")
+        status = kwargs.get("status")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, int) and not isinstance(arg, bool):
+                limit = arg
+            elif isinstance(arg, str):
+                keyword = arg
+
+        try:
+            limit = max(1, int(limit or 100))
+            offset = max(0, int(offset or 0))
+        except (ValueError, TypeError):
+            limit, offset = 100, 0
+        if db is None:
+            return []
+
+        stmt = select(Pan123TgRecord).where(*self._build_filter(keyword, status))
         records = db.execute(
-            stmt.order_by(Pan123TgRecord.updated_at.desc()).limit(limit)
+            stmt.order_by(Pan123TgRecord.updated_at.desc(), Pan123TgRecord.id.desc())
+            .offset(offset)
+            .limit(limit)
         ).scalars().all()
         return [self._to_dict(r) for r in records]
-        return [self._to_dict(r) for r in records]
+
+    @db_query
+    def count_records(self, *args, **kwargs) -> int:
+        """统计符合条件的记录总数，用于分页"""
+        db = self._extract_db(args, kwargs)
+        if db is None:
+            return 0
+        from sqlalchemy import func
+        stmt = select(func.count(Pan123TgRecord.id)).where(
+            *self._build_filter(kwargs.get("keyword") or kwargs.get("search"), kwargs.get("status"))
+        )
+        return int(db.execute(stmt).scalar() or 0)
 
     @staticmethod
     def _to_dict(rec: Pan123TgRecord) -> dict:

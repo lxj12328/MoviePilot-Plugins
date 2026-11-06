@@ -53,7 +53,7 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.assertEqual(commands[0]["cmd"], "/pan123_tg_run")
 
         apis = self.plugin.get_api()
-        self.assertEqual(len(apis), 3)
+        self.assertEqual(len(apis), 4)
 
     @patch("threading.Thread")
     def test_run_now_on_save(self, mock_thread):
@@ -209,6 +209,7 @@ S05E217 4K WEB-DL H.265
             "tv_target_dir_id": "1002",
         })
         self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 1
         self.plugin._db.list_records.return_value = [
             {
                 "id": 1,
@@ -225,19 +226,82 @@ S05E217 4K WEB-DL H.265
         ]
         page = self.plugin.get_page()
         self.assertEqual(len(page), 2)
-        # 包含运行状态卡片与数据清单卡片
         self.assertEqual(page[0]["component"], "VCard")
-        self.assertEqual(page[1]["component"], "VCard")
-        self.assertIn("已转存影视资源数据清单", page[1]["content"][0]["content"][0]["text"])
+        table_card = page[1]
+        self.assertIn("共 1 条", table_card["content"][0]["content"][0]["text"])
+        table = table_card["content"][1]
+        self.assertEqual(table["component"], "VDataTable")
+        self.assertEqual(table["props"]["items-per-page"], 10)
+        item = table["props"]["items"][0]
+        self.assertEqual(item["title"], "八仙！ (2026)")
+        self.assertEqual(item["spec"], "2160p / H.265 / DoVi")
+        self.assertEqual(item["status"], "首发转存")
+        self.assertEqual(item["score"], 120)
 
-    def test_api_records_search(self):
+    def test_api_records_pagination(self):
         self.plugin.init_plugin({"enabled": True})
         self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 45
         self.plugin._db.list_records.return_value = [{"title": "八仙"}]
-        res = self.plugin._api_get_records(keyword="八仙", limit=10)
+        res = self.plugin._api_get_records(keyword="八仙", status="saved", page=3, page_size=20)
         self.assertEqual(res["code"], 200)
-        self.assertEqual(res["total"], 1)
-        self.plugin._db.list_records.assert_called_with(limit=10, keyword="八仙")
+        self.assertEqual(res["total"], 45)
+        self.assertEqual(res["pages"], 3)
+        self.plugin._db.list_records.assert_called_with(limit=20, offset=40, keyword="八仙", status="saved")
+
+    def test_api_records_bad_params_fallback(self):
+        self.plugin.init_plugin({"enabled": True})
+        self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 0
+        self.plugin._db.list_records.return_value = []
+        res = self.plugin._api_get_records(page="x", page_size="y")
+        self.assertEqual((res["page"], res["page_size"]), (1, 20))
+
+    def test_form_is_mobile_friendly(self):
+        form, model = self.plugin.get_form()
+        self.assertIn("retention_days", model)
+        self.assertEqual(model["retention_days"], 0)
+
+        def walk(node):
+            if isinstance(node, dict):
+                yield node
+                for v in node.values():
+                    yield from walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    yield from walk(v)
+
+        cols = [n for n in walk(form) if n.get("component") == "VCol"]
+        self.assertTrue(cols)
+        # 手机端 (cols=12) 一律单列堆叠
+        self.assertTrue(all(c["props"].get("cols") == 12 for c in cols))
+        # 所有表单 model 都有默认值
+        models = {n["props"]["model"] for n in walk(form) if isinstance(n.get("props"), dict) and "model" in n["props"]}
+        self.assertTrue(models.issubset(model.keys()))
+
+    def test_retention_service_and_purge(self):
+        self.plugin.init_plugin({"enabled": True, "retention_days": "30"})
+        self.assertEqual(self.plugin._retention_days, 30)
+        self.plugin._db = MagicMock()
+        self.plugin._db.purge_expired.return_value = 3
+        self.assertEqual(self.plugin._api_purge()["deleted"], 3)
+        self.plugin._db.purge_expired.assert_called_with(days=30)
+        ids = [s["id"] for s in self.plugin.get_service()]
+        if "pan123_tg_purge_job" not in ids:  # 无 apscheduler 的最小环境允许缺省
+            self.assertEqual(ids, ["pan123_tg_check_job"])
+
+    def test_retention_zero_means_forever(self):
+        self.plugin.init_plugin({"enabled": True, "retention_days": 0})
+        self.plugin._db = MagicMock()
+        self.assertEqual(self.plugin._api_purge()["deleted"], 0)
+        self.plugin._db.purge_expired.assert_not_called()
+        self.assertEqual([s["id"] for s in self.plugin.get_service()], ["pan123_tg_check_job"])
+
+    def test_retention_invalid_value_falls_back(self):
+        self.plugin.init_plugin({"enabled": True, "retention_days": "abc"})
+        self.assertEqual(self.plugin._retention_days, 0)
+        self.plugin.init_plugin({"enabled": True, "retention_days": -5})
+        self.assertEqual(self.plugin._retention_days, 0)
 
 
 if __name__ == "__main__":

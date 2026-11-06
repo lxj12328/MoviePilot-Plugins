@@ -3,6 +3,7 @@
 支持 Telegram 影视频道消息自动监听、电影与剧集智能分流转存、123秒传/分享链接适配与画质洗版升级
 """
 
+import re
 import threading
 import time
 from datetime import datetime
@@ -70,8 +71,11 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.7"
+    plugin_version = "1.1.0"
     plugin_author = "lxj12328"
+
+    # 详情页最多加载的最近记录条数 (客户端分页/排序)
+    PAGE_FETCH_LIMIT = 500
 
     def __init__(self):
         super().__init__()
@@ -87,6 +91,7 @@ class Pan123TgPilot(_PluginBase):
         self._auto_upgrade: bool = True
         self._auto_delete_old_version: bool = True
         self._notify_enabled: bool = False
+        self._retention_days: int = 0
 
         self._client: Optional[Pan123TgClient] = None
         self._watcher: Optional[TgChannelWatcher] = None
@@ -177,15 +182,15 @@ class Pan123TgPilot(_PluginBase):
         self._auto_upgrade = bool(config.get("auto_upgrade", True))
         self._auto_delete_old_version = bool(config.get("auto_delete_old_version", True))
         self._notify_enabled = bool(config.get("notify_enabled", False))
+        try:
+            self._retention_days = max(0, int(config.get("retention_days") or 0))
+        except (ValueError, TypeError):
+            self._retention_days = 0
 
-        # 初始化数据库
+        # 初始化数据库 (ensure_table 内含可重复执行的结构迁移与空记录清理)
         if not self._db:
             self._db = Pan123TgDatabase()
         self._db.ensure_table()
-        try:
-            self._db.clean_invalid_records()
-        except Exception:
-            pass
 
         # 初始化 123 客户端
         if self._auth_token:
@@ -255,7 +260,7 @@ class Pan123TgPilot(_PluginBase):
         else:
             trigger = "interval"
 
-        return [
+        services = [
             {
                 "id": "pan123_tg_check_job",
                 "name": "123云盘TG频道定时转存与洗版",
@@ -264,6 +269,29 @@ class Pan123TgPilot(_PluginBase):
                 "kwargs": {},
             }
         ]
+        if self._retention_days > 0 and CronTrigger:
+            services.append(
+                {
+                    "id": "pan123_tg_purge_job",
+                    "name": "123云盘TG转存记录过期清理",
+                    "trigger": CronTrigger.from_crontab("0 3 * * *"),
+                    "func": self._service_purge_records,
+                    "kwargs": {},
+                }
+            )
+        return services
+
+    def _service_purge_records(self) -> int:
+        """按保留天数清理过期转存记录 (0 表示永久保留，不清理)"""
+        if not self._db or self._retention_days <= 0:
+            return 0
+        try:
+            n = self._db.purge_expired(days=self._retention_days)
+            logger.info(f"Pan123TgPilot 记录保留清理完成: 保留 {self._retention_days} 天，清除过期记录 {n} 条")
+            return int(n or 0)
+        except Exception as e:
+            logger.error(f"Pan123TgPilot 清理过期记录异常: {e}")
+            return 0
 
     def _service_check_channels(self) -> None:
         """周期执行 TG 频道抓取与转存调度"""
@@ -536,262 +564,119 @@ class Pan123TgPilot(_PluginBase):
 
         return "upgraded" if is_upgrade else "transferred"
 
+    # ------------------------------------------------------------------ 表单构造辅助 (移动端自适应)
+    @staticmethod
+    def _col(content: list[dict], md: int = 6) -> dict:
+        """统一栏位：手机 (cols=12) 单列堆叠，平板/桌面 (md) 才并排"""
+        return {"component": "VCol", "props": {"cols": 12, "md": md}, "content": content}
+
+    @staticmethod
+    def _switch(model: str, label: str, hint: str = "") -> dict:
+        props: dict[str, Any] = {"model": model, "label": label, "color": "primary", "density": "comfortable"}
+        if hint:
+            props.update({"hint": hint, "persistent-hint": True})
+        return {"component": "VSwitch", "props": props}
+
+    @staticmethod
+    def _field(model: str, label: str, hint: str = "", **extra: Any) -> dict:
+        props: dict[str, Any] = {"model": model, "label": label, "variant": "outlined", "density": "comfortable"}
+        if hint:
+            props.update({"hint": hint, "persistent-hint": True})
+        props.update(extra)
+        return {"component": "VTextField", "props": props}
+
+    @staticmethod
+    def _section(title: str, icon: str, rows: list[dict]) -> dict:
+        """配置分组卡片：标题 + 若干行"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-3"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"}, "text": f"{title}"},
+                {"component": "VCardText", "content": rows},
+            ],
+        }
+
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
-        """定义 MoviePilot V3 后台插件配置表单"""
+        """定义 MoviePilot V3 后台插件配置表单 (分组卡片 + 手机单列自适应)"""
+        col, sw, fld = self._col, self._switch, self._field
+
+        basic = self._section("基础设置", "mdi-cog", [
+            {"component": "VRow", "content": [
+                col([sw("enabled", "启用插件")]),
+                col([sw("notify_enabled", "发送转存成功通知")]),
+                col([sw("run_now_on_save", "保存后立即运行一次", "保存配置时在后台立刻巡检一次，便于测试")]),
+                col([{
+                    "component": "VBtn",
+                    "props": {
+                        "color": "primary", "variant": "elevated", "block": True,
+                        "prepend-icon": "mdi-play-circle", "text": "立即执行一次巡检",
+                    },
+                    "events": {"click": "api.post('/plugin/Pan123TgPilot/manual_check')"},
+                }]),
+            ]},
+        ])
+
+        pan = self._section("123 云盘", "mdi-cloud", [
+            {"component": "VRow", "content": [
+                col([fld(
+                    "pan123_token", "123 云盘 Web Token", "网页登录后 F12 复制请求头 Authorization (可不带 Bearer)",
+                    type="password", placeholder="Authorization / Token",
+                )], md=12),
+                col([fld(
+                    "movie_target_dir_id", "电影目录 ID", "网盘文件夹 URL 末尾的数字，0 为根目录",
+                    placeholder="例如 17439195",
+                )]),
+                col([fld(
+                    "tv_target_dir_id", "剧集目录 ID", "识别到剧集 (SxxExx) 时转存至此",
+                    placeholder="例如 17439196",
+                )]),
+            ]},
+        ])
+
+        tg = self._section("Telegram 监控", "mdi-send", [
+            {"component": "VRow", "content": [
+                col([{
+                    "component": "VTextarea",
+                    "props": {
+                        "model": "tg_channels", "label": "监控频道", "variant": "outlined",
+                        "rows": 3, "auto-grow": True, "placeholder": "@Pan123Movie, @regeng123, @yun123pan",
+                        "hint": "多个频道用逗号或换行分隔", "persistent-hint": True,
+                    },
+                }], md=12),
+                col([fld("check_interval", "检查周期 (分钟)", "默认 10 分钟", type="number", placeholder="10")]),
+                col([fld(
+                    "tg_proxy", "Telegram 代理 (可选)",
+                    "留空则继承 MoviePilot 全局代理；Docker 内请勿填 127.0.0.1",
+                    placeholder="http://192.168.1.100:7890",
+                )]),
+                col([fld(
+                    "tg_bot_token", "Bot Token (可选)", "留空使用 t.me/s/ 公开预览，无需 Bot",
+                    type="password", placeholder="123456789:ABCdef...",
+                )], md=12),
+            ]},
+        ])
+
+        upgrade = self._section("洗版与数据", "mdi-database", [
+            {"component": "VRow", "content": [
+                col([sw("auto_upgrade", "智能画质洗版", "同一影视出现更高评分版本时自动转存")]),
+                col([sw("auto_delete_old_version", "洗版后清理旧版本", "旧版文件移入网盘回收站")]),
+                col([fld(
+                    "retention_days", "记录保留天数", "0 = 永久保留；填 N 则每天 03:00 清理 N 天前的记录 (清理后同资源可能被重新转存)",
+                    type="number", placeholder="0",
+                )], md=12),
+            ]},
+        ])
+
         form = [
             {
                 "component": "VAlert",
                 "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "text": (
-                        "123云盘TG转存助手：实时监控 Telegram 频道，提取影视名称、TMDB ID 与画质特征，"
-                        "精准分流转存至 123 云盘的电影或剧集目录，支持标准分享链接与 123FSLinkV2 秒传链接，"
-                        "并内置多维智能洗版升级能力。"
-                    ),
+                    "type": "info", "variant": "tonal", "density": "compact", "class": "mb-3",
+                    "text": "实时监控 Telegram 频道，按画质评分自动转存/洗版到 123 云盘，支持分享链接与 123FSLinkV2 秒传码。",
                 },
             },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": "enabled",
-                                    "label": "启用插件",
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": "notify_enabled",
-                                    "label": "发送转存成功通知 (默认关闭)",
-                                },
-                            }
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": "run_now_on_save",
-                                    "label": "立即运行一次 (保存配置后立即执行)",
-                                    "hint": "开启此项并点击保存，插件将立刻在后台执行一次频道巡检与转存测试，无需等待定时周期",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6, "class": "d-flex align-center"},
-                        "content": [
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "primary",
-                                    "variant": "elevated",
-                                    "prepend-icon": "mdi-play-circle",
-                                    "text": "立即执行一次巡检测试",
-                                },
-                                "events": {
-                                    "click": "api.post('/plugin/Pan123TgPilot/manual_check')",
-                                },
-                            }
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "pan123_token",
-                                    "label": "123 云盘 Web Token",
-                                    "placeholder": "请输入 123 云盘网页版 Authorization / Token",
-                                    "type": "password",
-                                    "hint": "在 123pan.com 网页登录后，按 F12 在网络请求 Header 中复制 Authorization (可带或不带 Bearer 前缀)",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    }
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "movie_target_dir_id",
-                                    "label": "电影转存目录 ID",
-                                    "placeholder": "例如: 17439195",
-                                    "hint": "123云盘中存放电影的文件夹 ID (在网页端打开该文件夹，URL 最后的数字即为目录ID；0为根目录)",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "tv_target_dir_id",
-                                    "label": "电视剧集转存目录 ID",
-                                    "placeholder": "例如: 17439196",
-                                    "hint": "123云盘中存放电视剧集的文件夹 ID (识别到剧集、季集SxxExx时转存至此)",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VTextarea",
-                                "props": {
-                                    "model": "tg_channels",
-                                    "label": "监控的 Telegram 频道列表",
-                                    "placeholder": "@Pan123Movie, @regeng123, @yun123pan",
-                                    "rows": 3,
-                                    "hint": "多个频道用逗号或换行分隔，支持频道用户名 (如 @Pan123Movie 或 Pan123Movie)",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    }
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "check_interval",
-                                    "label": "频道抓取检查周期 (分钟)",
-                                    "type": "number",
-                                    "hint": "默认每 10 分钟自动检查一次 TG 频道的最新消息",
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "tg_proxy",
-                                    "label": "Telegram 网络代理 (可选，国内网络必填)",
-                                    "placeholder": "http://192.168.1.100:7890",
-                                    "hint": "境内访问 TG 需配置代理。留空则自动继承 MoviePilot 全局代理。⚠️注意：若 MoviePilot 运行在 Docker 容器内，请勿填 127.0.0.1 (指容器本身)，请填写宿主机局域网 IP (如 http://192.168.x.x:7890) 或 http://host.docker.internal:7890，并确认代理软件开启了「允许局域网连接」",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": "auto_upgrade",
-                                    "label": "开启智能画质洗版",
-                                    "hint": "当检测到同一影视且画质评分更高时 (如 4K 替代 1080p, DoVi 替代 SDR)，自动转存新资源",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12, "md": 6},
-                        "content": [
-                            {
-                                "component": "VSwitch",
-                                "props": {
-                                    "model": "auto_delete_old_version",
-                                    "label": "洗版成功后自动清理旧版本",
-                                    "hint": "洗版转存成功后，自动将网盘中旧版本的低画质文件移入回收站，节省空间",
-                                    "persistent-hint": True,
-                                },
-                            }
-                        ],
-                    },
-                ],
-            },
-            {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VTextField",
-                                "props": {
-                                    "model": "tg_bot_token",
-                                    "label": "Telegram Bot Token (备用高级模式，可留空)",
-                                    "placeholder": "123456789:ABCdefGhIJKlmNoPQRstUVwxYZ",
-                                    "hint": "留空时默认通过 t.me/s/ 公开预览流免鉴权解析，完全无需 Bot；如配置则通过 Bot API 获取",
-                                },
-                            }
-                        ],
-                    }
-                ],
-            },
+            basic, pan, tg, upgrade,
         ]
 
         model = {
@@ -807,299 +692,136 @@ class Pan123TgPilot(_PluginBase):
             "auto_upgrade": True,
             "auto_delete_old_version": True,
             "notify_enabled": False,
+            "retention_days": 0,
         }
-
         return form, model
 
-    def get_page(self) -> list[dict]:
-        """定义 MoviePilot V3 插件状态页面"""
-        status_text = "运行中" if self._enabled else "未启用"
-        color = "success" if self._enabled else "grey"
-        channels_str = ", ".join(self._tg_channels) if self._tg_channels else "未配置"
-        last_check = (
-            self._last_check_time.strftime("%Y-%m-%d %H:%M:%S")
-            if self._last_check_time
-            else "尚未执行"
+    # ------------------------------------------------------------------ 详情页
+    @staticmethod
+    def _stat_card(color: str, label: str, value: Any) -> dict:
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 3},
+            "content": [{
+                "component": "VCard",
+                "props": {"color": color, "variant": "tonal"},
+                "content": [{
+                    "component": "VCardItem",
+                    "content": [
+                        {"component": "VCardSubtitle", "text": label},
+                        {"component": "VCardTitle", "text": str(value)},
+                    ],
+                }],
+            }],
+        }
+
+    @staticmethod
+    def _record_to_row(r: dict) -> dict:
+        """把数据库记录转成数据表行"""
+        size_bytes = r.get("file_size") or 0
+        size_str = f"{size_bytes / (1024.0 ** 3):.2f} GB" if size_bytes > 0 else "-"
+        spec = " / ".join([x for x in (r.get("resolution"), r.get("codec"), r.get("dovi_hdr")) if x]) or "-"
+        status = str(r.get("status") or "").lower()
+        status_text = {"saved": "首发转存", "upgraded": "洗版升级", "ignored": "已跳过"}.get(
+            status, "首发转存" if "save" in status else (status.upper() or "已转存")
         )
+        title_text = str(r.get("media_title") or r.get("title") or "").strip()
+        if not title_text and r.get("fslink"):
+            m_fn = re.search(r"#([^#]+\.(?:mkv|mp4|ts|avi|mov|iso|rmvb|flv))", r["fslink"], re.IGNORECASE)
+            if m_fn:
+                title_text = m_fn.group(1)
+        return {
+            "title": title_text or "-",
+            "spec": spec,
+            "size": size_str,
+            "score": int(r.get("quality_score") or 0),
+            "channel": r.get("channel") or "-",
+            "status": status_text,
+            "time": str(r.get("updated_at") or r.get("created_at") or "-")[:19],
+        }
+
+    def get_page(self) -> list[dict]:
+        """插件详情页：状态统计 + 带分页/排序的已转存资源数据表"""
+        status_text = "运行中" if self._enabled else "未启用"
+        channels_str = ", ".join(self._tg_channels) if self._tg_channels else "未配置"
+        last_check = self._last_check_time.strftime("%Y-%m-%d %H:%M:%S") if self._last_check_time else "尚未执行"
+        retention = f"{self._retention_days} 天" if self._retention_days > 0 else "永久"
 
         status_card = {
             "component": "VCard",
             "props": {"class": "mb-4", "variant": "outlined"},
             "content": [
-                {
-                    "component": "VCardItem",
-                    "content": [
-                        {
-                            "component": "VCardTitle",
-                            "text": "123云盘TG转存助手运行状态",
-                        },
-                        {
-                            "component": "VCardSubtitle",
-                            "text": f"插件状态: {status_text} | 检查周期: 每 {self._check_interval} 分钟 | 上次巡检: {last_check}",
-                        },
-                    ],
-                },
-                {
-                    "component": "VCardText",
-                    "content": [
-                        {
-                            "component": "VRow",
-                            "content": [
-                                {
-                                    "component": "VCol",
-                                    "props": {"cols": 6, "md": 3},
-                                    "content": [
-                                        {
-                                            "component": "VCard",
-                                            "props": {"color": "primary", "variant": "tonal"},
-                                            "content": [
-                                                {
-                                                    "component": "VCardItem",
-                                                    "content": [
-                                                        {"component": "VCardSubtitle", "text": "累计检查消息"},
-                                                        {"component": "VCardTitle", "text": str(self._check_stats["total_checked"])},
-                                                    ],
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {
-                                    "component": "VCol",
-                                    "props": {"cols": 6, "md": 3},
-                                    "content": [
-                                        {
-                                            "component": "VCard",
-                                            "props": {"color": "success", "variant": "tonal"},
-                                            "content": [
-                                                {
-                                                    "component": "VCardItem",
-                                                    "content": [
-                                                        {"component": "VCardSubtitle", "text": "成功转存总数"},
-                                                        {"component": "VCardTitle", "text": str(self._check_stats["transferred_count"])},
-                                                    ],
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {
-                                    "component": "VCol",
-                                    "props": {"cols": 6, "md": 3},
-                                    "content": [
-                                        {
-                                            "component": "VCard",
-                                            "props": {"color": "info", "variant": "tonal"},
-                                            "content": [
-                                                {
-                                                    "component": "VCardItem",
-                                                    "content": [
-                                                        {"component": "VCardSubtitle", "text": "洗版升级总数"},
-                                                        {"component": "VCardTitle", "text": str(self._check_stats["upgraded_count"])},
-                                                    ],
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {
-                                    "component": "VCol",
-                                    "props": {"cols": 6, "md": 3},
-                                    "content": [
-                                        {
-                                            "component": "VCard",
-                                            "props": {"color": "warning", "variant": "tonal"},
-                                            "content": [
-                                                {
-                                                    "component": "VCardItem",
-                                                    "content": [
-                                                        {"component": "VCardSubtitle", "text": "监控频道数量"},
-                                                        {"component": "VCardTitle", "text": str(len(self._tg_channels))},
-                                                    ],
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
-                            ],
-                        },
-                        {
-                            "component": "VDivider",
-                            "props": {"class": "my-4"},
-                        },
-                        {
-                            "component": "p",
-                            "props": {"class": "text-caption text-grey"},
-                            "text": f"当前监控的频道: {channels_str}",
-                        },
-                        {
-                            "component": "p",
-                            "props": {"class": "text-caption text-grey"},
-                            "text": f"电影目录ID: {self._movie_target_dir_id} | 剧集目录ID: {self._tv_target_dir_id} | 智能洗版: {'开启' if self._auto_upgrade else '关闭'} | 旧版清理: {'开启' if self._auto_delete_old_version else '关闭'}",
-                        },
-                    ],
-                },
-                {
-                    "component": "VCardActions",
-                    "props": {"class": "px-4 pb-4"},
-                    "content": [
-                        {
-                            "component": "VBtn",
-                            "props": {
-                                "color": "primary",
-                                "variant": "elevated",
-                                "prepend-icon": "mdi-play-circle",
-                                "text": "立即运行一次巡检测试",
-                            },
-                            "events": {
-                                "click": "api.post('/plugin/Pan123TgPilot/manual_check')",
-                            },
-                        },
-                    ],
-                },
+                {"component": "VCardItem", "content": [
+                    {"component": "VCardTitle", "text": "123云盘TG转存助手"},
+                    {"component": "VCardSubtitle",
+                     "text": f"{status_text} · 每 {self._check_interval} 分钟 · 上次巡检 {last_check}"},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VRow", "content": [
+                        self._stat_card("primary", "累计检查消息", self._check_stats["total_checked"]),
+                        self._stat_card("success", "成功转存", self._check_stats["transferred_count"]),
+                        self._stat_card("info", "洗版升级", self._check_stats["upgraded_count"]),
+                        self._stat_card("warning", "监控频道", len(self._tg_channels)),
+                    ]},
+                    {"component": "p", "props": {"class": "text-caption text-grey mt-2"},
+                     "text": f"频道: {channels_str}"},
+                    {"component": "p", "props": {"class": "text-caption text-grey"},
+                     "text": (f"电影目录ID {self._movie_target_dir_id} · 剧集目录ID {self._tv_target_dir_id} · "
+                              f"洗版 {'开' if self._auto_upgrade else '关'} · "
+                              f"清理旧版 {'开' if self._auto_delete_old_version else '关'} · 记录保留 {retention}")},
+                ]},
+                {"component": "VCardActions", "props": {"class": "px-4 pb-4"}, "content": [{
+                    "component": "VBtn",
+                    "props": {"color": "primary", "variant": "elevated", "block": True,
+                              "prepend-icon": "mdi-play-circle", "text": "立即运行一次巡检"},
+                    "events": {"click": "api.post('/plugin/Pan123TgPilot/manual_check')"},
+                }]},
             ],
         }
 
-        # 动态读取并呈现已转存影视资源清单
-        recent_records = self._db.list_records(limit=50) if self._db else []
-        rows = []
-        for r in recent_records:
-            size_bytes = r.get("file_size") or 0
-            if size_bytes > 0:
-                size_str = f"{size_bytes / (1024.0 ** 3):.2f} GB"
-            else:
-                size_str = "-"
+        total = 0
+        items: list[dict] = []
+        if self._db:
+            try:
+                total = self._db.count_records()
+                items = [self._record_to_row(r) for r in self._db.list_records(limit=self.PAGE_FETCH_LIMIT)]
+            except Exception as e:
+                logger.error(f"Pan123TgPilot 读取转存记录失败: {e}")
 
-            res = r.get("resolution") or "-"
-            codec = r.get("codec") or "-"
-            hdr = r.get("dovi_hdr") or ""
-            spec = f"{res} / {codec}" + (f" / {hdr}" if hdr else "")
-
-            status = str(r.get("status") or "").lower()
-            status_map = {
-                "saved": ("首发转存", "success"),
-                "upgraded": ("洗版升级", "info"),
-                "ignored": ("已跳过", "grey"),
-            }
-            status_text, status_color = status_map.get(
-                status,
-                ("首发转存" if "save" in status else (status.upper() if status else "已转存"), "primary"),
-            )
-
-            time_str = str(r.get("updated_at") or r.get("created_at") or "-")
-            if len(time_str) > 19:
-                time_str = time_str[:19]
-
-            title_text = str(r.get("media_title") or r.get("title") or "").strip()
-            if not title_text and r.get("fslink"):
-                m_fn = re.search(r"#([^#]+\.(?:mkv|mp4|ts|avi|mov|iso|rmvb|flv))", r["fslink"], re.IGNORECASE)
-                if m_fn:
-                    title_text = m_fn.group(1)
-            if not title_text:
-                title_text = "-"
-
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {
-                        "component": "td",
-                        "props": {"class": "font-weight-medium"},
-                        "text": title_text,
-                    },
-                    {
-                        "component": "td",
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {"size": "x-small", "variant": "tonal", "color": "primary"},
-                                "text": spec,
-                            }
-                        ],
-                    },
-                    {"component": "td", "text": size_str},
-                    {
-                        "component": "td",
-                        "props": {"class": "text-primary font-weight-bold"},
-                        "text": str(r.get("quality_score") or 0),
-                    },
-                    {"component": "td", "text": r.get("channel") or "-"},
-                    {
-                        "component": "td",
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {"size": "x-small", "color": status_color},
-                                "text": status_text,
-                            }
-                        ],
-                    },
-                    {
-                        "component": "td",
-                        "props": {"class": "text-caption text-grey"},
-                        "text": time_str,
-                    },
-                ],
-            })
-
-        if not rows:
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {
-                        "component": "td",
-                        "props": {"colspan": 7, "class": "text-center text-grey py-4"},
-                        "text": "暂无转存记录，当监控频道抓取到资源并转存后将在此展示",
-                    }
-                ],
-            })
-
+        headers = [
+            {"title": "影视名称", "key": "title", "sortable": True},
+            {"title": "画质 (分辨率/编码/HDR)", "key": "spec", "sortable": True},
+            {"title": "大小", "key": "size", "sortable": False},
+            {"title": "评分", "key": "score", "sortable": True},
+            {"title": "来源频道", "key": "channel", "sortable": True},
+            {"title": "类型", "key": "status", "sortable": True},
+            {"title": "转存时间", "key": "time", "sortable": True},
+        ]
         table_card = {
             "component": "VCard",
             "props": {"variant": "outlined"},
             "content": [
+                {"component": "VCardItem", "content": [
+                    {"component": "VCardTitle", "text": f"已转存资源清单 (共 {total} 条)"},
+                    {"component": "VCardSubtitle",
+                     "text": f"按时间倒序，最多加载最近 {self.PAGE_FETCH_LIMIT} 条；点击表头可排序。"
+                             "按关键词/状态检索或翻阅全部请调用 /records?keyword=&page=&page_size="},
+                ]},
                 {
-                    "component": "VCardItem",
-                    "content": [
-                        {
-                            "component": "VCardTitle",
-                            "text": f"已转存影视资源数据清单 (展示最新 {len(recent_records)} 条)",
-                        },
-                        {
-                            "component": "VCardSubtitle",
-                            "text": "标注影视名称、分辨率、编码、HDR/DoVi、文件大小与评分，支持在 API 中使用 /records?keyword= 模糊检索",
-                        },
-                    ],
-                },
-                {
-                    "component": "VTable",
-                    "props": {"density": "compact", "hover": True},
-                    "content": [
-                        {
-                            "component": "thead",
-                            "content": [
-                                {
-                                    "component": "tr",
-                                    "content": [
-                                        {"component": "th", "text": "影视名称"},
-                                        {"component": "th", "text": "画质规格 (分辨率/编码/HDR)"},
-                                        {"component": "th", "text": "文件大小"},
-                                        {"component": "th", "text": "质量评分"},
-                                        {"component": "th", "text": "来源频道"},
-                                        {"component": "th", "text": "转存类型"},
-                                        {"component": "th", "text": "转存时间"},
-                                    ],
-                                }
-                            ],
-                        },
-                        {
-                            "component": "tbody",
-                            "content": rows,
-                        },
-                    ],
+                    "component": "VDataTable",
+                    "props": {
+                        "headers": headers,
+                        "items": items,
+                        "items-per-page": 10,
+                        "items-per-page-options": [10, 20, 50, 100],
+                        "items-per-page-text": "每页",
+                        "no-data-text": "暂无转存记录，抓取并转存资源后将在此展示",
+                        "density": "compact",
+                        "hover": True,
+                    },
                 },
             ],
         }
-
         return [status_card, table_card]
 
     def get_api(self) -> list[dict[str, Any]]:
@@ -1116,8 +838,15 @@ class Pan123TgPilot(_PluginBase):
                 "path": "/records",
                 "endpoint": self._api_get_records,
                 "methods": ["GET"],
-                "summary": "获取历史转存与洗版记录",
-                "description": "查询近期的转存成功与洗版历史记录",
+                "summary": "分页查询转存与洗版记录",
+                "description": "参数: keyword 关键字, status(saved/upgraded), page 页码(从1起), page_size 每页条数",
+            },
+            {
+                "path": "/purge",
+                "endpoint": self._api_purge,
+                "methods": ["POST", "GET"],
+                "summary": "按保留天数立即清理过期记录",
+                "description": "保留天数为 0 (永久) 时不会删除任何记录",
             },
             {
                 "path": "/test_tg",
@@ -1133,16 +862,37 @@ class Pan123TgPilot(_PluginBase):
         threading.Thread(target=self._service_check_channels, daemon=True).start()
         return {"code": 200, "message": "已在后台启动 TG 频道巡检与转存任务"}
 
-    def _api_get_records(self, keyword: str = "", limit: int = 100) -> dict[str, Any]:
-        """API: 获取转存记录，支持关键字检索"""
+    def _api_get_records(
+        self, keyword: str = "", status: str = "", page: int = 1, page_size: int = 20
+    ) -> dict[str, Any]:
+        """API: 分页获取转存记录，支持关键字与状态检索"""
         if not self._db:
             return {"code": 500, "message": "数据库未就绪", "data": []}
         try:
-            lim = int(limit) if limit else 100
+            page = max(1, int(page or 1))
+            page_size = min(200, max(1, int(page_size or 20)))
         except (ValueError, TypeError):
-            lim = 100
-        records = self._db.list_records(limit=lim, keyword=keyword or "")
-        return {"code": 200, "message": "success", "total": len(records), "data": records}
+            page, page_size = 1, 20
+        total = self._db.count_records(keyword=keyword or "", status=status or "")
+        records = self._db.list_records(
+            limit=page_size, offset=(page - 1) * page_size, keyword=keyword or "", status=status or ""
+        )
+        return {
+            "code": 200,
+            "message": "success",
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": (total + page_size - 1) // page_size,
+            "data": records,
+        }
+
+    def _api_purge(self) -> dict[str, Any]:
+        """API: 立即按保留天数清理过期记录"""
+        if self._retention_days <= 0:
+            return {"code": 200, "message": "记录保留天数为 0 (永久保留)，未执行清理", "deleted": 0}
+        n = self._service_purge_records()
+        return {"code": 200, "message": f"已清理 {n} 条过期记录", "deleted": n}
 
     def _api_test_tg(self) -> dict[str, Any]:
         """API: 测试 TG 连通性"""

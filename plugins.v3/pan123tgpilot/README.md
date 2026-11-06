@@ -67,6 +67,7 @@
 | **开启智能画质洗版** | `auto_upgrade` | 布尔值 (Switch) | `true` | 当检测到同一影视且画质评分更高时，自动转存新资源 |
 | **洗版成功后清理旧版** | `auto_delete_old_version` | 布尔值 (Switch) | `true` | 洗版成功后，自动将网盘中旧版文件移至回收站 |
 | **Telegram Bot Token** | `tg_bot_token` | 字符串 (Password) | `空` | 高级备用选项。留空时默认通过公开流免鉴权解析；如配置则通过官方 Bot API 读取 |
+| **记录保留天数** | `retention_days` | 整数 (Number) | `0` | `0` 表示永久保留；填 N 则每天 03:00 自动清理 `updated_at` 早于 N 天的转存记录。注意：清理后同一资源再次出现可能被重新转存 |
 
 ---
 
@@ -120,7 +121,24 @@ flowchart LR
 
 ---
 
+### 数据存储、分页与保留策略
+
+- 记录存放在 MoviePilot 宿主数据库的自有表 `plugin_pan123_tg_record` 中（`link_hash`、`updated_at`、`status` 等均有索引），无需额外数据库文件。
+- 链接去重基于带索引的 `link_hash`（分享链接短码 `s:<key>` / 秒传文件哈希 `f:<etag>`），不再使用全表 `LIKE` 扫描。
+- 升级到 v1.1.0 时自动执行可重复运行的迁移：补齐 `link_hash` 列与索引并回填历史数据。
+- 详情页清单使用数据表：每页 10/20/50/100 条可选，点击表头排序，最多加载最近 500 条。
+- 完整检索与翻页使用 API：`GET /api/v1/plugin/Pan123TgPilot/records?keyword=八仙&status=saved&page=1&page_size=20`，返回 `total` / `pages` / `data`。
+- 手动清理：`/purge`（保留天数为 0 时不会删除任何数据）。
+
 ## 6. 版本历史 (Changelog)
+
+### v1.1.0
+- **数据保留、分页、性能与移动端配置优化**：
+  - 新增「记录保留天数」（默认 0 = 永久），每天 03:00 定时清理过期记录，并提供 `/purge` 手动触发。
+  - 详情页清单改为分页数据表（可排序）；`/records` API 支持 `keyword`、`status`、`page`、`page_size`，返回总数与总页数。
+  - 新增 `link_hash` 列与索引、`updated_at` 索引，链接去重由 `LIKE` 全表扫描改为索引等值查询，附带可重复执行的迁移与历史回填。
+  - 配置表单重构为「基础设置 / 123 云盘 / Telegram 监控 / 洗版与数据」分组卡片，所有栏位手机单列堆叠，按钮占满整行，提示文案精简。
+  - 补齐 models 的 `logger` 导入；新增基于真实 SQLAlchemy + 内存 SQLite 的数据库测试。
 
 ### v1.0.7
 - **转存数据持久化字段与清单展示修复**：
