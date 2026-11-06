@@ -288,12 +288,16 @@ class Pan123TgClient:
         # 若直接传入了秒传码字符串，自动解构
         if fslink and (not etag or not size or not filename):
             try:
-                # 123FSLinkV2$<md5>#<size>#<filename>
-                parts = fslink.split("$", 1)[1].split("#")
+                # 123FSLinkV2$<md5_or_sha1>#<size>#<filename>
+                clean_link = fslink.rstrip("。，,.）)]】\"' \t\r\n")
+                parts = clean_link.split("$", 1)[1].split("#", 2)
                 if len(parts) >= 3:
                     etag = etag or parts[0].strip().lower()
                     size = size or int(parts[1].strip())
-                    filename = filename or parts[2].strip()
+                    fn = parts[2].strip().rstrip("。，,.）)]】\"' \t\r\n")
+                    if "." not in fn or fn.endswith("."):
+                        fn = fn.rstrip(".") + ".mkv"
+                    filename = filename or fn
             except Exception:
                 pass
 

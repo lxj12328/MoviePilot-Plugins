@@ -14,7 +14,7 @@ class TgMessageParser:
     """Telegram 消息解析引擎"""
 
     # 正则规则库
-    RE_FS_LINK = re.compile(r"(123FSLink(?:V2)?\$[a-fA-F0-9]{32}#\d+#[^ \r\n#]+)")
+    RE_FS_LINK = re.compile(r"(123FSLink(?:V2)?\$[a-fA-F0-9]{32,40}#\d+#[^\r\n]+)")
     RE_SHARE_URL = re.compile(r"https?://(?:www\.)?(?:123pan\.com|123684\.com|123pan\.cn)/s/([a-zA-Z0-9_-]+)(?:\?[^ \r\n\"'\)\]]*)?")
     RE_EXTRACT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
 
@@ -40,7 +40,10 @@ class TgMessageParser:
 
         # 1. 提取 123 分享链接与秒传码
         fs_match = cls.RE_FS_LINK.search(text)
-        fslink = fs_match.group(1).strip() if fs_match else None
+        fslink = None
+        if fs_match:
+            # 允许文件名中包含空格等字符，剥离末尾的标点符号、引号及闭合括号
+            fslink = fs_match.group(1).rstrip("。，,.）)]】\"' \t\r\n")
 
         share_match = cls.RE_SHARE_URL.search(text)
         share_url = share_match.group(0).strip() if share_match else None
@@ -66,12 +69,16 @@ class TgMessageParser:
         fs_etag, fs_size, fs_filename = "", 0, ""
         if fslink:
             try:
-                # 123FSLinkV2$<md5>#<size>#<filename>
-                parts = fslink.split("$", 1)[1].split("#")
+                # 123FSLinkV2$<md5_or_sha1>#<size>#<filename>
+                parts = fslink.split("$", 1)[1].split("#", 2)
                 if len(parts) >= 3:
                     fs_etag = parts[0].strip().lower()
                     fs_size = int(parts[1].strip())
-                    fs_filename = parts[2].strip()
+                    raw_fn = parts[2].strip().rstrip("。，,.）)]】\"' \t\r\n")
+                    # 若因原发布者缺失扩展名或异常截断，智能兜底补齐 .mkv
+                    if "." not in raw_fn or raw_fn.endswith("."):
+                        raw_fn = raw_fn.rstrip(".") + ".mkv"
+                    fs_filename = raw_fn
             except Exception:
                 pass
 

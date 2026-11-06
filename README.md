@@ -11,7 +11,7 @@
 | 插件名称 (Plugin Name) | 目录位置 (Directory) | 版本 (Version) | 功能简介 (Description) | 状态 (Status) |
 | :--- | :--- | :--- | :--- | :--- |
 | **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.4.0` | 123云盘助手首个正式稳定版：Web原生秒传与直填Token、影视多级目录级联同步、视频与刮削伴生文件(字幕/海报/NFO)全量同步与清理、qB状态标签联动、独创qB磁盘剩余空间监控与紧急空间腾退机制 | 活跃 (Active) |
-| **123云盘TG转存助手 (Pan123TgPilot)** | [`plugins.v3/pan123tgpilot/`](./plugins.v3/pan123tgpilot/README.md) | `1.0.3` | 123云盘 Telegram 频道智能转存与画质洗版助手：实时监听TG频道、电影与剧集智能分流转存至指定目录、优先完整分享链接转存并全量同步伴生文件(视频/字幕/NFO/海报图片)、自动同名子文件夹归集、适配123FSLinkV2秒传链接、多维画质评分与自动洗版升级、MoviePilot系统消息通知与一键立即运行测试 | 活跃 (Active) |
+| **123云盘TG转存助手 (Pan123TgPilot)** | [`plugins.v3/pan123tgpilot/`](./plugins.v3/pan123tgpilot/README.md) | `1.0.4` | 123云盘 Telegram 频道智能转存与画质洗版助手：实时监听TG频道、电影与剧集智能分流转存至指定目录、优先完整分享链接转存并全量同步伴生文件(视频/字幕/NFO/海报图片)、自动同名子文件夹归集、完美解析带空格与特殊符号的123FSLinkV2秒传链接防丢后缀、多维画质评分与自动洗版升级、MoviePilot系统消息通知与一键立即运行测试 | 活跃 (Active) |
 
 > 💡 **提示**：每当新增或更新插件工具时，请同步更新此表格，确保项目工具目录与功能状态清晰可查。
 

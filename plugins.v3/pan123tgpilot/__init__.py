@@ -70,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "lxj12328"
 
     def __init__(self):
