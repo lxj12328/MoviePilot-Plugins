@@ -128,5 +128,36 @@ class TestPan123WebClient(unittest.TestCase):
             self.assertEqual(client.user_info.get("nickname"), "TestUser")
 
 
+    def test_generate_qr_login(self):
+        client = Pan123WebClient()
+        ok, data, msg = client.generate_qr_login()
+        self.assertTrue(ok)
+        self.assertIn("uuid", data)
+        self.assertIn("img_url", data)
+        self.assertIn("url", data)
+
+    def test_check_qr_login_status_waiting(self):
+        client = Pan123WebClient()
+        with patch.object(client, "_http_post") as mock_post:
+            mock_post.return_value = (True, {"code": 1001, "message": "等待扫码"}, "ok")
+            is_done, tok, msg = client.check_qr_login_status("mock_uuid_123")
+            self.assertFalse(is_done)
+            self.assertIsNone(tok)
+            self.assertIn("等待", msg)
+
+    def test_check_qr_login_status_success(self):
+        client = Pan123WebClient()
+        # 第一次请求获取 wechat_code，第二次换取 token
+        with patch.object(client, "_http_post") as mock_post:
+            mock_post.side_effect = [
+                (True, {"code": 0, "data": {"code": "mock_wx_code_abc"}}, "ok"),
+                (True, {"code": 0, "data": {"token": "mock_qr_token_success_999"}}, "ok"),
+            ]
+            is_done, tok, msg = client.check_qr_login_status("mock_uuid_123")
+            self.assertTrue(is_done)
+            self.assertEqual(tok, "mock_qr_token_success_999")
+            self.assertEqual(client.token, "mock_qr_token_success_999")
+
+
 if __name__ == "__main__":
     unittest.main()

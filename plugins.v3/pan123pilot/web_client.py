@@ -268,6 +268,110 @@ class Pan123WebClient:
 
         return False, last_err
 
+    def generate_qr_login(self) -> tuple[bool, dict, str]:
+        """
+        初始化 123 云盘微信/App 扫码登录会话
+        返回: (ok, {"uuid": uuid, "url": qr_url, "img_url": img_url}, msg)
+        """
+        import uuid
+
+        session_uuid = uuid.uuid4().hex
+
+        # 尝试官方二维码创建接口
+        generate_urls = [
+            f"{self.WEB_BASE_URL}/api/user/qr-code/generate",
+            f"{self.USER_API_URL}/api/user/qr-code/generate",
+        ]
+        remote_data = None
+        for g_url in generate_urls:
+            ok, res, _ = self._http_post(g_url, {"uuid": session_uuid}, with_auth=False)
+            if ok and res.get("code") == 0:
+                remote_data = res.get("data") or {}
+                if remote_data.get("uuid"):
+                    session_uuid = remote_data.get("uuid")
+                break
+
+        # 构造官方微信授权扫码页面链接
+        target_url = (
+            (remote_data.get("url") or remote_data.get("qrcode"))
+            if remote_data
+            else f"{self.WEB_BASE_URL}/wx-app-login.html?uuid={session_uuid}&env=production"
+        )
+
+        encoded_url = urllib.parse.quote(target_url)
+        # 生成可直接渲染的二维码图片直链
+        img_url = f"https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={encoded_url}"
+
+        return True, {
+            "uuid": session_uuid,
+            "url": target_url,
+            "img_url": img_url,
+        }, "ok"
+
+    def check_qr_login_status(self, session_uuid: str) -> tuple[bool, Optional[str], str]:
+        """
+        轮询检查扫码登录状态
+        :return: (is_done, token, status_message)
+        """
+        if not session_uuid:
+            return False, None, "UUID 无效"
+
+        endpoints = [
+            f"{self.WEB_BASE_URL}/api/user/qr-code/wx_code",
+            f"{self.USER_API_URL}/api/user/qr-code/wx_code",
+        ]
+
+        payload = {"uuid": session_uuid}
+        wx_code = None
+        last_msg = "等待扫码"
+
+        for url in endpoints:
+            ok, res, msg = self._http_post(url, payload, with_auth=False)
+            if ok:
+                code = res.get("code")
+                if code == 0:
+                    data = res.get("data") or {}
+                    wx_code = data.get("code") or data.get("wechat_code") or data.get("wx_code")
+                    if wx_code:
+                        break
+                elif code in (1, 1001, 1002):
+                    last_msg = res.get("message") or "等待微信/App扫码"
+                elif code == 1003:
+                    last_msg = "已扫码，请在手机上点击确认授权"
+                elif code in (1004, 1005):
+                    last_msg = "二维码已过期，请刷新二维码重新扫描"
+                else:
+                    last_msg = res.get("message") or msg
+            else:
+                last_msg = msg
+
+        if not wx_code:
+            return False, None, last_msg
+
+        # 获取到 wechat_code 后换取正式 Token
+        sign_in_urls = [
+            f"{self.WEB_BASE_URL}/api/user/sign_in",
+            f"{self.USER_API_URL}/api/user/sign_in",
+        ]
+        sign_payloads = [
+            {"code": wx_code, "type": 4},
+            {"wechat_code": wx_code, "type": 4},
+            {"code": wx_code, "type": 1},
+        ]
+        for s_url in sign_in_urls:
+            for s_pay in sign_payloads:
+                ok_s, res_s, msg_s = self._http_post(s_url, s_pay, with_auth=False)
+                if ok_s and res_s.get("code") == 0:
+                    data_s = res_s.get("data") or {}
+                    tok = data_s.get("token") or data_s.get("accessToken")
+                    if tok:
+                        self.token = self._clean_token(tok)
+                        self._last_token_check = time.time()
+                        logger.info("Pan123Pilot 微信扫码授权登录成功！已获取正式有效 Token")
+                        return True, self.token, "微信扫码授权登录成功"
+
+        return False, None, "换取登录 Token 失败"
+
     def ensure_authenticated(self) -> tuple[bool, str]:
         """确保客户端处于已鉴权状态，严格遵循选定的 auth_mode 隔离执行"""
         # 1. 直填 Token 模式 (web_token): 严格以用户填写的 authorToken 为准，绝不擅自越权调用账号密码登录
@@ -278,7 +382,13 @@ class Pan123WebClient:
                 return True, "Web Token 有效"
             return False, "当前配置的 Web Token 已失效或校验未通过，请在 123 网页端重新复制 authorToken 填入"
 
-        # 2. 短信验证码模式 (web_sms): 使用短信验证码换取的 Token，失效时提示重新获取验证码
+        # 2. 扫码登录模式 (web_qr): 使用扫码获取并缓存的 Token
+        if self.auth_mode == "web_qr":
+            if self.token and self.check_token_validity():
+                return True, "扫码登录 Token 有效"
+            return False, "扫码登录凭证已失效，请在插件详情页扫描二维码重新授权登录"
+
+        # 3. 短信验证码模式 (web_sms): 使用短信验证码换取的 Token，失效时提示重新获取验证码
         if self.auth_mode == "web_sms":
             if self.token and self.check_token_validity():
                 return True, "短信登录 Token 有效"
