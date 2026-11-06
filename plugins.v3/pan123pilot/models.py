@@ -82,6 +82,7 @@ class Pan123TaskDatabase:
         source_path: Optional[str] = None,
         parent_file_id: int = 0,
         max_retry: int = 10,
+        force_reset: bool = False,
     ) -> int:
         """添加新任务或更新已有任务信息"""
         if db is None:
@@ -99,8 +100,8 @@ class Pan123TaskDatabase:
             task.parent_file_id = parent_file_id
             task.max_retry = max_retry
             task.updated_at = datetime.now()
-            # 若已有任务处于未完成状态 (PENDING / RETRYING / FAILED)，重新扫描录入时重置为 PENDING 立即触发流转
-            if task.status not in ("COMPLETED", "CLEANED"):
+            # 若已有任务处于未完成状态或要求强制重置，重置为 PENDING 立即触发流转
+            if force_reset or task.status not in ("COMPLETED", "CLEANED"):
                 task.status = "PENDING"
                 task.retry_count = 0
                 task.error_msg = ""
@@ -118,6 +119,31 @@ class Pan123TaskDatabase:
             db.add(task)
         db.flush()
         return task.id
+
+    @db_update
+    def reset_tasks_status(
+        self,
+        db: Optional[Session] = None,
+        *,
+        statuses: Optional[list[str]] = None,
+        to_status: str = "PENDING",
+    ) -> int:
+        """重置指定或全部任务状态为 PENDING，并清空重试计数以便全量重新流转"""
+        if db is None:
+            return 0
+        stmt = select(Pan123Task)
+        if statuses:
+            stmt = stmt.where(Pan123Task.status.in_(statuses))
+        records = db.execute(stmt).scalars().all()
+        count = 0
+        for task in records:
+            task.status = to_status
+            task.retry_count = 0
+            task.error_msg = ""
+            task.updated_at = datetime.now()
+            count += 1
+        db.flush()
+        return count
 
     @db_update
     def update_task_status(

@@ -205,7 +205,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.3.8"
+    plugin_version = "1.3.9"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -223,6 +223,7 @@ class Pan123Pilot(_PluginBase):
     _parent_file_id: int = 0
     _local_library_root: str = ""
     _enable_path_cascade: bool = True
+    _force_resync_completed: bool = False
     _scan_history_on_save: bool = False
     _auto_scan_history: bool = False
     _retry_interval: int = 30
@@ -334,6 +335,7 @@ class Pan123Pilot(_PluginBase):
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
         self._local_library_root = str(config.get("local_library_root") or "").strip()
         self._enable_path_cascade = bool(config.get("enable_path_cascade", True))
+        self._force_resync_completed = bool(config.get("force_resync_completed", False))
         self._scan_history_on_save = bool(config.get("scan_history_on_save", False))
         self._auto_scan_history = bool(config.get("auto_scan_history", False))
         try:
@@ -520,12 +522,19 @@ class Pan123Pilot(_PluginBase):
                 logger.error("Pan123Pilot OpenAPI Token 获取失败，请检查 Client ID / Secret")
 
         # 检查是否需要扫描本地历史已整理媒体
-        if self._enabled and (self._scan_history_on_save or self._auto_scan_history):
-            logger.info("Pan123Pilot 已开启历史媒体扫描，正在启动后台异步补录...")
+        if self._enabled and (self._force_resync_completed or self._scan_history_on_save or self._auto_scan_history):
+            force = self._force_resync_completed
+            if force:
+                logger.info("Pan123Pilot 检测到开启【强制重新同步已完成的媒体】，正在重置任务库并全量补录...")
+                if self.db_helper:
+                    self.db_helper.reset_tasks_status(statuses=["COMPLETED", "CLEANED", "FAILED", "RETRYING"], to_status="PENDING")
+            else:
+                logger.info("Pan123Pilot 已开启历史媒体扫描，正在启动后台异步补录...")
             if self._scan_history_on_save:
                 self._scan_history_on_save = False
             threading.Thread(
                 target=self._scan_and_sync_history_library,
+                kwargs={"force_resync": force},
                 daemon=True,
             ).start()
         elif self._enabled and self.scheduler:
@@ -658,6 +667,13 @@ class Pan123Pilot(_PluginBase):
                 "summary": "手动扫描本地媒体库并补录待同步媒体文件",
             },
             {
+                "path": "/reset_tasks",
+                "endpoint": self._api_reset_tasks,
+                "methods": ["POST", "GET"],
+                "auth": "bear",
+                "summary": "一键重置所有已完成及重试任务为待同步并立即触发流转",
+            },
+            {
                 "path": "/test_auth",
                 "endpoint": self._api_test_auth,
                 "methods": ["POST", "GET"],
@@ -694,7 +710,7 @@ class Pan123Pilot(_PluginBase):
             return {"code": 1, "message": "OpenAPI Token 获取失败，请检查 Client ID / Secret"}
         return {"code": 1, "message": "客户端未初始化"}
 
-    def _scan_and_sync_history_library(self) -> int:
+    def _scan_and_sync_history_library(self, force_resync: bool = False) -> int:
         """
         深度扫描本地已整理好的历史媒体文件，自动关联 MoviePilot 整理历史或 qB 种子，
         补录入库并触发全链路秒传与标签回写。
@@ -704,8 +720,8 @@ class Pan123Pilot(_PluginBase):
                 logger.warning(f"Pan123Pilot 历史媒体库扫描跳过：路径不存在或未配置 ({self._local_library_root})")
                 return 0
 
-            logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} ...")
-            task_ids = _record_transferred_target(self._local_library_root)
+            logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} (强制重新同步: {force_resync}) ...")
+            task_ids = _record_transferred_target(self._local_library_root, force_resync=force_resync)
             logger.info(f"Pan123Pilot 本地历史媒体扫描完成，共识别与补录 {len(task_ids)} 个媒体文件")
             return len(task_ids)
         except Exception as e:
@@ -717,8 +733,19 @@ class Pan123Pilot(_PluginBase):
         if not self._local_library_root or not os.path.exists(self._local_library_root):
             return {"code": 1, "message": f"本地媒体库路径未配置或在容器内不存在: {self._local_library_root}"}
 
-        count = self._scan_and_sync_history_library()
+        count = self._scan_and_sync_history_library(force_resync=self._force_resync_completed)
         return {"code": 0, "message": f"媒体库扫描完成，已录入并检查 {count} 个媒体文件"}
+
+    def _api_reset_tasks(self) -> dict:
+        """手动一键重置所有已完成及异常任务为待同步并立即触发流转"""
+        if not self.db_helper:
+            return {"code": 1, "message": "数据库未就绪"}
+        count = self.db_helper.reset_tasks_status()
+        if self._local_library_root and os.path.exists(self._local_library_root):
+            _record_transferred_target(self._local_library_root, force_resync=True)
+        if self.scheduler and self._enabled:
+            self.scheduler.process_pending_tasks(enable_real_upload=self._enable_real_upload)
+        return {"code": 0, "message": f"已成功重置 {count} 个任务为待同步，后台正在全速重新秒传/上传！"}
 
     def on_transfer_completed(self, event: Any) -> None:
         """MoviePilot 插件类反射事件监听入口"""
@@ -972,13 +999,13 @@ class Pan123Pilot(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "scan_history_on_save",
-                                            "label": "保存配置时立即扫描历史媒体库 (自动关联 qB 种子)",
+                                            "label": "保存时扫描历史媒体库",
                                             "hint": "保存配置后后台自动遍历本地媒体库，关联种子并把未同步的影视加入秒传队列",
                                             "persistent-hint": True,
                                         },
@@ -987,7 +1014,7 @@ class Pan123Pilot(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -995,6 +1022,21 @@ class Pan123Pilot(_PluginBase):
                                             "model": "auto_scan_history",
                                             "label": "启动时自动扫描补录历史媒体",
                                             "hint": "每次 MoviePilot 启动或重载时，自动检查并补录未同步文件",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "force_resync_completed",
+                                            "label": "强制重新同步已完成的媒体",
+                                            "hint": "开启后保存配置，插件将重置已完成状态并全量重新秒传至云盘（当您在网盘删除了已上传文件需重新上传时使用）",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1355,6 +1397,7 @@ class Pan123Pilot(_PluginBase):
             "target_parent_file_id": 0,
             "local_library_root": "",
             "enable_path_cascade": True,
+            "force_resync_completed": False,
             "scan_history_on_save": False,
             "auto_scan_history": False,
             "retry_interval": 30,
@@ -1569,6 +1612,7 @@ def _record_transferred_target(
     target_path: str,
     source_path: Optional[str] = None,
     torrent_hash: Optional[str] = None,
+    force_resync: bool = False,
 ) -> list[int]:
     """
     将整理后的目标文件或目录内的媒体录入任务库并触发处理。
@@ -1626,9 +1670,9 @@ def _record_transferred_target(
 
     for file_full, fname in target_files:
         try:
-            # 检查是否已存在于数据库且已处理完成
+            # 检查是否已存在于数据库且已处理完成（若 force_resync 为 True 则不跳过，强制重置流转）
             existing = db.get_task_by_target(target_path=file_full)
-            if existing and existing.get("status") in ("COMPLETED", "CLEANED"):
+            if not force_resync and existing and existing.get("status") in ("COMPLETED", "CLEANED"):
                 logger.debug(f"Pan123Pilot 媒体已处理完成，跳过: {fname} (状态: {existing.get('status')})")
                 continue
 
@@ -1654,6 +1698,7 @@ def _record_transferred_target(
                 file_size=f_size,
                 torrent_hash=cur_hash,
                 source_path=cur_src,
+                force_reset=force_resync,
             )
             task_ids.append(tid)
             logger.info(

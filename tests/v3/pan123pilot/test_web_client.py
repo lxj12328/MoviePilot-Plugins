@@ -297,6 +297,40 @@ class TestPan123WebClient(unittest.TestCase):
             error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
         )
 
+    def test_database_reset_tasks_status(self):
+        from pan123pilot.models import Pan123TaskDatabase, Pan123Task
+        db = Pan123TaskDatabase()
+        mock_session = MagicMock()
+        task1 = MagicMock(spec=Pan123Task)
+        task1.status = "COMPLETED"
+        task1.retry_count = 5
+        task2 = MagicMock(spec=Pan123Task)
+        task2.status = "FAILED"
+        task2.retry_count = 10
+
+        mock_session.execute.return_value.scalars.return_value.all.return_value = [task1, task2]
+
+        count = db.reset_tasks_status(db=mock_session)
+        self.assertEqual(count, 2)
+        self.assertEqual(task1.status, "PENDING")
+        self.assertEqual(task1.retry_count, 0)
+        self.assertEqual(task2.status, "PENDING")
+        self.assertEqual(task2.retry_count, 0)
+        mock_session.flush.assert_called_once()
+
+    def test_api_reset_tasks_endpoint(self):
+        from pan123pilot import Pan123Pilot
+        pilot = Pan123Pilot()
+        pilot._enabled = True
+        pilot.db_helper = MagicMock()
+        pilot.db_helper.reset_tasks_status.return_value = 7
+        pilot.scheduler = MagicMock()
+
+        res = pilot._api_reset_tasks()
+        self.assertEqual(res["code"], 0)
+        self.assertIn("7 个任务", res["message"])
+        pilot.scheduler.process_pending_tasks.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
