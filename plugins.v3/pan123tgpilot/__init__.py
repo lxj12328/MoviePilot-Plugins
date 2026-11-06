@@ -70,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "lxj12328"
 
     def __init__(self):
@@ -395,17 +395,24 @@ class Pan123TgPilot(_PluginBase):
         saved_file_id: Optional[int] = None
         error_msg = ""
 
+        # 构建统一的媒体文件夹名称 (例如: "八仙！ (2026)" 或 "死灵法师！我即是天灾")
+        year_str = str(resource.get("year") or "").strip()
+        folder_display_name = f"{title} ({year_str})" if year_str else title
+
         try:
-            if resource.get("fslink"):
-                # 秒传链接
-                fslink = resource["fslink"]
+            # 1. 优先使用标准分享链接转存：可完整转存该分享下的整个文件夹与全部伴生文件（视频、字幕、nfo、海报等）
+            if resource.get("share_key"):
+                share_key = resource["share_key"]
+                share_pwd = resource.get("share_pwd", "")
                 logger.info(
-                    f"Pan123TgPilot 发起 123 秒传转存: 【{resource.get('fs_filename') or title}】 -> "
-                    f"目标目录ID: {target_dir_id}"
+                    f"Pan123TgPilot 发起 123 分享转存 (完整转存文件夹及字幕/nfo刮削伴生文件): 【{title}】 "
+                    f"(Key: {share_key}) -> 目标目录ID: {target_dir_id}"
                 )
-                success, file_id, msg = self._client.save_fslink(
-                    fslink=fslink,
-                    parent_file_id=target_dir_id,
+                success, file_id, msg = self._client.save_share_link(
+                    share_key=share_key,
+                    share_pwd=share_pwd,
+                    target_parent_id=target_dir_id,
+                    folder_name=folder_display_name,
                 )
                 if success:
                     save_success = True
@@ -415,23 +422,24 @@ class Pan123TgPilot(_PluginBase):
                         saved_file_id = None
                 else:
                     error_msg = msg
-            elif resource.get("share_key"):
-                # 标准分享链接
-                share_key = resource["share_key"]
-                share_pwd = resource.get("share_pwd", "")
+            elif resource.get("fslink"):
+                # 2. 仅当没有分享链接时，执行单文件秒传码转存 (自动归集至同名文件夹)
+                fslink = resource["fslink"]
                 logger.info(
-                    f"Pan123TgPilot 发起 123 分享转存: 【{title}】 "
-                    f"(Key: {share_key}) -> 目标目录ID: {target_dir_id}"
+                    f"Pan123TgPilot 发起 123 秒传转存: 【{resource.get('fs_filename') or title}】 -> "
+                    f"目标目录ID: {target_dir_id} (归集文件夹: {folder_display_name})"
                 )
-                success, msg, saved_ids = self._client.save_share_link(
-                    share_key=share_key,
+                success, file_id, msg = self._client.save_fslink(
+                    fslink=fslink,
                     parent_file_id=target_dir_id,
-                    share_pwd=share_pwd,
+                    folder_name=folder_display_name,
                 )
                 if success:
                     save_success = True
-                    if saved_ids:
-                        saved_file_id = saved_ids[0]
+                    try:
+                        saved_file_id = int(file_id) if file_id else None
+                    except (ValueError, TypeError):
+                        saved_file_id = None
                 else:
                     error_msg = msg
         except Exception as e:

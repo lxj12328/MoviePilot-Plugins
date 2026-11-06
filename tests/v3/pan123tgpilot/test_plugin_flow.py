@@ -149,6 +149,31 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         # 验证旧版本被自动删除
         self.plugin._client.trash_files.assert_called_with([99999])
 
+    def test_share_link_priority_over_fslink(self):
+        self.plugin.init_plugin({
+            "enabled": True,
+            "pan123_token": "token_abc",
+            "movie_target_dir_id": "1001",
+            "tv_target_dir_id": "1002",
+        })
+        self.plugin._client = MagicMock()
+        self.plugin._client.save_share_link.return_value = (True, "88888", "success")
+        self.plugin._db = MagicMock()
+        self.plugin._db.get_record_by_media_key.return_value = None
+
+        # 同时含有分享链接与秒传链接的消息，必须优先转存分享链接的完整文件夹与伴生文件
+        msg = """
+🎬 斗破苍穹 (2017)
+🎭 类型：剧集
+S05E217 4K WEB-DL H.265
+🔗 链接：[123网盘](https://www.123pan.com/s/7Tx1jv-8e4tv?pwd=xoxo#)
+🔗 秒传：123FSLinkV2$82467be2147f26532298438bf7015238#1234567#斗破S05E217.mkv
+        """
+        res = self.plugin._process_single_message(channel="Pan123Movie", msg_id="10", raw_text=msg)
+        self.assertEqual(res, "transferred")
+        self.plugin._client.save_share_link.assert_called_once()
+        self.plugin._client.save_fslink.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,51 @@ class TestClientAndWatcher(unittest.TestCase):
         headers = client._get_headers(with_auth=True)
         self.assertEqual(headers["authorization"], "Bearer test_token_xyz")
 
+    def test_client_mkdir(self):
+        client = Pan123TgClient(token="test_token")
+        client._http_request = MagicMock(return_value=(True, {
+            "code": 0,
+            "message": "ok",
+            "data": {"fileId": 778899},
+        }, "ok"))
+
+        ok, dir_id, msg = client.mkdir("八仙！ (2026)", parent_file_id=12345)
+        self.assertTrue(ok)
+        self.assertEqual(dir_id, 778899)
+
+    def test_client_save_share_link(self):
+        client = Pan123TgClient(token="test_token")
+
+        def mock_request(url, method="GET", payload=None, with_auth=True):
+            if "share/get" in url:
+                return True, {
+                    "code": 0,
+                    "message": "ok",
+                    "data": {
+                        "InfoList": [
+                            {"fileId": 101, "fileName": "movie.mkv", "type": 0},
+                            {"fileId": 102, "fileName": "movie.nfo", "type": 0},
+                            {"fileId": 103, "fileName": "movie.srt", "type": 0},
+                        ],
+                        "next": 0,
+                    },
+                }, "ok"
+            elif "upload_request" in url:
+                return True, {"code": 0, "data": {"fileId": 999}}, "ok"
+            elif "share/save" in url:
+                return True, {"code": 0, "message": "ok", "data": {"fileId": 999}}, "ok"
+            return False, {}, "error"
+
+        client._http_request = MagicMock(side_effect=mock_request)
+        ok, fid, msg = client.save_share_link(
+            share_key="7Tx1jv-8e4tv",
+            share_pwd="xoxo",
+            target_parent_id=12345,
+            folder_name="测试影视 (2026)",
+        )
+        self.assertTrue(ok)
+        self.assertIn("3 个文件", msg)
+
     def test_client_save_fslink(self):
         client = Pan123TgClient(token="test_token")
         client._http_request = MagicMock(return_value=(True, {

@@ -116,14 +116,68 @@ class Pan123TgClient:
             return True
         return False
 
+    def mkdir(self, dirname: str, parent_file_id: int = 0) -> Tuple[bool, int, str]:
+        """在指定目录下创建新文件夹 (若同名则复用现有文件夹)"""
+        clean_name = (dirname or "").strip()
+        if not clean_name:
+            return False, 0, "文件夹名称为空"
+
+        parent_id = int(parent_file_id or 0)
+        cache_key = (parent_id, clean_name)
+        if hasattr(self, "_dir_cache") and cache_key in self._dir_cache:
+            return True, self._dir_cache[cache_key], "命中缓存"
+
+        payload = {
+            "driveId": 0,
+            "parentFileId": parent_id,
+            "filename": clean_name,
+            "fileName": clean_name,
+            "type": 1,  # 1 代表文件夹
+            "size": 0,
+            "etag": "",
+            "duplicate": 2,  # 2: 若同名则重用/覆盖
+            "NotReuse": True,
+            "event": "newCreateFolder",
+            "operateType": 1,
+        }
+
+        urls = [
+            f"{self.WEB_BASE_URL}/b/api/file/upload_request",
+            f"{self.BACKUP_BASE_URL}/b/api/file/upload_request",
+        ]
+
+        last_msg = ""
+        for url in urls:
+            ok, res, msg = self._http_request(url, method="POST", payload=payload, with_auth=True)
+            if ok and res.get("code") == 0:
+                data = res.get("data") or {}
+                info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
+                dir_id = (
+                    info.get("FileId")
+                    or info.get("fileId")
+                    or data.get("fileId")
+                    or data.get("FileId")
+                    or data.get("id")
+                )
+                if dir_id:
+                    did = int(dir_id)
+                    if not hasattr(self, "_dir_cache"):
+                        self._dir_cache = {}
+                    self._dir_cache[cache_key] = did
+                    return True, did, "创建/获取文件夹成功"
+            last_msg = res.get("message") if ok else msg
+
+        return False, 0, f"创建文件夹失败: {last_msg}"
+
     def save_share_link(
         self,
         share_key: str,
         share_pwd: str = "",
         target_parent_id: int = 0,
+        folder_name: str = "",
     ) -> Tuple[bool, Optional[str], str]:
         """
-        转存标准 123 分享链接至指定云盘目录
+        转存标准 123 分享链接中的全量文件夹与所有文件 (包含视频、字幕、nfo、图片等刮削信息)
         :return: (ok: 是否成功, file_id: 云盘文件ID, msg: 说明)
         """
         if not self.is_configured():
@@ -133,36 +187,64 @@ class Pan123TgClient:
         last_msg = ""
 
         for host in hosts:
-            # 1. 查询分享提取文件列表
-            query_params = urllib.parse.urlencode({
-                "limit": 100,
-                "next": 0,
-                "orderBy": "file_name",
-                "orderDirection": "asc",
-                "shareKey": share_key,
-                "SharePwd": share_pwd,
-                "parentFileId": 0,
-                "Page": 1,
-            })
-            get_url = f"{host}/b/api/share/get?{query_params}"
-            ok_get, res_get, msg_get = self._http_request(get_url, method="GET", with_auth=True)
-            if not ok_get or res_get.get("code") != 0:
-                last_msg = res_get.get("message") if ok_get else msg_get
+            # 1. 多页遍历查询分享提取全量文件与文件夹列表 (完整抓取视频、字幕、nfo元数据、海报)
+            file_id_list = []
+            items = []
+            next_cursor = 0
+
+            while True:
+                query_params = urllib.parse.urlencode({
+                    "limit": 100,
+                    "next": next_cursor,
+                    "orderBy": "file_name",
+                    "orderDirection": "asc",
+                    "shareKey": share_key,
+                    "SharePwd": share_pwd,
+                    "parentFileId": 0,
+                    "Page": 1,
+                })
+                get_url = f"{host}/b/api/share/get?{query_params}"
+                ok_get, res_get, msg_get = self._http_request(get_url, method="GET", with_auth=True)
+                if not ok_get or res_get.get("code") != 0:
+                    last_msg = res_get.get("message") if ok_get else msg_get
+                    break
+
+                data_get = res_get.get("data") or {}
+                batch_items = data_get.get("InfoList") or data_get.get("fileList") or []
+                if not batch_items:
+                    break
+
+                for it in batch_items:
+                    fid = it.get("FileId") or it.get("fileId")
+                    if fid and int(fid) not in file_id_list:
+                        file_id_list.append(int(fid))
+                        items.append(it)
+
+                next_val = data_get.get("next")
+                if not next_val or int(next_val) == 0 or len(batch_items) < 100:
+                    break
+                next_cursor = int(next_val)
+
+            if not file_id_list:
                 continue
 
-            data_get = res_get.get("data") or {}
-            items = data_get.get("InfoList") or data_get.get("fileList") or []
-            file_id_list = []
-            for item in items:
-                fid = item.get("FileId") or item.get("fileId")
-                if fid:
-                    file_id_list.append(int(fid))
+            # 判断是否需要归集至影视同名子文件夹：
+            # 若分享根目录本身就是一个文件夹 (Type == 1)，直接转存至 target_parent_id 即可完整保留该文件夹；
+            # 若分享根目录下直接平铺了多个文件 (如 .mkv + .nfo + .srt + .jpg)，则自动在目标目录下创建影视同名文件夹并转存入内
+            final_target_id = int(target_parent_id or 0)
+            has_single_root_folder = (
+                len(items) == 1 and int(items[0].get("type") or items[0].get("Type") or 0) == 1
+            )
+            if not has_single_root_folder and folder_name:
+                ok_mk, dir_id, _ = self.mkdir(dirname=folder_name, parent_file_id=final_target_id)
+                if ok_mk and dir_id:
+                    final_target_id = dir_id
 
-            # 2. 调用转存接口
+            # 2. 调用批量转存接口，全量转存所有文件夹与伴生文件
             save_payload = {
                 "shareKey": share_key,
                 "sharePwd": share_pwd,
-                "parentFileId": int(target_parent_id or 0),
+                "parentFileId": final_target_id,
                 "fileIdList": file_id_list,
                 "duplicate": 2,  # 覆盖/重用
             }
@@ -172,8 +254,8 @@ class Pan123TgClient:
             )
             if ok_save and res_save.get("code") == 0:
                 data_s = res_save.get("data") or {}
-                fid = data_s.get("fileId") or data_s.get("FileId") or str(file_id_list[0] if file_id_list else "")
-                return True, str(fid), "分享转存成功"
+                fid = data_s.get("fileId") or data_s.get("FileId") or str(final_target_id or file_id_list[0])
+                return True, str(fid), f"分享转存成功 (共包含 {len(file_id_list)} 个文件/文件夹)"
 
             last_msg = res_save.get("message") if ok_save else msg_save
 
@@ -187,14 +269,21 @@ class Pan123TgClient:
         target_parent_id: int = 0,
         fslink: str = "",
         parent_file_id: int = 0,
+        folder_name: str = "",
     ) -> Tuple[bool, Optional[str], str]:
         """
-        解析 123 秒传码 (123FSLink) 并零流量直接秒传至指定目录
+        解析 123 秒传码 (123FSLink) 并零流量直接秒传至指定目录 (支持自动归集至同名文件夹)
         """
         if not self.is_configured():
             return False, None, "123 云盘 Web Token 未配置"
 
         target_id = int(parent_file_id or target_parent_id or 0)
+
+        # 若提供了影视文件夹名称，自动创建或复用该子文件夹
+        if folder_name and target_id != 0:
+            ok_mk, dir_id, _ = self.mkdir(dirname=folder_name, parent_file_id=target_id)
+            if ok_mk and dir_id:
+                target_id = dir_id
 
         # 若直接传入了秒传码字符串，自动解构
         if fslink and (not etag or not size or not filename):
