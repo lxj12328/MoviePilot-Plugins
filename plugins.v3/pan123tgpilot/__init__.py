@@ -70,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_author = "lxj12328"
 
     def __init__(self):
@@ -364,20 +364,38 @@ class Pan123TgPilot(_PluginBase):
         media_type_cn = "剧集" if is_tv else "电影"
         title = resource.get("title", "未知影视")
 
-        # 检查本地数据库中该资源的转存记录
+        # 1. 链接级去重：若该分享链接或秒传码已在历史记录中，直接跳过
+        share_url = resource.get("share_url") or ""
+        fslink = resource.get("fslink") or ""
+        if self._db and self._db.has_link_processed(share_url=share_url, fslink=fslink):
+            logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{title}】")
+            return "skipped"
+
+        # 2. 媒体级去重与智能洗版对比
         media_key = resource.get("media_key", "")
-        existing_record = self._db.get_record_by_media_key(media_key=media_key) if self._db else None
+        existing_record = None
+        if self._db:
+            existing_record = self._db.get_record_by_media_key(
+                media_key=media_key,
+                title=title,
+                year=resource.get("year", ""),
+                tmdb_id=resource.get("tmdb_id"),
+                media_type=resource.get("media_type", "movie"),
+                ep_tag=resource.get("ep_tag", ""),
+            )
 
         is_upgrade = False
         decision_reason = ""
         if existing_record:
             if not self._auto_upgrade:
-                # 未开启洗版，跳过已转存资源
+                logger.info(f"Pan123TgPilot 本地库已存在【{title}】且未开启自动洗版，跳过转存")
                 return "skipped"
 
             should_up, decision_reason = evaluate_upgrade(existing_record, resource)
             if not should_up:
-                # 质量未超过已保存版本，跳过
+                logger.info(
+                    f"Pan123TgPilot 【{title}】已有同质或更优资源 (当前得分: {existing_record.get('quality_score', 0)} >= 新资源: {resource.get('quality_score', 0)})，跳过转存"
+                )
                 return "skipped"
 
             is_upgrade = True
@@ -800,145 +818,274 @@ class Pan123TgPilot(_PluginBase):
             else "尚未执行"
         )
 
-        return [
-            {
-                "component": "VCard",
-                "props": {"class": "mb-4", "variant": "outlined"},
+        status_card = {
+            "component": "VCard",
+            "props": {"class": "mb-4", "variant": "outlined"},
+            "content": [
+                {
+                    "component": "VCardItem",
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "text": "123云盘TG转存助手运行状态",
+                        },
+                        {
+                            "component": "VCardSubtitle",
+                            "text": f"插件状态: {status_text} | 检查周期: 每 {self._check_interval} 分钟 | 上次巡检: {last_check}",
+                        },
+                    ],
+                },
+                {
+                    "component": "VCardText",
+                    "content": [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 6, "md": 3},
+                                    "content": [
+                                        {
+                                            "component": "VCard",
+                                            "props": {"color": "primary", "variant": "tonal"},
+                                            "content": [
+                                                {
+                                                    "component": "VCardItem",
+                                                    "content": [
+                                                        {"component": "VCardSubtitle", "text": "累计检查消息"},
+                                                        {"component": "VCardTitle", "text": str(self._check_stats["total_checked"])},
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 6, "md": 3},
+                                    "content": [
+                                        {
+                                            "component": "VCard",
+                                            "props": {"color": "success", "variant": "tonal"},
+                                            "content": [
+                                                {
+                                                    "component": "VCardItem",
+                                                    "content": [
+                                                        {"component": "VCardSubtitle", "text": "成功转存总数"},
+                                                        {"component": "VCardTitle", "text": str(self._check_stats["transferred_count"])},
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 6, "md": 3},
+                                    "content": [
+                                        {
+                                            "component": "VCard",
+                                            "props": {"color": "info", "variant": "tonal"},
+                                            "content": [
+                                                {
+                                                    "component": "VCardItem",
+                                                    "content": [
+                                                        {"component": "VCardSubtitle", "text": "洗版升级总数"},
+                                                        {"component": "VCardTitle", "text": str(self._check_stats["upgraded_count"])},
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                                {
+                                    "component": "VCol",
+                                    "props": {"cols": 6, "md": 3},
+                                    "content": [
+                                        {
+                                            "component": "VCard",
+                                            "props": {"color": "warning", "variant": "tonal"},
+                                            "content": [
+                                                {
+                                                    "component": "VCardItem",
+                                                    "content": [
+                                                        {"component": "VCardSubtitle", "text": "监控频道数量"},
+                                                        {"component": "VCardTitle", "text": str(len(self._tg_channels))},
+                                                    ],
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "component": "VDivider",
+                            "props": {"class": "my-4"},
+                        },
+                        {
+                            "component": "p",
+                            "props": {"class": "text-caption text-grey"},
+                            "text": f"当前监控的频道: {channels_str}",
+                        },
+                        {
+                            "component": "p",
+                            "props": {"class": "text-caption text-grey"},
+                            "text": f"电影目录ID: {self._movie_target_dir_id} | 剧集目录ID: {self._tv_target_dir_id} | 智能洗版: {'开启' if self._auto_upgrade else '关闭'} | 旧版清理: {'开启' if self._auto_delete_old_version else '关闭'}",
+                        },
+                    ],
+                },
+                {
+                    "component": "VCardActions",
+                    "props": {"class": "px-4 pb-4"},
+                    "content": [
+                        {
+                            "component": "VBtn",
+                            "props": {
+                                "color": "primary",
+                                "variant": "elevated",
+                                "prepend-icon": "mdi-play-circle",
+                                "text": "立即运行一次巡检测试",
+                            },
+                            "events": {
+                                "click": "api.post('/plugin/Pan123TgPilot/manual_check')",
+                            },
+                        },
+                    ],
+                },
+            ],
+        }
+
+        # 动态读取并呈现已转存影视资源清单
+        recent_records = self._db.list_records(limit=50) if self._db else []
+        rows = []
+        for r in recent_records:
+            size_bytes = r.get("file_size") or 0
+            if size_bytes > 0:
+                size_str = f"{size_bytes / (1024.0 ** 3):.2f} GB"
+            else:
+                size_str = "-"
+
+            res = r.get("resolution") or "-"
+            codec = r.get("codec") or "-"
+            hdr = r.get("dovi_hdr") or ""
+            spec = f"{res} / {codec}" + (f" / {hdr}" if hdr else "")
+
+            status = r.get("status")
+            status_map = {
+                "saved": ("首发转存", "success"),
+                "upgraded": ("洗版升级", "info"),
+                "ignored": ("已跳过", "grey"),
+            }
+            status_text, status_color = status_map.get(status, (status or "已转存", "primary"))
+
+            time_str = str(r.get("updated_at") or r.get("created_at") or "-")
+            if len(time_str) > 19:
+                time_str = time_str[:19]
+
+            rows.append({
+                "component": "tr",
                 "content": [
                     {
-                        "component": "VCardItem",
+                        "component": "td",
+                        "props": {"class": "font-weight-medium"},
+                        "text": r.get("media_title") or r.get("title") or "-",
+                    },
+                    {
+                        "component": "td",
                         "content": [
                             {
-                                "component": "VCardTitle",
-                                "text": "123云盘TG转存助手运行状态",
-                            },
+                                "component": "VChip",
+                                "props": {"size": "x-small", "variant": "tonal", "color": "primary"},
+                                "text": spec,
+                            }
+                        ],
+                    },
+                    {"component": "td", "text": size_str},
+                    {
+                        "component": "td",
+                        "props": {"class": "text-primary font-weight-bold"},
+                        "text": str(r.get("quality_score") or 0),
+                    },
+                    {"component": "td", "text": r.get("channel") or "-"},
+                    {
+                        "component": "td",
+                        "content": [
                             {
-                                "component": "VCardSubtitle",
-                                "text": f"插件状态: {status_text} | 检查周期: 每 {self._check_interval} 分钟 | 上次巡检: {last_check}",
-                            },
+                                "component": "VChip",
+                                "props": {"size": "x-small", "color": status_color},
+                                "text": status_text,
+                            }
                         ],
                     },
                     {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VRow",
-                                "content": [
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 6, "md": 3},
-                                        "content": [
-                                            {
-                                                "component": "VCard",
-                                                "props": {"color": "primary", "variant": "tonal"},
-                                                "content": [
-                                                    {
-                                                        "component": "VCardItem",
-                                                        "content": [
-                                                            {"component": "VCardSubtitle", "text": "累计检查消息"},
-                                                            {"component": "VCardTitle", "text": str(self._check_stats["total_checked"])},
-                                                        ],
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 6, "md": 3},
-                                        "content": [
-                                            {
-                                                "component": "VCard",
-                                                "props": {"color": "success", "variant": "tonal"},
-                                                "content": [
-                                                    {
-                                                        "component": "VCardItem",
-                                                        "content": [
-                                                            {"component": "VCardSubtitle", "text": "成功转存总数"},
-                                                            {"component": "VCardTitle", "text": str(self._check_stats["transferred_count"])},
-                                                        ],
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 6, "md": 3},
-                                        "content": [
-                                            {
-                                                "component": "VCard",
-                                                "props": {"color": "info", "variant": "tonal"},
-                                                "content": [
-                                                    {
-                                                        "component": "VCardItem",
-                                                        "content": [
-                                                            {"component": "VCardSubtitle", "text": "洗版升级总数"},
-                                                            {"component": "VCardTitle", "text": str(self._check_stats["upgraded_count"])},
-                                                        ],
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                    {
-                                        "component": "VCol",
-                                        "props": {"cols": 6, "md": 3},
-                                        "content": [
-                                            {
-                                                "component": "VCard",
-                                                "props": {"color": "warning", "variant": "tonal"},
-                                                "content": [
-                                                    {
-                                                        "component": "VCardItem",
-                                                        "content": [
-                                                            {"component": "VCardSubtitle", "text": "监控频道数量"},
-                                                            {"component": "VCardTitle", "text": str(len(self._tg_channels))},
-                                                        ],
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                ],
-                            },
-                            {
-                                "component": "VDivider",
-                                "props": {"class": "my-4"},
-                            },
-                            {
-                                "component": "p",
-                                "props": {"class": "text-caption text-grey"},
-                                "text": f"当前监控的频道: {channels_str}",
-                            },
-                            {
-                                "component": "p",
-                                "props": {"class": "text-caption text-grey"},
-                                "text": f"电影目录ID: {self._movie_target_dir_id} | 剧集目录ID: {self._tv_target_dir_id} | 智能洗版: {'开启' if self._auto_upgrade else '关闭'} | 旧版清理: {'开启' if self._auto_delete_old_version else '关闭'}",
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VCardActions",
-                        "props": {"class": "px-4 pb-4"},
-                        "content": [
-                            {
-                                "component": "VBtn",
-                                "props": {
-                                    "color": "primary",
-                                    "variant": "elevated",
-                                    "prepend-icon": "mdi-play-circle",
-                                    "text": "立即运行一次巡检测试",
-                                },
-                                "events": {
-                                    "click": "api.post('/plugin/Pan123TgPilot/manual_check')",
-                                },
-                            },
-                        ],
+                        "component": "td",
+                        "props": {"class": "text-caption text-grey"},
+                        "text": time_str,
                     },
                 ],
-            }
-        ]
+            })
+
+        if not rows:
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {
+                        "component": "td",
+                        "props": {"colspan": 7, "class": "text-center text-grey py-4"},
+                        "text": "暂无转存记录，当监控频道抓取到资源并转存后将在此展示",
+                    }
+                ],
+            })
+
+        table_card = {
+            "component": "VCard",
+            "props": {"variant": "outlined"},
+            "content": [
+                {
+                    "component": "VCardItem",
+                    "content": [
+                        {
+                            "component": "VCardTitle",
+                            "text": f"已转存影视资源数据清单 (展示最新 {len(recent_records)} 条)",
+                        },
+                        {
+                            "component": "VCardSubtitle",
+                            "text": "标注影视名称、分辨率、编码、HDR/DoVi、文件大小与评分，支持在 API 中使用 /records?keyword= 模糊检索",
+                        },
+                    ],
+                },
+                {
+                    "component": "VTable",
+                    "props": {"density": "compact", "hover": True},
+                    "content": [
+                        {
+                            "component": "thead",
+                            "content": [
+                                {
+                                    "component": "tr",
+                                    "content": [
+                                        {"component": "th", "text": "影视名称"},
+                                        {"component": "th", "text": "画质规格 (分辨率/编码/HDR)"},
+                                        {"component": "th", "text": "文件大小"},
+                                        {"component": "th", "text": "质量评分"},
+                                        {"component": "th", "text": "来源频道"},
+                                        {"component": "th", "text": "转存类型"},
+                                        {"component": "th", "text": "转存时间"},
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "component": "tbody",
+                            "content": rows,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        return [status_card, table_card]
 
     def get_api(self) -> list[dict[str, Any]]:
         """注册插件专用 API 路由"""
@@ -971,12 +1118,16 @@ class Pan123TgPilot(_PluginBase):
         threading.Thread(target=self._service_check_channels, daemon=True).start()
         return {"code": 200, "message": "已在后台启动 TG 频道巡检与转存任务"}
 
-    def _api_get_records(self) -> dict[str, Any]:
-        """API: 获取转存记录"""
+    def _api_get_records(self, keyword: str = "", limit: int = 100) -> dict[str, Any]:
+        """API: 获取转存记录，支持关键字检索"""
         if not self._db:
             return {"code": 500, "message": "数据库未就绪", "data": []}
-        records = self._db.list_records(limit=100)
-        return {"code": 200, "message": "success", "data": records}
+        try:
+            lim = int(limit) if limit else 100
+        except (ValueError, TypeError):
+            lim = 100
+        records = self._db.list_records(limit=lim, keyword=keyword or "")
+        return {"code": 200, "message": "success", "total": len(records), "data": records}
 
     def _api_test_tg(self) -> dict[str, Any]:
         """API: 测试 TG 连通性"""

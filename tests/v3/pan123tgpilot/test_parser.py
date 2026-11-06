@@ -70,7 +70,7 @@ S05E217 4K WEB-DL H.265 10bit 25fps [国语][内嵌简中字幕]
         self.assertEqual(parsed["fs_size"], 32855978205)
         self.assertEqual(parsed["fs_filename"], "八仙！ (2026) - 2160p.WEB-DL.DoVi.H.265.10-bit.60fps.HQ.DTS 5.1 {tmdb-1633056}.mkv")
         self.assertTrue(parsed["fs_filename"].endswith(".mkv"))
-        self.assertEqual(parsed["media_key"], "movie_tmdb_1633056")
+        self.assertEqual(parsed["media_key"], "movie_八仙_2026")
 
     def test_parse_fslink_with_trailing_punctuation(self):
         msg = "🔗分享链接 : 123FSLinkV2$82467be2147f26532298438bf7015238#32855978205#八仙！ (2026) - 2160p.WEB-DL.DoVi.H.265.10-bit.60fps.HQ.DTS 5.1 {tmdb-1633056}.mkv。"

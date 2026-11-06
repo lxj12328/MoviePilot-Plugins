@@ -82,6 +82,22 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(file_id, "172012630879389")
 
+    def test_client_save_fslink_fallback_on_folder_not_found(self):
+        client = Pan123TgClient(token="test_token")
+        # 第一次请求 mkdir 报错 文件夹不存在，第二次在根目录 0 下创建成功，随后秒传成功
+        client._http_request = MagicMock(side_effect=[
+            (False, {"code": 10404, "message": "文件夹不存在"}, "文件夹不存在"),
+            (True, {"code": 0, "message": "ok", "data": {"dirID": 99990}}, "ok"),
+            (True, {"code": 0, "message": "ok", "data": {"reuse": True, "fileId": 888123}}, "ok"),
+        ])
+        success, file_id, msg = client.save_fslink(
+            fslink="123FSLinkV2$82467be2147f26532298438bf7015238#32855978205#夜曲.mkv",
+            parent_file_id=42149741,
+            folder_name="夜曲 (2026)",
+        )
+        self.assertTrue(success)
+        self.assertEqual(file_id, "888123")
+
     def test_client_trash_files(self):
         client = Pan123TgClient(token="test_token")
         client._http_request = MagicMock(return_value=(True, {"code": 0, "message": "success"}, "ok"))

@@ -3,11 +3,12 @@ Pan123TgPilot 数据模型
 负责 Telegram 频道转存历史记录与画质洗版版本管理
 """
 
+import re
 from datetime import datetime
 from typing import Any, Optional
 
 try:
-    from sqlalchemy import BigInteger, DateTime, Integer, String, Text, select
+    from sqlalchemy import BigInteger, DateTime, Integer, String, Text, or_, select
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 except ImportError:
     class DummyColType:
@@ -15,6 +16,7 @@ except ImportError:
         def __call__(self, *args, **kwargs): return self
         def __eq__(self, other): return self
         def desc(self): return self
+        def like(self, other): return self
 
     class DummySelect:
         def __init__(self, *args, **kwargs): pass
@@ -26,6 +28,7 @@ except ImportError:
     mapped_column = lambda *args, **kwargs: DummyColType()  # type: ignore
     Integer = String = BigInteger = DateTime = Text = DummyColType  # type: ignore
     select = lambda *args, **kwargs: DummySelect()  # type: ignore
+    or_ = lambda *args: None  # type: ignore
     Session = Any  # type: ignore
 
 try:
@@ -87,29 +90,62 @@ class Pan123TgDatabase:
 
     @db_query
     def get_record_by_media_key(self, *args, **kwargs) -> Optional[dict]:
-        """根据媒体唯一键查找最新记录 (自适应适配 MoviePilot @db_query 注入)"""
+        """
+        根据媒体唯一键或标题+年份+季集查找最新记录。
+        同时支持匹配当前 media_key、历史 TMDB 格式 key 及归一化影视标题，
+        确保不同频道以不同格式发布同一资源时能够百分之百命中本地库去重！
+        """
         db = kwargs.get("db")
         media_key = str(kwargs.get("media_key") or "")
+        title = str(kwargs.get("title") or kwargs.get("media_title") or "")
+        year = str(kwargs.get("year") or "")
+        tmdb_id = str(kwargs.get("tmdb_id") or "")
+        media_type = str(kwargs.get("media_type") or "")
+        ep_tag = str(kwargs.get("ep_tag") or "")
+
         for arg in args:
             if hasattr(arg, "execute"):
                 db = arg
             elif isinstance(arg, str) and not media_key:
                 media_key = arg
 
-        if db is None or not media_key:
+        if db is None:
             return None
-        stmt = (
-            select(Pan123TgRecord)
-            .where(Pan123TgRecord.media_key == media_key)
-            .order_by(Pan123TgRecord.id.desc())
-            .limit(1)
-        )
-        rec = db.execute(stmt).scalar_one_or_none()
+
+        conditions = []
+        if media_key:
+            conditions.append(Pan123TgRecord.media_key == media_key)
+        if tmdb_id:
+            conditions.append(Pan123TgRecord.media_key == f"movie_tmdb_{tmdb_id}")
+            if ep_tag:
+                conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}_{ep_tag}")
+            else:
+                conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}")
+        if title:
+            norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", title).lower()
+            if norm_title:
+                if ep_tag:
+                    conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}_{ep_tag}")
+                elif year:
+                    conditions.append(Pan123TgRecord.media_key == f"movie_{norm_title}_{year}")
+                conditions.append(Pan123TgRecord.media_title == title)
+                conditions.append(Pan123TgRecord.media_title == norm_title)
+
+        if not conditions:
+            return None
+
+        stmt = select(Pan123TgRecord)
+        if len(conditions) == 1:
+            stmt = stmt.where(conditions[0])
+        else:
+            stmt = stmt.where(or_(*conditions))
+
+        rec = db.execute(stmt.order_by(Pan123TgRecord.id.desc()).limit(1)).scalar_one_or_none()
         return self._to_dict(rec) if rec else None
 
     @db_query
     def has_link_processed(self, *args, **kwargs) -> bool:
-        """检查特定链接是否已转存过 (自适应适配 MoviePilot @db_query 注入)"""
+        """检查特定分享链接或秒传哈希码是否已转存过 (自适应适配 MoviePilot @db_query 注入)"""
         db = kwargs.get("db")
         share_url = str(kwargs.get("share_url") or "")
         fslink = str(kwargs.get("fslink") or "")
@@ -124,15 +160,28 @@ class Pan123TgDatabase:
 
         if db is None:
             return False
-        stmt = select(Pan123TgRecord)
-        if share_url and fslink:
-            stmt = stmt.where((Pan123TgRecord.share_url == share_url) | (Pan123TgRecord.fslink == fslink))
-        elif share_url:
-            stmt = stmt.where(Pan123TgRecord.share_url == share_url)
-        elif fslink:
-            stmt = stmt.where(Pan123TgRecord.fslink == fslink)
-        else:
+
+        conditions = []
+        if share_url:
+            conditions.append(Pan123TgRecord.share_url == share_url)
+            m_key = re.search(r"/s/([a-zA-Z0-9_-]+)", share_url)
+            if m_key:
+                conditions.append(Pan123TgRecord.share_url.like(f"%{m_key.group(1)}%"))
+        if fslink:
+            conditions.append(Pan123TgRecord.fslink == fslink)
+            m_hash = re.search(r"\$([a-fA-F0-9]{32,40})#", fslink)
+            if m_hash:
+                conditions.append(Pan123TgRecord.fslink.like(f"%{m_hash.group(1)}%"))
+
+        if not conditions:
             return False
+
+        stmt = select(Pan123TgRecord)
+        if len(conditions) == 1:
+            stmt = stmt.where(conditions[0])
+        else:
+            stmt = stmt.where(or_(*conditions))
+
         rec = db.execute(stmt.limit(1)).scalar_one_or_none()
         return rec is not None
 
@@ -203,6 +252,10 @@ class Pan123TgDatabase:
             existing.error_msg = error_msg
             existing.updated_at = datetime.now()
             db.flush()
+            try:
+                db.commit()
+            except Exception:
+                pass
             return existing.id
         else:
             new_rec = Pan123TgRecord(
@@ -227,24 +280,44 @@ class Pan123TgDatabase:
             )
             db.add(new_rec)
             db.flush()
+            try:
+                db.commit()
+            except Exception:
+                pass
             return new_rec.id
 
     @db_query
     def list_records(self, *args, **kwargs) -> list[dict]:
-        """获取最近转存记录 (自适应适配 MoviePilot @db_query 注入)"""
+        """获取最近转存记录，支持关键词检索 (自适应适配 MoviePilot @db_query 注入)"""
         db = kwargs.get("db")
         limit = kwargs.get("limit")
+        keyword = kwargs.get("keyword") or kwargs.get("search")
         for arg in args:
             if hasattr(arg, "execute"):
                 db = arg
             elif isinstance(arg, int):
                 limit = arg
+            elif isinstance(arg, str):
+                keyword = arg
 
-        limit = int(limit or 50)
+        limit = int(limit or 100)
         if db is None:
             return []
+
+        stmt = select(Pan123TgRecord)
+        if keyword and str(keyword).strip():
+            kw = f"%{str(keyword).strip()}%"
+            stmt = stmt.where(
+                or_(
+                    Pan123TgRecord.media_title.like(kw),
+                    Pan123TgRecord.channel.like(kw),
+                    Pan123TgRecord.resolution.like(kw),
+                    Pan123TgRecord.codec.like(kw),
+                    Pan123TgRecord.media_key.like(kw),
+                )
+            )
         records = db.execute(
-            select(Pan123TgRecord).order_by(Pan123TgRecord.updated_at.desc()).limit(limit)
+            stmt.order_by(Pan123TgRecord.updated_at.desc()).limit(limit)
         ).scalars().all()
         return [self._to_dict(r) for r in records]
 

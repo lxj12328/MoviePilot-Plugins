@@ -108,6 +108,7 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.plugin._client.trash_files.return_value = (True, "success")
 
         self.plugin._db = MagicMock()
+        self.plugin._db.has_link_processed.return_value = False
         # 第一次无记录
         self.plugin._db.get_record_by_media_key.return_value = None
 
@@ -159,6 +160,7 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.plugin._client = MagicMock()
         self.plugin._client.save_share_link.return_value = (True, "88888", "success")
         self.plugin._db = MagicMock()
+        self.plugin._db.has_link_processed.return_value = False
         self.plugin._db.get_record_by_media_key.return_value = None
 
         # 同时含有分享链接与秒传链接的消息，必须优先转存分享链接的完整文件夹与伴生文件
@@ -173,6 +175,61 @@ S05E217 4K WEB-DL H.265
         self.assertEqual(res, "transferred")
         self.plugin._client.save_share_link.assert_called_once()
         self.plugin._client.save_fslink.assert_not_called()
+
+    def test_link_level_deduplication_skips(self):
+        self.plugin.init_plugin({
+            "enabled": True,
+            "pan123_token": "token_abc",
+            "movie_target_dir_id": "1001",
+            "tv_target_dir_id": "1002",
+        })
+        self.plugin._client = MagicMock()
+        self.plugin._db = MagicMock()
+        # 链接级别去重命中
+        self.plugin._db.has_link_processed.return_value = True
+
+        msg = "🔗分享链接 : 123FSLinkV2$82467be2147f26532298438bf7015238#32855978205#八仙.mkv"
+        res = self.plugin._process_single_message(channel="channel_a", msg_id="1", raw_text=msg)
+        self.assertEqual(res, "skipped")
+        self.plugin._client.save_fslink.assert_not_called()
+
+    def test_get_page_returns_status_and_table(self):
+        self.plugin.init_plugin({
+            "enabled": True,
+            "pan123_token": "token_abc",
+            "movie_target_dir_id": "1001",
+            "tv_target_dir_id": "1002",
+        })
+        self.plugin._db = MagicMock()
+        self.plugin._db.list_records.return_value = [
+            {
+                "id": 1,
+                "media_title": "八仙！ (2026)",
+                "resolution": "2160p",
+                "codec": "H.265",
+                "dovi_hdr": "DoVi",
+                "file_size": 32855978205,
+                "quality_score": 120,
+                "channel": "@Pan123Movie",
+                "status": "saved",
+                "created_at": "2026-11-06 20:00:00",
+            }
+        ]
+        page = self.plugin.get_page()
+        self.assertEqual(len(page), 2)
+        # 包含运行状态卡片与数据清单卡片
+        self.assertEqual(page[0]["component"], "VCard")
+        self.assertEqual(page[1]["component"], "VCard")
+        self.assertIn("已转存影视资源数据清单", page[1]["content"][0]["content"][0]["text"])
+
+    def test_api_records_search(self):
+        self.plugin.init_plugin({"enabled": True})
+        self.plugin._db = MagicMock()
+        self.plugin._db.list_records.return_value = [{"title": "八仙"}]
+        res = self.plugin._api_get_records(keyword="八仙", limit=10)
+        self.assertEqual(res["code"], 200)
+        self.assertEqual(res["total"], 1)
+        self.plugin._db.list_records.assert_called_with(limit=10, keyword="八仙")
 
 
 if __name__ == "__main__":

@@ -236,9 +236,19 @@ class Pan123TgClient:
                 len(items) == 1 and int(items[0].get("type") or items[0].get("Type") or 0) == 1
             )
             if not has_single_root_folder and folder_name:
-                ok_mk, dir_id, _ = self.mkdir(dirname=folder_name, parent_file_id=final_target_id)
+                ok_mk, dir_id, msg_mk = self.mkdir(dirname=folder_name, parent_file_id=final_target_id)
                 if ok_mk and dir_id:
                     final_target_id = dir_id
+                elif "文件夹不存在" in str(msg_mk) and final_target_id != 0:
+                    logger.warning(
+                        f"Pan123TgPilot 目标目录ID [{final_target_id}] 在云盘中不存在 (可能已被删除)，"
+                        f"自动降级至根目录 (0) 下创建影视文件夹【{folder_name}】并转存..."
+                    )
+                    ok_retry, dir_retry, _ = self.mkdir(dirname=folder_name, parent_file_id=0)
+                    if ok_retry and dir_retry:
+                        final_target_id = dir_retry
+                    else:
+                        final_target_id = 0
 
             # 2. 调用批量转存接口，全量转存所有文件夹与伴生文件
             save_payload = {
@@ -256,6 +266,18 @@ class Pan123TgClient:
                 data_s = res_save.get("data") or {}
                 fid = data_s.get("fileId") or data_s.get("FileId") or str(final_target_id or file_id_list[0])
                 return True, str(fid), f"分享转存成功 (共包含 {len(file_id_list)} 个文件/文件夹)"
+            elif ok_save and "文件夹不存在" in str(res_save.get("message")) and final_target_id != 0:
+                logger.warning(
+                    f"Pan123TgPilot 目录ID [{final_target_id}] 不存在，自动降级至根目录 (0) 重试分享转存..."
+                )
+                save_payload["parentFileId"] = 0
+                ok_fb, res_fb, msg_fb = self._http_request(
+                    save_url, method="POST", payload=save_payload, with_auth=True
+                )
+                if ok_fb and res_fb.get("code") == 0:
+                    data_s = res_fb.get("data") or {}
+                    fid = data_s.get("fileId") or data_s.get("FileId") or str(file_id_list[0])
+                    return True, str(fid), f"分享转存成功 (已降级至根目录，共 {len(file_id_list)} 个文件/文件夹)"
 
             last_msg = res_save.get("message") if ok_save else msg_save
 
@@ -280,10 +302,20 @@ class Pan123TgClient:
         target_id = int(parent_file_id or target_parent_id or 0)
 
         # 若提供了影视文件夹名称，自动创建或复用该子文件夹
-        if folder_name and target_id != 0:
-            ok_mk, dir_id, _ = self.mkdir(dirname=folder_name, parent_file_id=target_id)
+        if folder_name:
+            ok_mk, dir_id, msg_mk = self.mkdir(dirname=folder_name, parent_file_id=target_id)
             if ok_mk and dir_id:
                 target_id = dir_id
+            elif "文件夹不存在" in str(msg_mk) and target_id != 0:
+                logger.warning(
+                    f"Pan123TgPilot 检测到配置的目标目录ID [{target_id}] 在 123 云盘中不存在 (可能已被删除或移入回收站)，"
+                    f"自动降级至根目录 (0) 下创建同名影视文件夹【{folder_name}】并重试秒传..."
+                )
+                ok_retry, dir_retry, _ = self.mkdir(dirname=folder_name, parent_file_id=0)
+                if ok_retry and dir_retry:
+                    target_id = dir_retry
+                else:
+                    target_id = 0
 
         # 若直接传入了秒传码字符串，自动解构
         if fslink and (not etag or not size or not filename):
@@ -333,6 +365,26 @@ class Pan123TgClient:
                     return True, str(file_id or 0), "秒传转存成功"
                 else:
                     return False, None, "云端未命中秒传特征"
+            else:
+                resp_msg = res.get("message") if ok else msg
+                if "文件夹不存在" in str(resp_msg) and payload.get("parentFileId") != 0:
+                    logger.warning(
+                        f"Pan123TgPilot 目标目录ID [{payload.get('parentFileId')}] 在云端不存在，正在降级至根目录 (0) 重试秒传..."
+                    )
+                    payload["parentFileId"] = 0
+                    ok_fb, res_fb, msg_fb = self._http_request(url, method="POST", payload=payload, with_auth=True)
+                    if ok_fb and res_fb.get("code") == 0:
+                        data = res_fb.get("data") or {}
+                        reuse = bool(data.get("reuse") or data.get("Reuse"))
+                        info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
+                        file_id = (
+                            data.get("fileId")
+                            or data.get("FileId")
+                            or info.get("FileId")
+                            or info.get("fileId")
+                        )
+                        if reuse or (file_id and not data.get("preuploadID")):
+                            return True, str(file_id or 0), "秒传转存成功 (已降级至根目录)"
             last_msg = res.get("message") if ok else msg
 
         return False, None, f"秒传转存失败: {last_msg}"

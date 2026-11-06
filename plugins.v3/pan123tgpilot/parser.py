@@ -296,15 +296,15 @@ class TgMessageParser:
         media_type: str,
         ep_tag: str,
     ) -> str:
-        """组装媒体唯一身份键 (用于去重与洗版对比)"""
+        """
+        组装媒体唯一身份键 (用于去重与洗版对比)。
+        统一采用规范化影视主标题 + 年份 + 季集组合，
+        确保不同频道（无论是否附带 TMDB 链接）发布同一部作品时都能生成完全一致的识别键！
+        """
         norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", title).lower()
         if media_type == "tv":
             tag = f"_{ep_tag}" if ep_tag else ""
-            if tmdb_id:
-                return f"tv_tmdb_{tmdb_id}{tag}"
             return f"tv_{norm_title}{tag}"
         else:
-            if tmdb_id:
-                return f"movie_tmdb_{tmdb_id}"
             yr_str = f"_{year}" if year else ""
             return f"movie_{norm_title}{yr_str}"
