@@ -5,6 +5,7 @@ qBittorrent 联动客户端封装
 
 import http.cookiejar
 import json
+import os
 from typing import Optional, Tuple
 import urllib.error
 import urllib.parse
@@ -100,16 +101,25 @@ class QBHelper:
 
     def match_torrent_by_path(self, target_or_source_path: str) -> Optional[str]:
         """通过文件或目录路径逆向在 QB 中搜寻对应种子 Hash"""
+        if not target_or_source_path:
+            return None
         ok, res = self._request("/api/v2/torrents/info")
         if not ok:
             return None
         try:
             torrents = json.loads(res)
+            target_name = os.path.basename(target_or_source_path)
+            # 去除扩展名后的纯文件名
+            base_name, _ = os.path.splitext(target_name)
             for t in torrents:
                 content_path = t.get("content_path") or ""
                 name = t.get("name") or ""
+                # 匹配优先级：
+                # 1. 路径完全相互包含
+                # 2. 种子名称包含在文件路径中
+                # 3. 文件名与种子名称相互包含
                 if (content_path and (content_path in target_or_source_path or target_or_source_path in content_path)) or (
-                    name and name in target_or_source_path
+                    name and (name in target_or_source_path or target_name in name or (base_name and base_name in name))
                 ):
                     return t.get("hash")
         except Exception:

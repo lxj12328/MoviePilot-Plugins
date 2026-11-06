@@ -10,7 +10,7 @@
 
 | 插件名称 (Plugin Name) | 目录位置 (Directory) | 版本 (Version) | 功能简介 (Description) | 状态 (Status) |
 | :--- | :--- | :--- | :--- | :--- |
-| **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.1.6` | 123云盘自动化零流量 SHA1 秒传、影视目录多级级联、qB下载器下拉联动、Symedia Webhook 生成 strm 与做种达标清理 | 活跃 (Active) |
+| **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.2.0` | 123云盘自动化零流量 SHA1 秒传、影视目录多级级联、历史已整理文件补录联动、qB下载器下拉联动、Symedia Webhook 生成 strm 与做种达标清理 | 活跃 (Active) |
 
 > 💡 **提示**：每当新增或更新插件工具时，请同步更新此表格，确保项目工具目录与功能状态清晰可查。
 

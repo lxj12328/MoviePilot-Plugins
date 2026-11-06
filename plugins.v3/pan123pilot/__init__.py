@@ -204,7 +204,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.2.0"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -217,6 +217,8 @@ class Pan123Pilot(_PluginBase):
     _parent_file_id: int = 0
     _local_library_root: str = ""
     _enable_path_cascade: bool = True
+    _scan_history_on_save: bool = False
+    _auto_scan_history: bool = False
     _retry_interval: int = 30
     _cleanup_interval: int = 60
     _max_retry_count: int = 10
@@ -282,6 +284,8 @@ class Pan123Pilot(_PluginBase):
         self._parent_file_id = int(config.get("target_parent_file_id") or 0)
         self._local_library_root = str(config.get("local_library_root") or "").strip()
         self._enable_path_cascade = bool(config.get("enable_path_cascade", True))
+        self._scan_history_on_save = bool(config.get("scan_history_on_save", False))
+        self._auto_scan_history = bool(config.get("auto_scan_history", False))
         try:
             self._retry_interval = max(1, int(config.get("retry_interval") or 30))
         except (ValueError, TypeError):
@@ -398,6 +402,14 @@ class Pan123Pilot(_PluginBase):
         global _plugin_instance
         _plugin_instance = self
         logger.info("Pan123Pilot (123云盘助手) 初始化完成并已启动后台调度")
+
+        # 检查是否需要扫描本地历史已整理媒体
+        if self._enabled and (self._scan_history_on_save or self._auto_scan_history):
+            logger.info("Pan123Pilot 已开启历史媒体扫描，正在启动后台异步补录...")
+            threading.Thread(
+                target=self._scan_and_sync_history_library,
+                daemon=True,
+            ).start()
 
     def get_state(self) -> bool:
         """返回插件是否启用"""
@@ -530,13 +542,27 @@ class Pan123Pilot(_PluginBase):
         self._service_cleanup_tasks()
         return {"code": 0, "message": "已手动触发做种达标清理"}
 
+    def _scan_and_sync_history_library(self) -> int:
+        """
+        深度扫描本地已整理好的历史媒体文件，自动关联 MoviePilot 整理历史或 qB 种子，
+        补录入库并触发全链路秒传与标签回写。
+        """
+        if not self._local_library_root or not os.path.exists(self._local_library_root):
+            logger.warning(f"Pan123Pilot 历史媒体库扫描跳过：路径不存在或未配置 ({self._local_library_root})")
+            return 0
+
+        logger.info(f"Pan123Pilot 开始扫描本地媒体库历史文件: {self._local_library_root} ...")
+        task_ids = _record_transferred_target(self._local_library_root)
+        logger.info(f"Pan123Pilot 本地历史媒体扫描完成，共识别与补录 {len(task_ids)} 个媒体文件")
+        return len(task_ids)
+
     def _api_scan_library(self) -> dict:
         """手动扫描本地媒体库根目录，将未录入的任务录入数据库并立即触发同步"""
         if not self._local_library_root or not os.path.exists(self._local_library_root):
             return {"code": 1, "message": f"本地媒体库路径未配置或在容器内不存在: {self._local_library_root}"}
 
-        task_ids = _record_transferred_target(self._local_library_root)
-        return {"code": 0, "message": f"媒体库扫描完成，已录入并检查 {len(task_ids)} 个媒体文件"}
+        count = self._scan_and_sync_history_library()
+        return {"code": 0, "message": f"媒体库扫描完成，已录入并检查 {count} 个媒体文件"}
 
     def on_transfer_completed(self, event: Any) -> None:
         """MoviePilot 插件类反射事件监听入口"""
@@ -706,6 +732,41 @@ class Pan123Pilot(_PluginBase):
                                         "props": {
                                             "model": "enable_real_upload",
                                             "label": "重试超限后允许真实分片上传",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "scan_history_on_save",
+                                            "label": "保存时扫描补录历史媒体 (自动关联 qB 种子)",
+                                            "hint": "保存配置后后台自动遍历本地媒体库，关联种子并把未同步的影视加入秒传队列",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "auto_scan_history",
+                                            "label": "启动时自动扫描补录历史媒体",
+                                            "hint": "每次 MoviePilot 启动或重载时，自动检查并补录未同步文件",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -1061,6 +1122,8 @@ class Pan123Pilot(_PluginBase):
             "target_parent_file_id": 0,
             "local_library_root": "",
             "enable_path_cascade": True,
+            "scan_history_on_save": False,
+            "auto_scan_history": False,
             "retry_interval": 30,
             "cleanup_interval": 60,
             "max_retry_count": 10,
@@ -1236,6 +1299,35 @@ def _extract_transfer_info(event: Any) -> tuple[Optional[str], Optional[str], Op
     return target_str, source_str, hash_str
 
 
+def _query_transfer_history(dest_path: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    从 MoviePilot 整理历史库中查询 (torrent_hash, src)。
+    优先通过精确路径匹配，其次通过文件名模糊匹配。
+    """
+    if not dest_path:
+        return None, None
+    filename = os.path.basename(dest_path)
+    try:
+        from app.db import Engine
+        if Engine is not None:
+            try:
+                from sqlalchemy import text
+                stmt = text(
+                    "SELECT download_hash, src FROM transferhistory WHERE dest = :dest OR dest LIKE :dest_pattern ORDER BY id DESC LIMIT 1"
+                )
+            except Exception:
+                stmt = "SELECT download_hash, src FROM transferhistory WHERE dest = :dest OR dest LIKE :dest_pattern ORDER BY id DESC LIMIT 1"
+            with Engine.connect() as conn:
+                row = conn.execute(stmt, {"dest": dest_path, "dest_pattern": f"%{filename}%"}).fetchone()
+                if row:
+                    download_hash = str(row[0] or "").strip() or None
+                    src = str(row[1] or "").strip() or None
+                    return download_hash, src
+    except Exception:
+        pass
+    return None, None
+
+
 def _record_transferred_target(
     target_path: str,
     source_path: Optional[str] = None,
@@ -1243,56 +1335,89 @@ def _record_transferred_target(
 ) -> list[int]:
     """
     将整理后的目标文件或目录内的媒体录入任务库并触发处理。
-    支持单一文件与目录多级遍历。
+    支持单一文件与目录多级遍历，自动关联 MoviePilot 整理历史与 qB 种子 Hash。
     """
     if not target_path or not os.path.exists(target_path):
         return []
 
+    global _plugin_instance
     task_ids = []
-    db = Pan123TaskDatabase()
+    db = _plugin_instance._db if (_plugin_instance and _plugin_instance._db) else Pan123TaskDatabase()
     db.ensure_table()
 
-    # 1. 若为目录，递归扫描所有视频媒体文件
+    # 待处理的文件清单：[(file_full_path, file_name)]
+    target_files: list[tuple[str, str]] = []
     if os.path.isdir(target_path):
         for root, _, files in os.walk(target_path):
             for f in sorted(files):
                 ext = os.path.splitext(f)[1].lower()
                 if ext in VIDEO_EXTENSIONS:
-                    file_full = os.path.join(root, f)
-                    try:
-                        f_size = os.path.getsize(file_full)
-                        tid = db.add_or_update_task(
-                            target_path=file_full,
-                            file_name=f,
-                            file_size=f_size,
-                            torrent_hash=torrent_hash,
-                            source_path=source_path,
-                        )
-                        task_ids.append(tid)
-                        logger.info(f"Pan123Pilot 已捕获目录中的新媒体文件: {f} (任务ID: {tid})")
-                    except Exception as e:
-                        logger.error(f"Pan123Pilot 录入同步任务失败: {e}")
+                    target_files.append((os.path.join(root, f), f))
     else:
-        # 2. 若为单一文件
         ext = os.path.splitext(target_path)[1].lower()
         if ext in VIDEO_EXTENSIONS:
-            filename = os.path.basename(target_path)
-            file_size = os.path.getsize(target_path)
-            try:
-                tid = db.add_or_update_task(
-                    target_path=target_path,
-                    file_name=filename,
-                    file_size=file_size,
-                    torrent_hash=torrent_hash,
-                    source_path=source_path,
-                )
-                task_ids.append(tid)
-                logger.info(f"Pan123Pilot 已捕获新整理媒体文件: {filename} (任务ID: {tid})")
-            except Exception as e:
-                logger.error(f"Pan123Pilot 录入同步任务失败: {e}")
+            target_files.append((target_path, os.path.basename(target_path)))
 
-    # 3. 若有新任务入库且调度器正在运行，即刻启动处理
-    global _plugin_instance
+    all_plugin_tags: list[str] = []
+    if _plugin_instance:
+        all_plugin_tags = [
+            _plugin_instance._tag_pending,
+            _plugin_instance._tag_uploading,
+            _plugin_instance._tag_retrying,
+            _plugin_instance._tag_failed,
+            _plugin_instance._tag_completed,
+        ]
+
+    for file_full, fname in target_files:
+        try:
+            # 检查是否已存在于数据库且已处理完成
+            existing = db.get_task_by_target(target_path=file_full)
+            if existing and existing.get("status") in ("COMPLETED", "CLEANED"):
+                continue
+
+            f_size = os.path.getsize(file_full) if os.path.exists(file_full) else 0
+            if f_size == 0:
+                continue
+
+            cur_hash = torrent_hash
+            cur_src = source_path
+
+            # 1. 若无 hash，尝试从 MoviePilot 整理历史库查询
+            if not cur_hash:
+                cur_hash, cur_src = _query_transfer_history(file_full)
+
+            # 2. 若仍未匹配到 hash，尝试从 qBittorrent 逆向搜寻
+            if not cur_hash and _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
+                cur_hash = _plugin_instance.qb_helper.match_torrent_by_path(file_full)
+
+            # 3. 录入或更新任务
+            tid = db.add_or_update_task(
+                target_path=file_full,
+                file_name=fname,
+                file_size=f_size,
+                torrent_hash=cur_hash,
+                source_path=cur_src,
+            )
+            task_ids.append(tid)
+            logger.info(
+                f"Pan123Pilot 已录入媒体任务: {fname} (任务ID: {tid}, 关联种子: {cur_hash or '未关联'})"
+            )
+
+            # 4. 联动 qBittorrent 打上“待处理”标签
+            if cur_hash and _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
+                try:
+                    _plugin_instance.qb_helper.update_tags(
+                        cur_hash,
+                        _plugin_instance._tag_pending,
+                        all_plugin_tags,
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"Pan123Pilot 录入同步任务失败 [{fname}]: {e}")
+
+    # 5. 若有新任务入库且调度器正在运行，即刻启动处理
     if task_ids and _plugin_instance and _plugin_instance.scheduler and _plugin_instance.get_state():
         try:
             threading.Thread(target=_plugin_instance.scheduler.process_pending_tasks, daemon=True).start()
