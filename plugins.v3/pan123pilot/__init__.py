@@ -210,7 +210,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -237,6 +237,7 @@ class Pan123Pilot(_PluginBase):
     _cleanup_interval: int = 60
     _max_retry_count: int = 10
     _enable_real_upload: bool = True
+    _retention_days: int = 0
 
     _downloader_select: str = "manual"
     _qb_host: str = ""
@@ -363,6 +364,10 @@ class Pan123Pilot(_PluginBase):
 
         self._max_retry_count = int(config.get("max_retry_count") or 10)
         self._enable_real_upload = bool(config.get("enable_real_upload", True))
+        try:
+            self._retention_days = max(0, int(config.get("retention_days") or 0))
+        except (ValueError, TypeError):
+            self._retention_days = 0
 
         self._downloader_select = str(config.get("downloader_select") or "manual").strip()
         self._qb_host = str(config.get("qb_host") or "").strip()
@@ -415,6 +420,13 @@ class Pan123Pilot(_PluginBase):
         # 2. 基础组件初始化（即使未启用也能安全响应页面与状态查询）
         self.db_helper = Pan123TaskDatabase()
         self.db_helper.ensure_table()
+        if self._retention_days > 0:
+            try:
+                purged = self.db_helper.purge_expired_tasks(days=self._retention_days)
+                if purged > 0:
+                    logger.info(f"Pan123Pilot 已自动清理超过 {self._retention_days} 天的历史完结记录: {purged} 条")
+            except Exception:
+                pass
         if self._auth_mode in ("web_token", "web_account"):
             self.client = Pan123WebClient(
                 username=self._pan123_username,
@@ -633,7 +645,15 @@ class Pan123Pilot(_PluginBase):
         self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload, retry_interval_minutes=interval_min)
 
     def _service_cleanup_tasks(self) -> None:
-        """定时做种达标清理绑定方法"""
+        """定时做种达标清理与历史过期记录清理绑定方法"""
+        if self.db_helper and self._retention_days > 0:
+            try:
+                purged = self.db_helper.purge_expired_tasks(days=self._retention_days)
+                if purged > 0:
+                    logger.info(f"Pan123Pilot 定时清理超过 {self._retention_days} 天的历史完结记录: {purged} 条")
+            except Exception:
+                pass
+
         if not self.scheduler or not self._enabled or not self._enable_auto_cleanup:
             return
         completed_tasks = self.db_helper.list_tasks_by_status(statuses=["COMPLETED"]) if self.db_helper else []
@@ -658,6 +678,20 @@ class Pan123Pilot(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "获取123云盘同步任务列表",
+            },
+            {
+                "path": "/records",
+                "endpoint": self._api_get_records,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "分页与关键词检索123云盘秒传/同步任务清单",
+            },
+            {
+                "path": "/purge",
+                "endpoint": self._api_purge_records,
+                "methods": ["POST", "GET"],
+                "auth": "bear",
+                "summary": "按保留天数清理历史完结记录",
             },
             {
                 "path": "/trigger_retry",
@@ -699,6 +733,46 @@ class Pan123Pilot(_PluginBase):
     def _api_get_tasks(self) -> dict:
         tasks = self.db_helper.list_all_tasks(limit=50) if self.db_helper else []
         return {"code": 0, "message": "ok", "data": tasks}
+
+    def _api_get_records(
+        self,
+        keyword: str = "",
+        status: str = "",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> dict:
+        """支持关键词、状态过滤与分页的同步任务清单接口"""
+        if not self.db_helper:
+            return {"code": 0, "message": "ok", "total": 0, "page": 1, "page_size": 20, "data": []}
+        try:
+            p = max(1, int(page or 1))
+        except (ValueError, TypeError):
+            p = 1
+        try:
+            ps = min(200, max(1, int(page_size or 20)))
+        except (ValueError, TypeError):
+            ps = 20
+        offset = (p - 1) * ps
+        total = self.db_helper.count_tasks(keyword=keyword, status=status)
+        items = self.db_helper.list_tasks_paginated(limit=ps, offset=offset, keyword=keyword, status=status)
+        return {
+            "code": 0,
+            "message": "ok",
+            "total": total,
+            "page": p,
+            "page_size": ps,
+            "data": items,
+        }
+
+    def _api_purge_records(self, days: Optional[int] = None) -> dict:
+        """手动清理超过指定天数的已完结记录"""
+        if not self.db_helper:
+            return {"code": 1, "message": "数据库未就绪", "purged": 0}
+        target_days = int(days if days is not None else self._retention_days or 0)
+        if target_days <= 0:
+            return {"code": 0, "message": "当前设置为永久保留 (days=0)，未清理任何记录", "purged": 0}
+        purged = self.db_helper.purge_expired_tasks(days=target_days)
+        return {"code": 0, "message": f"已清理超过 {target_days} 天的完结记录共 {purged} 条", "purged": purged}
 
     def _api_trigger_retry(self) -> dict:
         if self.scheduler and self._enabled:
@@ -1067,7 +1141,7 @@ class Pan123Pilot(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 12},
+                                "props": {"cols": 12, "md": 8},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -1075,6 +1149,23 @@ class Pan123Pilot(_PluginBase):
                                             "model": "sync_scraped_assets",
                                             "label": "同步上传刮削伴生文件 (字幕、海报图片与 NFO 元数据)",
                                             "hint": "开启后，影视对应的 .srt/.ass/.vtt 字幕、.nfo 元数据及 .jpg/.png/.webp 海报图片将一并上传至 123 云盘对应目录",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "retention_days",
+                                            "label": "同步记录保留天数 (0=永久保留)",
+                                            "type": "number",
+                                            "placeholder": "0",
+                                            "hint": "默认 0 永久保留；设为正整数（如 30/90）将自动清理超期完结记录",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1465,6 +1556,7 @@ class Pan123Pilot(_PluginBase):
             "cleanup_interval": 60,
             "max_retry_count": 10,
             "enable_real_upload": True,
+            "retention_days": 0,
             "downloader_select": "manual",
             "qb_host": "",
             "qb_username": "",
@@ -1493,13 +1585,216 @@ class Pan123Pilot(_PluginBase):
         return form, defaults
 
     def get_page(self) -> list[dict]:
-        """返回插件详情页展示组件"""
+        """返回插件详情页展示组件：状态统计看板 + 分页秒传/同步媒体数据清单"""
+        if not self.db_helper:
+            self.db_helper = Pan123TaskDatabase()
+            self.db_helper.ensure_table()
+
         auth_info = getattr(self, "_auth_status_msg", "待检测")
         is_auth_ok = "已连接" in auth_info
         status_text = "已启用 (后台调度运行中)" if self._enabled else "未启用"
         cascade_text = "开启" if self._enable_path_cascade else "关闭"
         symedia_text = "已启用" if self._symedia_enabled else "未启用"
         dl_text = "手动模式" if self._downloader_select == "manual" else f"系统下载器 ({self._qb_host or '已绑定'})"
+        retention_text = "永久保留" if int(self._retention_days or 0) <= 0 else f"保留 {self._retention_days} 天"
+
+        status_counts = self.db_helper.get_status_counts() if self.db_helper else {}
+        records = self.db_helper.list_tasks_paginated(limit=500, offset=0) if self.db_helper else []
+
+        total_count = status_counts.get("TOTAL", len(records))
+        completed_count = status_counts.get("COMPLETED", 0) + status_counts.get("CLEANED", 0)
+        pending_count = (
+            status_counts.get("PENDING", 0)
+            + status_counts.get("UPLOADING", 0)
+            + status_counts.get("RETRYING", 0)
+        )
+        cleaned_count = status_counts.get("CLEANED", 0)
+        failed_count = status_counts.get("FAILED", 0)
+
+        status_map = {
+            "COMPLETED": ("已秒传", "success"),
+            "CLEANED": ("已清理", "teal"),
+            "UPLOADING": ("处理中", "info"),
+            "PENDING": ("排队中", "secondary"),
+            "RETRYING": ("待重试", "warning"),
+            "FAILED": ("失败", "error"),
+        }
+
+        def _build_task_table(rows_slice: list[dict]) -> dict:
+            tr_items = []
+            for r in rows_slice:
+                fname = str(r.get("file_name") or os.path.basename(str(r.get("target_path") or "")) or "-")
+                target_path = str(r.get("target_path") or "")
+                ext = os.path.splitext(fname)[1].lower()
+                is_video = ext in VIDEO_EXTENSIONS
+                type_label = "正片视频" if is_video else "刮削伴生"
+                type_color = "primary" if is_video else "purple"
+
+                rel_dir = ""
+                if target_path:
+                    parent_dir = os.path.dirname(target_path)
+                    if self._local_library_root and parent_dir.startswith(os.path.normpath(self._local_library_root)):
+                        rel_dir = os.path.relpath(parent_dir, os.path.normpath(self._local_library_root))
+                    else:
+                        rel_dir = os.path.basename(parent_dir)
+
+                fsize_bytes = int(r.get("file_size") or 0)
+                fsize_str = TaskScheduler.format_size(fsize_bytes) if fsize_bytes > 0 else "-"
+
+                st_raw = str(r.get("status") or "PENDING").upper()
+                st_label, st_color = status_map.get(st_raw, (st_raw, "default"))
+                if st_raw == "RETRYING":
+                    st_label = f"待重试 ({r.get('retry_count', 0)}/{r.get('max_retry', 10)})"
+
+                file_id_val = r.get("file_id")
+                parent_id_val = r.get("parent_file_id") or 0
+                cloud_info = f"FileID: {file_id_val}" if file_id_val else f"目录ID: {parent_id_val}"
+                err_msg = str(r.get("error_msg") or "").strip()
+                sub_line = f"📁 {rel_dir}" if rel_dir and rel_dir != "." else ""
+                if err_msg:
+                    sub_line = f"{sub_line} | {err_msg}" if sub_line else err_msg
+
+                tr_items.append(
+                    {
+                        "component": "tr",
+                        "content": [
+                            {
+                                "component": "td",
+                                "props": {"class": "py-2"},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "font-weight-medium text-body-2"},
+                                        "text": fname,
+                                    },
+                                    {
+                                        "component": "div",
+                                        "props": {"class": "text-caption text-medium-emphasis"},
+                                        "text": sub_line or target_path,
+                                    },
+                                ],
+                            },
+                            {
+                                "component": "td",
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {
+                                            "size": "x-small",
+                                            "color": type_color,
+                                            "variant": "tonal",
+                                        },
+                                        "text": type_label,
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "td",
+                                "props": {"class": "text-body-2"},
+                                "text": fsize_str,
+                            },
+                            {
+                                "component": "td",
+                                "content": [
+                                    {
+                                        "component": "VChip",
+                                        "props": {
+                                            "size": "small",
+                                            "color": st_color,
+                                            "variant": "tonal",
+                                        },
+                                        "text": st_label,
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "td",
+                                "props": {"class": "text-caption"},
+                                "text": cloud_info,
+                            },
+                            {
+                                "component": "td",
+                                "props": {"class": "text-caption text-medium-emphasis"},
+                                "text": str(r.get("updated_at") or r.get("created_at") or "-"),
+                            },
+                        ],
+                    }
+                )
+
+            return {
+                "component": "VTable",
+                "props": {"hover": True, "density": "compact"},
+                "content": [
+                    {
+                        "component": "thead",
+                        "content": [
+                            {
+                                "component": "tr",
+                                "content": [
+                                    {"component": "th", "text": "文件名称 / 相对路径"},
+                                    {"component": "th", "text": "类型"},
+                                    {"component": "th", "text": "文件大小"},
+                                    {"component": "th", "text": "同步状态"},
+                                    {"component": "th", "text": "云盘存储标识"},
+                                    {"component": "th", "text": "更新时间"},
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "tbody",
+                        "content": tr_items,
+                    },
+                ],
+            }
+
+        page_size = 20
+        table_sections: list[dict] = []
+        if not records:
+            table_sections.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "class": "ma-3",
+                        "text": "暂无秒传/同步媒体记录。当 MoviePilot 完成影视刮削整理或开启「扫描历史媒体库」后，秒传记录将在此实时展示。",
+                    },
+                }
+            )
+        else:
+            first_page = records[:page_size]
+            table_sections.append(_build_task_table(first_page))
+
+            if len(records) > page_size:
+                panels = []
+                total_pages = (len(records) + page_size - 1) // page_size
+                for p_idx in range(2, total_pages + 1):
+                    start_i = (p_idx - 1) * page_size
+                    end_i = min(p_idx * page_size, len(records))
+                    chunk = records[start_i:end_i]
+                    panels.append(
+                        {
+                            "component": "VExpansionPanel",
+                            "content": [
+                                {
+                                    "component": "VExpansionPanelTitle",
+                                    "text": f"📄 第 {p_idx} 页 (第 {start_i + 1} - {end_i} 条，点击展开)",
+                                },
+                                {
+                                    "component": "VExpansionPanelText",
+                                    "content": [_build_task_table(chunk)],
+                                },
+                            ],
+                        }
+                    )
+                table_sections.append(
+                    {
+                        "component": "VExpansionPanels",
+                        "props": {"variant": "accordion", "class": "mt-2"},
+                        "content": panels,
+                    }
+                )
 
         return [
             {
@@ -1507,15 +1802,163 @@ class Pan123Pilot(_PluginBase):
                 "props": {
                     "type": "success" if is_auth_ok else ("info" if self._enabled else "warning"),
                     "variant": "tonal",
+                    "class": "mb-3",
                     "text": (
                         f"123云盘连接状态: {auth_info} | "
                         f"运行状态: {status_text} | "
                         f"秒传重试间隔: {self._retry_interval} 分钟 | 做种清理巡检: {self._cleanup_interval} 分钟 | "
                         f"目录级联: {cascade_text} (根: {self._local_library_root or '未指定'} -> ID: {self._parent_file_id}) | "
-                        f"下载器: {dl_text} | Symedia 联动: {symedia_text}"
+                        f"下载器: {dl_text} | Symedia 联动: {symedia_text} | 记录保留: {retention_text}"
                     ),
                 },
-            }
+            },
+            {
+                "component": "VRow",
+                "props": {"class": "mb-2"},
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 6, "sm": 3},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "tonal", "color": "primary"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "props": {"class": "text-center py-3"},
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "累计媒体任务",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-h6 font-weight-bold"},
+                                                "text": str(total_count),
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 6, "sm": 3},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "tonal", "color": "success"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "props": {"class": "text-center py-3"},
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "已秒传 / 上传成功",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-h6 font-weight-bold"},
+                                                "text": str(completed_count),
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 6, "sm": 3},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "tonal", "color": "warning"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "props": {"class": "text-center py-3"},
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "排队中 / 待重试",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-h6 font-weight-bold"},
+                                                "text": str(pending_count),
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 6, "sm": 3},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "tonal", "color": "info"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "props": {"class": "text-center py-3"},
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "已达标清理 / 失败",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-h6 font-weight-bold"},
+                                                "text": f"{cleaned_count} / {failed_count}",
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined"},
+                "content": [
+                    {
+                        "component": "VCardItem",
+                        "content": [
+                            {
+                                "component": "VCardTitle",
+                                "props": {"class": "text-subtitle-1 font-weight-bold"},
+                                "text": f"🎬 已秒传 / 同步媒体数据清单 (共 {total_count} 条)",
+                            },
+                            {
+                                "component": "VCardSubtitle",
+                                "props": {"class": "text-caption"},
+                                "text": (
+                                    f"按更新时间倒序排列，每页 {page_size} 条（第 2 页起点击底部折叠面板翻页，最多展示最近 500 条）；"
+                                    "支持调用 /api/v1/plugin/Pan123Pilot/records?keyword=&status=&page=1&page_size=20 检索"
+                                ),
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCardText",
+                        "props": {"class": "pa-0"},
+                        "content": table_sections,
+                    },
+                ],
+            },
         ]
 
     def stop_service(self) -> None:
@@ -1760,12 +2203,14 @@ def _record_transferred_target(
             _plugin_instance._tag_completed,
         ]
 
+    tagged_hashes: set[str] = set()
+
     for file_full, fname in target_files:
         try:
-            # 检查是否已存在于数据库且已处理完成（若 force_resync 为 True 则不跳过，强制重置流转）
+            # 检查是否已存在于数据库且已处理完成或已在活动队列中（若 force_resync 为 True 则不跳过，强制重置流转）
             existing = db.get_task_by_target(target_path=file_full)
-            if not force_resync and existing and existing.get("status") in ("COMPLETED", "CLEANED"):
-                logger.debug(f"Pan123Pilot 媒体已处理完成，跳过: {fname} (状态: {existing.get('status')})")
+            if not force_resync and existing and existing.get("status") in ("COMPLETED", "CLEANED", "PENDING", "UPLOADING"):
+                logger.debug(f"Pan123Pilot 媒体已在队列或已处理完成，跳过重复入队: {fname} (状态: {existing.get('status')})")
                 continue
 
             f_size = os.path.getsize(file_full) if os.path.exists(file_full) else 0
@@ -1797,14 +2242,21 @@ def _record_transferred_target(
                 f"Pan123Pilot 已录入媒体任务: {fname} (任务ID: {tid}, 关联种子: {cur_hash or '未关联'})"
             )
 
-            # 4. 联动 qBittorrent 打上“待处理”标签
-            if cur_hash and _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
+            # 4. 联动 qBittorrent 打上“待处理”标签 (同一批次相同种子 Hash 仅打标一次，避免 API 洪水)
+            if (
+                cur_hash
+                and cur_hash not in tagged_hashes
+                and _plugin_instance
+                and _plugin_instance.qb_helper
+                and _plugin_instance.qb_helper.is_configured()
+            ):
                 try:
                     _plugin_instance.qb_helper.update_tags(
                         cur_hash,
                         _plugin_instance._tag_pending,
                         all_plugin_tags,
                     )
+                    tagged_hashes.add(cur_hash)
                 except Exception:
                     pass
 

@@ -3,11 +3,11 @@ Pan123Pilot 本地任务持久化数据模型
 使用 SQLAlchemy 2.0 规范，提供任务存储与状态跟踪
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 try:
-    from sqlalchemy import BigInteger, DateTime, Integer, String, Text, select
+    from sqlalchemy import BigInteger, DateTime, Integer, String, Text, delete, func, or_, select
     from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 except ImportError:
     class DummyColType:
@@ -17,14 +17,18 @@ except ImportError:
     Mapped = Any  # type: ignore
     mapped_column = lambda *args, **kwargs: None  # type: ignore
     Integer = String = BigInteger = DateTime = Text = DummyColType  # type: ignore
-    select = lambda *args, **kwargs: None  # type: ignore
+    select = delete = func = or_ = lambda *args, **kwargs: None  # type: ignore
     Session = Any  # type: ignore
 
 try:
     from app.db import Base, db_query, db_update
 except ImportError:
-    class DeclarativeBaseFallback:
-        pass
+    try:
+        class DeclarativeBaseFallback(DeclarativeBase):
+            pass
+    except Exception:
+        class DeclarativeBaseFallback:  # type: ignore
+            pass
 
     Base = DeclarativeBaseFallback  # type: ignore
     db_query = lambda func: func
@@ -100,8 +104,8 @@ class Pan123TaskDatabase:
             task.parent_file_id = parent_file_id
             task.max_retry = max_retry
             task.updated_at = datetime.now()
-            # 若已有任务处于未完成状态或要求强制重置，重置为 PENDING 立即触发流转
-            if force_reset or task.status not in ("COMPLETED", "CLEANED"):
+            # 若已有任务处于未完成且非正在上传状态，或要求强制重置，则重置为 PENDING 立即触发流转
+            if force_reset or task.status not in ("COMPLETED", "CLEANED", "UPLOADING"):
                 task.status = "PENDING"
                 task.retry_count = 0
                 task.error_msg = ""
@@ -119,6 +123,28 @@ class Pan123TaskDatabase:
             db.add(task)
         db.flush()
         return task.id
+
+    def add_task(
+        self,
+        *,
+        target_path: str,
+        torrent_hash: Optional[str] = None,
+        status: str = "PENDING",
+        file_name: Optional[str] = None,
+        file_size: int = 0,
+        parent_file_id: int = 0,
+    ) -> int:
+        """兼容快捷录入方法"""
+        import os
+        fname = file_name or os.path.basename(target_path)
+        fsize = file_size or (os.path.getsize(target_path) if os.path.exists(target_path) else 0)
+        return self.add_or_update_task(
+            target_path=target_path,
+            file_name=fname,
+            file_size=fsize,
+            torrent_hash=torrent_hash,
+            parent_file_id=parent_file_id,
+        )
 
     @db_update
     def reset_tasks_status(
@@ -216,9 +242,118 @@ class Pan123TaskDatabase:
         if db is None:
             return []
         records = db.execute(
-            select(Pan123Task).order_by(Pan123Task.updated_at.desc()).limit(limit)
+            select(Pan123Task).order_by(Pan123Task.updated_at.desc(), Pan123Task.id.desc()).limit(limit)
         ).scalars().all()
         return [self._to_dict(r) for r in records]
+
+    @db_query
+    def get_status_counts(self, db: Optional[Session] = None) -> dict[str, int]:
+        """聚合统计各状态任务数量"""
+        counts = {
+            "TOTAL": 0,
+            "PENDING": 0,
+            "UPLOADING": 0,
+            "RETRYING": 0,
+            "COMPLETED": 0,
+            "CLEANED": 0,
+            "FAILED": 0,
+        }
+        if db is None:
+            return counts
+        try:
+            rows = db.execute(
+                select(Pan123Task.status, func.count(Pan123Task.id)).group_by(Pan123Task.status)
+            ).all()
+            total = 0
+            for st, cnt in rows:
+                c = int(cnt or 0)
+                total += c
+                st_key = str(st or "").upper()
+                counts[st_key] = counts.get(st_key, 0) + c
+            counts["TOTAL"] = total
+        except Exception:
+            pass
+        return counts
+
+    @db_query
+    def count_tasks(
+        self,
+        db: Optional[Session] = None,
+        *,
+        keyword: str = "",
+        status: str = "",
+    ) -> int:
+        """按条件统计任务总数"""
+        if db is None:
+            return 0
+        try:
+            stmt = select(func.count(Pan123Task.id))
+            if status:
+                stmt = stmt.where(Pan123Task.status == status.strip().upper())
+            if keyword:
+                kw = f"%{keyword.strip()}%"
+                stmt = stmt.where(
+                    or_(
+                        Pan123Task.file_name.ilike(kw),
+                        Pan123Task.target_path.ilike(kw),
+                        Pan123Task.error_msg.ilike(kw),
+                    )
+                )
+            return int(db.execute(stmt).scalar() or 0)
+        except Exception:
+            return 0
+
+    @db_query
+    def list_tasks_paginated(
+        self,
+        db: Optional[Session] = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        keyword: str = "",
+        status: str = "",
+    ) -> list[dict]:
+        """分页、模糊检索任务列表（按更新时间与ID倒序）"""
+        if db is None:
+            return []
+        try:
+            stmt = select(Pan123Task)
+            if status:
+                stmt = stmt.where(Pan123Task.status == status.strip().upper())
+            if keyword:
+                kw = f"%{keyword.strip()}%"
+                stmt = stmt.where(
+                    or_(
+                        Pan123Task.file_name.ilike(kw),
+                        Pan123Task.target_path.ilike(kw),
+                        Pan123Task.error_msg.ilike(kw),
+                    )
+                )
+            stmt = stmt.order_by(Pan123Task.updated_at.desc(), Pan123Task.id.desc()).offset(max(0, int(offset))).limit(max(1, int(limit)))
+            records = db.execute(stmt).scalars().all()
+            return [self._to_dict(r) for r in records]
+        except Exception:
+            return []
+
+    @db_update
+    def purge_expired_tasks(
+        self,
+        db: Optional[Session] = None,
+        *,
+        days: int = 0,
+    ) -> int:
+        """清理超过保留天数的已完结记录（仅清理 COMPLETED / CLEANED / FAILED，保留进行中任务）"""
+        if db is None or int(days or 0) <= 0:
+            return 0
+        cutoff = datetime.now() - timedelta(days=int(days))
+        res = db.execute(
+            delete(Pan123Task).where(
+                Pan123Task.updated_at < cutoff,
+                Pan123Task.status.in_(["COMPLETED", "CLEANED", "FAILED"]),
+            )
+        )
+        db.flush()
+        return int(getattr(res, "rowcount", 0) or 0)
 
     @staticmethod
     def _to_dict(task: Pan123Task) -> dict:

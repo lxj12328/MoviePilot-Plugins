@@ -6,6 +6,7 @@ qBittorrent 联动客户端封装
 import http.cookiejar
 import json
 import os
+import time
 from typing import Optional, Tuple
 import urllib.error
 import urllib.parse
@@ -29,6 +30,8 @@ class QBHelper:
         self._cookie_jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cookie_jar))
         self._logged_in = False
+        self._torrents_cache: list[dict] = []
+        self._torrents_cache_time: float = 0.0
 
     def is_configured(self) -> bool:
         """检查是否有基本连接配置"""
@@ -99,13 +102,21 @@ class QBHelper:
         except Exception:
             return None
 
-    def get_all_torrents(self) -> list[dict]:
-        """获取 qBittorrent 当前所有种子列表"""
+    def get_all_torrents(self, cache_ttl: float = 15.0) -> list[dict]:
+        """获取 qBittorrent 当前所有种子列表 (支持短时内存缓存防并发风暴)"""
+        now = time.time()
+        if cache_ttl > 0 and self._torrents_cache and (now - self._torrents_cache_time) < cache_ttl:
+            return self._torrents_cache
         ok, res = self._request("/api/v2/torrents/info")
         if not ok:
             return []
         try:
-            return json.loads(res)
+            data = json.loads(res)
+            if isinstance(data, list):
+                self._torrents_cache = data
+                self._torrents_cache_time = now
+                return data
+            return []
         except Exception:
             return []
 
@@ -243,11 +254,17 @@ class QBHelper:
         """
         if self.is_configured():
             ok, data = self._request("/api/v2/sync/maindata")
-            if ok and isinstance(data, dict):
-                server_state = data.get("server_state") or {}
-                free_space = server_state.get("free_space_on_disk")
-                if free_space is not None and isinstance(free_space, (int, float)) and free_space >= 0:
-                    return int(free_space)
+            if ok:
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except Exception:
+                        data = {}
+                if isinstance(data, dict):
+                    server_state = data.get("server_state") or {}
+                    free_space = server_state.get("free_space_on_disk")
+                    if free_space is not None and isinstance(free_space, (int, float)) and free_space >= 0:
+                        return int(free_space)
 
         if local_path and os.path.exists(local_path):
             import shutil

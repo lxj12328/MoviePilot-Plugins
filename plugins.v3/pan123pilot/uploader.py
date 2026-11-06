@@ -63,6 +63,9 @@ class TaskScheduler:
 
         self._stop_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
+        self._process_lock = threading.Lock()
+        self._retry_lock = threading.Lock()
+        self._recheck_pending = False
 
         # 缓存所有插件定义的标签集合，便于流转时精准清理旧标签
         self.all_plugin_tags = [
@@ -167,39 +170,97 @@ class TaskScheduler:
             self._worker_thread.join(timeout=3)
 
     @staticmethod
-    def calculate_file_hashes(filepath: str, chunk_size: int = 1024 * 1024 * 2) -> tuple[str, str, int]:
+    def calculate_file_hashes(
+        filepath: str,
+        chunk_size: int = 1024 * 1024 * 8,
+        need_sha1: bool = True,
+        need_md5: bool = True,
+    ) -> tuple[str, str, int]:
         """
-        流式分块读取文件并计算 SHA1 与 MD5
-        对内存极度友好，同时避免大文件读取 I/O 阻塞
+        流式分块读取文件并按需计算 SHA1 与 MD5
+        优先利用 Python 3.11+ C 语言级 hashlib.file_digest 释放 GIL 高速计算
         """
-        sha1_hash = hashlib.sha1()
-        md5_hash = hashlib.md5()
-        total_size = 0
+        total_size = os.path.getsize(filepath)
+        if hasattr(hashlib, "file_digest"):
+            if need_md5 and not need_sha1:
+                with open(filepath, "rb") as f:
+                    md5_hex = hashlib.file_digest(f, "md5").hexdigest()
+                return md5_hex, md5_hex, total_size
+            if need_sha1 and not need_md5:
+                with open(filepath, "rb") as f:
+                    sha1_hex = hashlib.file_digest(f, "sha1").hexdigest()
+                return sha1_hex, "", total_size
+
+        sha1_hash = hashlib.sha1() if need_sha1 else None
+        md5_hash = hashlib.md5() if need_md5 else None
+        read_size = 0
 
         with open(filepath, "rb") as f:
             while True:
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
-                sha1_hash.update(chunk)
-                md5_hash.update(chunk)
-                total_size += len(chunk)
+                if sha1_hash is not None:
+                    sha1_hash.update(chunk)
+                if md5_hash is not None:
+                    md5_hash.update(chunk)
+                read_size += len(chunk)
 
-        return sha1_hash.hexdigest(), md5_hash.hexdigest(), total_size
+        sha1_res = sha1_hash.hexdigest() if sha1_hash is not None else ""
+        md5_res = md5_hash.hexdigest() if md5_hash is not None else ""
+        if not sha1_res and md5_res:
+            sha1_res = md5_res
+        return sha1_res, md5_res, read_size or total_size
 
-    def _sync_qb_tag(self, torrent_hash: Optional[str], new_tag: str) -> None:
-        """向关联的 qB 种子回写新状态标签"""
-        if torrent_hash and self.qb.is_configured():
-            try:
-                self.qb.update_tags(torrent_hash, new_tag, self.all_plugin_tags)
-            except Exception:
-                pass
+    def _sync_qb_tag(self, torrent_hash: Optional[str], new_tag: str, tag_cache: Optional[dict[str, str]] = None) -> None:
+        """向关联的 qB 种子回写新状态标签（支持批次内去重缓存）"""
+        if not torrent_hash or not new_tag or not self.qb.is_configured():
+            return
+        if tag_cache is not None and tag_cache.get(torrent_hash) == new_tag:
+            return
+        try:
+            self.qb.update_tags(torrent_hash, new_tag, self.all_plugin_tags)
+            if tag_cache is not None:
+                tag_cache[torrent_hash] = new_tag
+        except Exception:
+            pass
 
     def process_pending_tasks(self, enable_real_upload: bool = True) -> None:
-        """处理新录入或处于待处理状态的任务"""
+        """
+        单飞互斥处理待同步任务队列：
+        若已有工作线程正在处理，则仅设置 _recheck_pending 标记并立即返回，
+        彻底避免多集剧集并发触发时多线程同时读盘计算哈希导致 I/O 踩踏
+        """
+        if not self._process_lock.acquire(blocking=False):
+            self._recheck_pending = True
+            logger.debug("Pan123Pilot 队列正在处理中，已合并本次触发请求至当前工作线程")
+            return
+
+        try:
+            while not self._stop_event.is_set():
+                self._recheck_pending = False
+                self._process_pending_batch(enable_real_upload=enable_real_upload)
+                if not self._recheck_pending:
+                    break
+        finally:
+            self._process_lock.release()
+
+    def _process_pending_batch(self, enable_real_upload: bool = True) -> None:
+        """执行单批次待处理任务（正片视频优先，刮削伴生文件其次）"""
         pending_tasks = self.db.list_tasks_by_status(statuses=["PENDING"])
         if not pending_tasks:
             return
+
+        # 视频正片优先秒传，刮削伴生小文件排在后面，确保 29 集剧集正片极速秒传完成
+        pending_tasks.sort(
+            key=lambda t: (
+                0 if os.path.splitext(str(t.get("target_path") or ""))[1].lower() in VIDEO_EXTENSIONS else 1,
+                int(t.get("id") or 0),
+            )
+        )
+
+        is_web_mode = getattr(self.client, "auth_mode", "") in ("web_token", "web_account", "web_sms")
+        batch_tag_cache: dict[str, str] = {}
 
         logger.info(f"Pan123Pilot 待处理任务队列共 {len(pending_tasks)} 个媒体任务待执行")
         for task in pending_tasks:
@@ -216,49 +277,59 @@ class TaskScheduler:
                 self.db.update_task_status(
                     task_id=task_id, status="FAILED", error_msg="目标文件不存在"
                 )
-                self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
+                self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"), batch_tag_cache)
                 continue
 
             logger.info(f"Pan123Pilot 开始执行待同步任务: 【{filename}】(ID: {task_id})")
 
             # 1. 标记为处理中
             self.db.update_task_status(task_id=task_id, status="UPLOADING")
-            self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"))
+            self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"), batch_tag_cache)
 
-            # 2. 计算或复用 SHA1 / MD5
+            # 2. 计算或复用哈希 (Web 模式仅需计算 MD5，利用 C 级 file_digest 提速 2~3 倍)
             sha1_str = task.get("sha1")
             md5_str = task.get("md5")
             file_size = task.get("file_size") or 0
 
-            if not sha1_str or not md5_str:
+            if not sha1_str and not md5_str:
                 try:
-                    logger.info(f"Pan123Pilot 正在计算哈希 (SHA1/MD5): 【{filename}】...")
-                    sha1_str, md5_str, file_size = self.calculate_file_hashes(target_path)
-                    logger.info(f"Pan123Pilot 哈希计算完成: 【{filename}】(SHA1: {sha1_str[:8]}..., 大小: {self.format_size(file_size)})")
+                    t0 = time.time()
+                    hash_label = "MD5" if is_web_mode else "SHA1/MD5"
+                    logger.info(f"Pan123Pilot 正在计算哈希 ({hash_label}): 【{filename}】...")
+                    sha1_str, md5_str, file_size = self.calculate_file_hashes(
+                        target_path,
+                        need_sha1=not is_web_mode,
+                        need_md5=True,
+                    )
+                    elapsed = time.time() - t0
+                    logger.info(
+                        f"Pan123Pilot 哈希计算完成: 【{filename}】(Hash: {(md5_str or sha1_str)[:8]}..., "
+                        f"大小: {self.format_size(file_size)}, 耗时: {elapsed:.2f}s)"
+                    )
                 except Exception as e:
                     logger.error(f"Pan123Pilot 计算哈希失败: 【{filename}】: {e}")
                     self.db.update_task_status(
                         task_id=task_id, status="FAILED", error_msg=f"计算哈希失败: {e}"
                     )
-                    self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
+                    self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"), batch_tag_cache)
                     continue
 
-            # 3. 尝试 SHA1 秒传（先计算或级联解析父目录 ID）
+            # 3. 尝试秒传（先计算或级联解析父目录 ID）
             parent_id = self.resolve_target_parent_id(target_path)
-            logger.info(f"Pan123Pilot 发起 123 云盘 SHA1 秒传: 【{filename}】(云盘 ParentID: {parent_id})...")
+            logger.info(f"Pan123Pilot 发起 123 云盘秒传: 【{filename}】(云盘 ParentID: {parent_id})...")
 
             try:
                 reuse, file_id, msg = self.client.sha1_reuse(
                     filename=filename,
-                    sha1_str=sha1_str,
+                    sha1_str=sha1_str or md5_str or "",
                     size=file_size,
                     parent_file_id=parent_id,
-                    md5_str=md5_str,
+                    md5_str=md5_str or sha1_str,
                 )
             except TypeError:
                 reuse, file_id, msg = self.client.sha1_reuse(
                     filename=filename,
-                    sha1_str=sha1_str,
+                    sha1_str=sha1_str or md5_str or "",
                     size=file_size,
                     parent_file_id=parent_id,
                 )
@@ -275,7 +346,7 @@ class TaskScheduler:
                     parent_file_id=parent_id,
                     error_msg="",
                 )
-                self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+                self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"), batch_tag_cache)
                 self._trigger_symedia_notify(target_path, action="create")
                 self._notify(
                     "upload",
@@ -293,7 +364,7 @@ class TaskScheduler:
                         md5=md5_str,
                         error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
                     )
-                    self._sync_qb_tag(torrent_hash, self.tags.get("retrying", "123_待重试"))
+                    self._sync_qb_tag(torrent_hash, self.tags.get("retrying", "123_待重试"), batch_tag_cache)
                     self._handle_token_expired(str(msg))
                     break
 
@@ -302,7 +373,7 @@ class TaskScheduler:
                 if ext in SCRAPED_EXTENSIONS or file_size < 10 * 1024 * 1024:
                     if enable_real_upload:
                         logger.info(f"Pan123Pilot 【{filename}】为刮削伴生小文件 ({self.format_size(file_size)})，秒传未命中立即执行快速真实上传...")
-                        self._handle_max_retry_reached(task, sha1_str, md5_str, enable_real_upload=True)
+                        self._handle_max_retry_reached(task, sha1_str or "", md5_str or "", enable_real_upload=True)
                         continue
 
                 # 正常大文件秒传未命中，进入重试流转
@@ -321,10 +392,10 @@ class TaskScheduler:
                         retry_increment=True,
                         error_msg=f"第 {retry_count} 次秒传未命中，等待定时重试",
                     )
-                    self._sync_qb_tag(torrent_hash, self.tags.get("retrying", "123_待重试"))
+                    self._sync_qb_tag(torrent_hash, self.tags.get("retrying", "123_待重试"), batch_tag_cache)
                 else:
                     # 达到最大重试次数
-                    self._handle_max_retry_reached(task, sha1_str, md5_str, enable_real_upload)
+                    self._handle_max_retry_reached(task, sha1_str or "", md5_str or "", enable_real_upload)
 
     def _handle_max_retry_reached(
         self,
@@ -358,13 +429,20 @@ class TaskScheduler:
 
         # 启动真实分片上传（先计算或级联解析父目录 ID）
         parent_id = self.resolve_target_parent_id(target_path)
-        logger.info(f"Pan123Pilot 【{os.path.basename(target_path)}】达到重试上限，启动 123 官方 V2 分片真实上传 (ParentID: {parent_id})...")
+        logger.info(f"Pan123Pilot 【{os.path.basename(target_path)}】达到重试上限，启动 123 分片真实上传 (ParentID: {parent_id})...")
         self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"))
-        ok, file_id, err = self.client.upload_file_v2(
-            filepath=target_path,
-            parent_file_id=parent_id,
-            etag=md5_str,
-        )
+
+        if not hasattr(self.client, "upload_file_v2"):
+            ok, file_id, err = False, 0, "当前客户端未实现分片真实上传"
+        else:
+            try:
+                ok, file_id, err = self.client.upload_file_v2(
+                    filepath=target_path,
+                    parent_file_id=parent_id,
+                    etag=md5_str or sha1_str,
+                )
+            except Exception as e:
+                ok, file_id, err = False, 0, str(e)
 
         if ok:
             logger.info(f"Pan123Pilot 【{os.path.basename(target_path)}】分片真实上传完成！云盘 FileID: {file_id}")
@@ -404,96 +482,102 @@ class TaskScheduler:
         enable_real_upload: bool = True,
         retry_interval_minutes: int = 0,
     ) -> None:
-        """周期性扫描 RETRYING 任务并重新发起 SHA1 秒传检测"""
-        retrying_tasks = self.db.list_tasks_by_status(statuses=["RETRYING"])
-        for task in retrying_tasks:
-            if self._stop_event.is_set():
-                break
+        """周期性扫描 RETRYING 任务并重新发起 SHA1 秒传检测（带单飞互斥锁）"""
+        if not self._retry_lock.acquire(blocking=False):
+            return
 
-            task_id = task["id"]
-            target_path = task["target_path"]
-            torrent_hash = task["torrent_hash"]
-            sha1_str = task.get("sha1")
-            file_size = task.get("file_size") or 0
-            parent_id = task.get("parent_file_id", 0)
-            filename = task.get("file_name") or os.path.basename(target_path)
-
-            if not sha1_str:
-                continue
-
-            # 校验任务距离上次重试/更新是否已达到设定的重试间隔时间
-            if retry_interval_minutes > 0:
-                updated_at_val = task.get("updated_at")
-                if updated_at_val:
-                    try:
-                        if isinstance(updated_at_val, datetime):
-                            last_time = updated_at_val
-                        else:
-                            last_time = datetime.strptime(str(updated_at_val), "%Y-%m-%d %H:%M:%S")
-                        elapsed_seconds = (datetime.now() - last_time).total_seconds()
-                        if elapsed_seconds < retry_interval_minutes * 60:
-                            # 距离上次尝试尚未满用户设定的重试间隔时间，暂不触发
-                            continue
-                    except Exception:
-                        pass
-
-            parent_id = self.resolve_target_parent_id(target_path)
-            md5_str = task.get("md5")
-            try:
-                reuse, file_id, msg = self.client.sha1_reuse(
-                    filename=filename,
-                    sha1_str=sha1_str,
-                    size=file_size,
-                    parent_file_id=parent_id,
-                    md5_str=md5_str,
-                )
-            except TypeError:
-                reuse, file_id, msg = self.client.sha1_reuse(
-                    filename=filename,
-                    sha1_str=sha1_str,
-                    size=file_size,
-                    parent_file_id=parent_id,
-                )
-
-            if reuse:
-                self.db.update_task_status(
-                    task_id=task_id,
-                    status="COMPLETED",
-                    file_id=file_id,
-                    parent_file_id=parent_id,
-                    error_msg="重试期间成功命中秒传",
-                )
-                self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
-                self._trigger_symedia_notify(target_path, action="create")
-                self._notify(
-                    "upload",
-                    "123云盘秒传成功 (重试命中)",
-                    f"媒体文件【{filename}】在重试期间成功命中秒传！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
-                )
-            else:
-                if "TOKEN_EXPIRED" in str(msg):
-                    logger.error(f"Pan123Pilot 周期重试中断: 123云盘 Web Token 已过期，暂停重试轮询")
-                    self.db.update_task_status(
-                        task_id=task_id,
-                        status="RETRYING",
-                        error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
-                    )
-                    self._handle_token_expired(str(msg))
+        try:
+            retrying_tasks = self.db.list_tasks_by_status(statuses=["RETRYING"])
+            for task in retrying_tasks:
+                if self._stop_event.is_set():
                     break
 
-                retry_count = task.get("retry_count", 0) + 1
-                max_retry = task.get("max_retry", 10)
-                if retry_count < max_retry:
+                task_id = task["id"]
+                target_path = task["target_path"]
+                torrent_hash = task["torrent_hash"]
+                sha1_str = task.get("sha1")
+                md5_str = task.get("md5")
+                file_size = task.get("file_size") or 0
+                parent_id = task.get("parent_file_id", 0)
+                filename = task.get("file_name") or os.path.basename(target_path)
+
+                if not sha1_str and not md5_str:
+                    continue
+
+                # 校验任务距离上次重试/更新是否已达到设定的重试间隔时间
+                if retry_interval_minutes > 0:
+                    updated_at_val = task.get("updated_at")
+                    if updated_at_val:
+                        try:
+                            if isinstance(updated_at_val, datetime):
+                                last_time = updated_at_val
+                            else:
+                                last_time = datetime.strptime(str(updated_at_val), "%Y-%m-%d %H:%M:%S")
+                            elapsed_seconds = (datetime.now() - last_time).total_seconds()
+                            if elapsed_seconds < retry_interval_minutes * 60:
+                                # 距离上次尝试尚未满用户设定的重试间隔时间，暂不触发
+                                continue
+                        except Exception:
+                            pass
+
+                parent_id = self.resolve_target_parent_id(target_path)
+                try:
+                    reuse, file_id, msg = self.client.sha1_reuse(
+                        filename=filename,
+                        sha1_str=sha1_str or md5_str or "",
+                        size=file_size,
+                        parent_file_id=parent_id,
+                        md5_str=md5_str or sha1_str,
+                    )
+                except TypeError:
+                    reuse, file_id, msg = self.client.sha1_reuse(
+                        filename=filename,
+                        sha1_str=sha1_str or md5_str or "",
+                        size=file_size,
+                        parent_file_id=parent_id,
+                    )
+
+                if reuse:
                     self.db.update_task_status(
                         task_id=task_id,
-                        status="RETRYING",
-                        retry_increment=True,
-                        error_msg=f"第 {retry_count} 次秒传仍未命中",
+                        status="COMPLETED",
+                        file_id=file_id,
+                        parent_file_id=parent_id,
+                        error_msg="重试期间成功命中秒传",
+                    )
+                    self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+                    self._trigger_symedia_notify(target_path, action="create")
+                    self._notify(
+                        "upload",
+                        "123云盘秒传成功 (重试命中)",
+                        f"媒体文件【{filename}】在重试期间成功命中秒传！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
                     )
                 else:
-                    self._handle_max_retry_reached(
-                        task, sha1_str, task.get("md5") or "", enable_real_upload
-                    )
+                    if "TOKEN_EXPIRED" in str(msg):
+                        logger.error("Pan123Pilot 周期重试中断: 123云盘 Web Token 已过期，暂停重试轮询")
+                        self.db.update_task_status(
+                            task_id=task_id,
+                            status="RETRYING",
+                            error_msg="123云盘 Web Token 已过期，等待更新 Token 后自动恢复",
+                        )
+                        self._handle_token_expired(str(msg))
+                        break
+
+                    retry_count = task.get("retry_count", 0) + 1
+                    max_retry = task.get("max_retry", 10)
+                    if retry_count < max_retry:
+                        self.db.update_task_status(
+                            task_id=task_id,
+                            status="RETRYING",
+                            retry_increment=True,
+                            error_msg=f"第 {retry_count} 次秒传仍未命中",
+                        )
+                    else:
+                        self._handle_max_retry_reached(
+                            task, sha1_str or "", md5_str or "", enable_real_upload
+                        )
+        finally:
+            self._retry_lock.release()
 
     def cleanup_completed_tasks(
         self,

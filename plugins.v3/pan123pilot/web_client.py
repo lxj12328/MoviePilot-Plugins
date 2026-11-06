@@ -3,8 +3,10 @@ Pan123Pilot 123云盘 Web/App 协议客户端
 完全免除官方 OpenAPI 开发者权益包付费限制，通过 Web Token 或账号密码直连实现零流量秒传
 """
 
+import hashlib
 import json
 import os
+import threading
 import time
 from typing import Any, Optional, Tuple
 import urllib.error
@@ -42,6 +44,7 @@ class Pan123WebClient:
         self.token = self._clean_token(token)
         self.auth_mode = auth_mode  # web_token / web_sms / web_account
         self._dir_cache: dict[str, int] = {}
+        self._dir_lock = threading.Lock()
         self._last_token_check = 0.0
         self.user_info: dict = {}
 
@@ -430,42 +433,24 @@ class Pan123WebClient:
         normalized_path = relative_dir_path.replace("\\", "/").strip("/")
         parts = [p.strip() for p in normalized_path.split("/") if p.strip()]
 
-        current_parent_id = root_parent_id
-        current_path_acc = ""
+        with self._dir_lock:
+            current_parent_id = root_parent_id
+            current_path_acc = ""
 
-        for part in parts:
-            current_path_acc = f"{current_path_acc}/{part}" if current_path_acc else part
-            cache_key = f"{root_parent_id}:{current_path_acc}"
+            for part in parts:
+                current_path_acc = f"{current_path_acc}/{part}" if current_path_acc else part
+                cache_key = f"{root_parent_id}:{current_path_acc}"
 
-            # 1. 命中缓存
-            if cache_key in self._dir_cache:
-                current_parent_id = self._dir_cache[cache_key]
-                continue
+                # 1. 命中缓存
+                if cache_key in self._dir_cache:
+                    current_parent_id = self._dir_cache[cache_key]
+                    continue
 
-            # 2. 检索远端当前目录下是否存在同名文件夹
-            found = False
-            ok_list, items, _ = self.list_files(parent_file_id=current_parent_id)
-            if ok_list:
-                for item in items:
-                    name = str(item.get("filename") or item.get("FileName") or item.get("file_name") or "").strip()
-                    is_folder = (
-                        item.get("type") in (1, "1")
-                        or item.get("Type") in (1, "1")
-                        or item.get("category") in (1, "1")
-                    )
-                    if is_folder and name.lower() == part.lower():
-                        current_parent_id = int(item.get("fileId") or item.get("FileId") or item.get("file_id"))
-                        self._dir_cache[cache_key] = current_parent_id
-                        found = True
-                        break
-
-            # 3. 远端不存在，创建新文件夹
-            if not found:
-                ok_mk, new_dir_id, err_msg = self.mkdir(part, parent_file_id=current_parent_id)
-                if not ok_mk or new_dir_id <= 0:
-                    # 再次重试列表，防止已有同名文件夹或并发冲突
-                    ok_retry, retry_items, _ = self.list_files(parent_file_id=current_parent_id)
-                    for item in retry_items:
+                # 2. 检索远端当前目录下是否存在同名文件夹
+                found = False
+                ok_list, items, _ = self.list_files(parent_file_id=current_parent_id)
+                if ok_list:
+                    for item in items:
                         name = str(item.get("filename") or item.get("FileName") or item.get("file_name") or "").strip()
                         is_folder = (
                             item.get("type") in (1, "1")
@@ -477,10 +462,207 @@ class Pan123WebClient:
                             self._dir_cache[cache_key] = current_parent_id
                             found = True
                             break
-                    if not found:
-                        return False, current_parent_id, f"创建或定位目录【{part}】失败: {err_msg}"
-                else:
-                    current_parent_id = new_dir_id
-                    self._dir_cache[cache_key] = current_parent_id
 
-        return True, current_parent_id, "ok"
+                # 3. 远端不存在，创建新文件夹
+                if not found:
+                    ok_mk, new_dir_id, err_msg = self.mkdir(part, parent_file_id=current_parent_id)
+                    if not ok_mk or new_dir_id <= 0:
+                        # 再次重试列表，防止已有同名文件夹或并发冲突
+                        ok_retry, retry_items, _ = self.list_files(parent_file_id=current_parent_id)
+                        for item in retry_items:
+                            name = str(item.get("filename") or item.get("FileName") or item.get("file_name") or "").strip()
+                            is_folder = (
+                                item.get("type") in (1, "1")
+                                or item.get("Type") in (1, "1")
+                                or item.get("category") in (1, "1")
+                            )
+                            if is_folder and name.lower() == part.lower():
+                                current_parent_id = int(item.get("fileId") or item.get("FileId") or item.get("file_id"))
+                                self._dir_cache[cache_key] = current_parent_id
+                                found = True
+                                break
+                        if not found:
+                            return False, current_parent_id, f"创建或定位目录【{part}】失败: {err_msg}"
+                    else:
+                        current_parent_id = new_dir_id
+                        self._dir_cache[cache_key] = current_parent_id
+
+            return True, current_parent_id, "ok"
+
+    def upload_file_v2(
+        self,
+        filepath: str,
+        parent_file_id: int = 0,
+        etag: Optional[str] = None,
+    ) -> tuple[bool, int, str]:
+        """
+        Web 端真实文件分片上传实现（主要用于无法秒传的 .nfo/.srt/.jpg 刮削伴生文件及兜底上传）
+        支持预上传秒传命中、S3 预签名分片上传确认
+        """
+        if not os.path.exists(filepath):
+            return False, 0, f"本地文件不存在: {filepath}"
+
+        ok_auth, auth_msg = self.ensure_authenticated()
+        if not ok_auth:
+            return False, 0, auth_msg
+
+        file_size = os.path.getsize(filepath)
+        filename = os.path.basename(filepath)
+
+        if not etag:
+            try:
+                with open(filepath, "rb") as f:
+                    if hasattr(hashlib, "file_digest"):
+                        etag = hashlib.file_digest(f, "md5").hexdigest()
+                    else:
+                        md5_hash = hashlib.md5()
+                        for chunk in iter(lambda: f.read(1024 * 1024 * 4), b""):
+                            md5_hash.update(chunk)
+                        etag = md5_hash.hexdigest()
+            except Exception as e:
+                return False, 0, f"计算文件 MD5 失败: {e}"
+
+        req_payload = {
+            "driveId": 0,
+            "parentFileId": int(parent_file_id or 0),
+            "filename": filename,
+            "fileName": filename,
+            "etag": etag.lower(),
+            "size": int(file_size),
+            "type": 0,
+            "duplicate": 2,
+        }
+
+        candidate_urls = [
+            f"{self.WEB_BASE_URL}/b/api/file/upload_request",
+            f"{self.BACKUP_BASE_URL}/b/api/file/upload_request",
+        ]
+
+        res_data: dict = {}
+        last_err = "请求预上传失败"
+        for url in candidate_urls:
+            ok, res, msg = self._http_post(url, req_payload, with_auth=True)
+            if ok and res.get("code") == 0:
+                res_data = res.get("data") or {}
+                break
+            last_err = res.get("message") if ok else msg
+
+        if not res_data:
+            return False, 0, f"创建 Web 上传任务失败: {last_err}"
+
+        # 1. 若预上传直接命中秒传
+        reuse = bool(res_data.get("reuse") or res_data.get("Reuse"))
+        info = res_data.get("Info") if isinstance(res_data.get("Info"), dict) else {}
+        file_id = int(
+            res_data.get("FileId")
+            or res_data.get("fileId")
+            or info.get("FileId")
+            or info.get("fileId")
+            or 0
+        )
+        if reuse:
+            return True, file_id, "创建时命中秒传"
+
+        # 2. 提取 S3 分片上传参数
+        bucket = res_data.get("Bucket") or res_data.get("bucket")
+        key = res_data.get("Key") or res_data.get("key")
+        upload_id = res_data.get("UploadId") or res_data.get("uploadId") or res_data.get("preuploadID")
+        storage_node = res_data.get("StorageNode") or res_data.get("storageNode") or ""
+        slice_size = int(res_data.get("SliceSize") or res_data.get("sliceSize") or 16777216)
+        if slice_size <= 0:
+            slice_size = 16777216
+
+        if not bucket or not key or not upload_id:
+            return False, 0, "云端未命中秒传且未返回 Web S3 上传凭证"
+
+        num_parts = max(1, (file_size + slice_size - 1) // slice_size)
+        s3_auth_payload = {
+            "bucket": bucket,
+            "key": key,
+            "uploadId": upload_id,
+            "storageNode": storage_node,
+            "partNumberStart": 1,
+            "partNumberEnd": num_parts + 1,
+        }
+
+        s3_urls_endpoints = [
+            f"{self.WEB_BASE_URL}/b/api/file/s3_re_ense_upload_parts",
+            f"{self.WEB_BASE_URL}/b/api/file/s3_upload_object/auth",
+            f"{self.BACKUP_BASE_URL}/b/api/file/s3_re_ense_upload_parts",
+        ]
+
+        presigned_urls: dict = {}
+        for s3_ep in s3_urls_endpoints:
+            ok_s3, res_s3, msg_s3 = self._http_post(s3_ep, s3_auth_payload, with_auth=True)
+            if ok_s3 and res_s3.get("code") == 0:
+                s3_data = res_s3.get("data") or {}
+                presigned_urls = s3_data.get("presignedUrls") or s3_data.get("presigned_urls") or {}
+                if presigned_urls:
+                    break
+            last_err = res_s3.get("message") if ok_s3 else msg_s3
+
+        if not presigned_urls:
+            return False, 0, f"获取 S3 预签名上传地址失败: {last_err}"
+
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        try:
+            with open(filepath, "rb") as f:
+                for part_no in range(1, num_parts + 1):
+                    chunk = f.read(slice_size)
+                    if not chunk and file_size > 0:
+                        break
+                    put_url = presigned_urls.get(str(part_no)) or presigned_urls.get(part_no)
+                    if not put_url:
+                        return False, 0, f"缺少分片 {part_no} 的预签名 URL"
+                    req_put = urllib.request.Request(
+                        put_url,
+                        data=chunk,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(len(chunk)),
+                            "User-Agent": self.DEFAULT_USER_AGENT,
+                        },
+                        method="PUT",
+                    )
+                    with urllib.request.urlopen(req_put, timeout=60, context=ctx) as resp_put:
+                        if resp_put.status not in (200, 201, 204):
+                            return False, 0, f"S3 分片上传返回 HTTP {resp_put.status}"
+        except Exception as e:
+            return False, 0, f"上传数据分片异常: {e}"
+
+        # 3. 完成上传确认
+        complete_payload = {
+            "fileId": file_id,
+            "bucket": bucket,
+            "key": key,
+            "uploadId": upload_id,
+            "storageNode": storage_node,
+            "fileSize": int(file_size),
+            "isMultipart": num_parts > 1,
+        }
+        complete_endpoints = [
+            f"{self.WEB_BASE_URL}/b/api/file/s3_complete_multipart_upload",
+            f"{self.WEB_BASE_URL}/b/api/file/upload_complete",
+            f"{self.BACKUP_BASE_URL}/b/api/file/s3_complete_multipart_upload",
+        ]
+        for comp_ep in complete_endpoints:
+            ok_c, res_c, msg_c = self._http_post(comp_ep, complete_payload, with_auth=True)
+            if ok_c and res_c.get("code") == 0:
+                c_data = res_c.get("data") or {}
+                c_info = c_data.get("file_info") or c_data.get("Info") or {}
+                final_id = int(
+                    c_data.get("FileId")
+                    or c_data.get("fileId")
+                    or (c_info.get("FileId") if isinstance(c_info, dict) else 0)
+                    or (c_info.get("fileId") if isinstance(c_info, dict) else 0)
+                    or file_id
+                    or 0
+                )
+                return True, final_id, "Web 分片上传成功"
+            last_err = res_c.get("message") if ok_c else msg_c
+
+        return False, 0, f"确认分片上传完成失败: {last_err}"
