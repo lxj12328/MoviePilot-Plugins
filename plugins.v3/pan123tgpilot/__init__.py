@@ -26,6 +26,28 @@ except ImportError:
     logger = DummyLogger()  # type: ignore
 
 try:
+    from app.schemas.types import EventType
+except ImportError:
+    try:
+        from app.sdk.events import EventType  # type: ignore
+    except ImportError:
+        class EventType:  # type: ignore
+            PluginAction = "PluginAction"
+
+try:
+    from app.sdk.events import Event, eventmanager
+except ImportError:
+    try:
+        from app.sdk.events import Event, event_manager as eventmanager  # type: ignore
+    except ImportError:
+        class EventManagerFallback:
+            def register(self, *args, **kwargs):
+                def decorator(func):
+                    return func
+                return decorator
+        eventmanager = EventManagerFallback()  # type: ignore
+
+try:
     from apscheduler.triggers.interval import IntervalTrigger
     from apscheduler.triggers.cron import CronTrigger
 except ImportError:
@@ -48,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "lxj12328"
 
     def __init__(self):
@@ -157,6 +179,30 @@ class Pan123TgPilot(_PluginBase):
             f"电影目录ID={self._movie_target_dir_id}, 剧集目录ID={self._tv_target_dir_id}, "
             f"智能洗版={self._auto_upgrade}"
         )
+
+        # 立即运行一次触发逻辑 (方便用户一键测试)
+        if self._enabled and config.get("run_now_on_save"):
+            logger.info("Pan123TgPilot 检测到勾选「保存配置后立即运行一次」，立即在后台启动全量巡检测试...")
+            threading.Thread(target=self._service_check_channels, daemon=True).start()
+
+    @staticmethod
+    def get_command() -> list[dict]:
+        """注册插件远程命令"""
+        return [
+            {
+                "cmd": "/pan123_tg_run",
+                "event": EventType.PluginAction,
+                "desc": "立即运行一次 123云盘TG转存巡检",
+                "category": "插件命令",
+                "data": {"action": "pan123_tg_run"},
+            }
+        ]
+
+    def run_action(self, action: str) -> None:
+        """处理插件动作"""
+        if action == "pan123_tg_run":
+            logger.info("Pan123TgPilot 收到远程命令 pan123_tg_run，立即在后台启动全量巡检...")
+            threading.Thread(target=self._service_check_channels, daemon=True).start()
 
     def get_state(self) -> bool:
         """返回插件是否启用"""
@@ -387,8 +433,10 @@ class Pan123TgPilot(_PluginBase):
         # 持久化转存记录
         record_data = {
             "media_key": media_key,
+            "channel": channel,
             "channel_name": channel,
             "msg_id": msg_id,
+            "media_title": title,
             "title": title,
             "year": resource.get("year", ""),
             "media_type": resource.get("media_type", "movie"),
@@ -401,9 +449,12 @@ class Pan123TgPilot(_PluginBase):
             "quality_score": resource.get("quality_score", 0),
             "share_url": resource.get("share_url", ""),
             "fslink": resource.get("fslink", ""),
+            "target_dir_id": target_dir_id,
             "pan_dir_id": target_dir_id,
+            "cloud_file_id": str(saved_file_id) if saved_file_id else None,
             "pan_file_id": saved_file_id,
             "status": "upgraded" if is_upgrade else "saved",
+            "error_msg": decision_reason if is_upgrade else "首发转存",
             "remark": decision_reason if is_upgrade else "首发转存",
         }
         if self._db:
@@ -469,6 +520,44 @@ class Pan123TgPilot(_PluginBase):
                                 "props": {
                                     "model": "notify_enabled",
                                     "label": "发送转存成功通知 (默认关闭)",
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+            {
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VSwitch",
+                                "props": {
+                                    "model": "run_now_on_save",
+                                    "label": "立即运行一次 (保存配置后立即执行)",
+                                    "hint": "开启此项并点击保存，插件将立刻在后台执行一次频道巡检与转存测试，无需等待定时周期",
+                                    "persistent-hint": True,
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6, "class": "d-flex align-center"},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "elevated",
+                                    "prepend-icon": "mdi-play-circle",
+                                    "text": "立即执行一次巡检测试",
+                                },
+                                "events": {
+                                    "click": "api.post('/plugin/Pan123TgPilot/manual_check')",
                                 },
                             }
                         ],
@@ -651,6 +740,7 @@ class Pan123TgPilot(_PluginBase):
 
         model = {
             "enabled": False,
+            "run_now_on_save": False,
             "pan123_token": "",
             "movie_target_dir_id": "",
             "tv_target_dir_id": "",
@@ -794,6 +884,24 @@ class Pan123TgPilot(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VCardActions",
+                        "props": {"class": "px-4 pb-4"},
+                        "content": [
+                            {
+                                "component": "VBtn",
+                                "props": {
+                                    "color": "primary",
+                                    "variant": "elevated",
+                                    "prepend-icon": "mdi-play-circle",
+                                    "text": "立即运行一次巡检测试",
+                                },
+                                "events": {
+                                    "click": "api.post('/plugin/Pan123TgPilot/manual_check')",
+                                },
+                            },
+                        ],
+                    },
                 ],
             }
         ]
@@ -850,3 +958,14 @@ class Pan123TgPilot(_PluginBase):
             }
         except Exception as e:
             return {"code": 500, "message": f"连接 Telegram 失败: {e}"}
+
+
+@eventmanager.register(EventType.PluginAction)
+def pan123_tg_on_action(event: Event) -> None:
+    """MoviePilot 插件远程命令事件监听器"""
+    if not _plugin_instance or not _plugin_instance.get_state():
+        return
+    event_data = getattr(event, "event_data", None) or {}
+    action = event_data.get("action")
+    if action == "pan123_tg_run":
+        _plugin_instance.run_action(action)

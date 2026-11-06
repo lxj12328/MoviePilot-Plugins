@@ -1,13 +1,14 @@
 import sys
 from pathlib import Path
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 plugins_v3_dir = Path(__file__).resolve().parents[3] / "plugins.v3"
 if str(plugins_v3_dir) not in sys.path:
     sys.path.insert(0, str(plugins_v3_dir))
 
 from pan123tgpilot import Pan123TgPilot
+from pan123tgpilot.models import Pan123TgDatabase
 
 
 class TestPan123TgPilotPlugin(unittest.TestCase):
@@ -37,6 +38,7 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.assertIsInstance(form, list)
         self.assertIsInstance(model, dict)
         self.assertIn("enabled", model)
+        self.assertIn("run_now_on_save", model)
         self.assertIn("pan123_token", model)
 
         page = self.plugin.get_page()
@@ -46,8 +48,50 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.assertEqual(len(services), 1)
         self.assertEqual(services[0]["id"], "pan123_tg_check_job")
 
+        commands = self.plugin.get_command()
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["cmd"], "/pan123_tg_run")
+
         apis = self.plugin.get_api()
         self.assertEqual(len(apis), 3)
+
+    @patch("threading.Thread")
+    def test_run_now_on_save(self, mock_thread):
+        config = {
+            "enabled": True,
+            "run_now_on_save": True,
+            "pan123_token": "token_test",
+        }
+        self.plugin.init_plugin(config)
+        mock_thread.assert_called()
+
+    @patch("threading.Thread")
+    def test_run_action(self, mock_thread):
+        self.plugin.run_action("pan123_tg_run")
+        mock_thread.assert_called()
+
+    def test_database_save_or_update_flexibility(self):
+        db = Pan123TgDatabase()
+        mock_session = MagicMock()
+        mock_session.execute.return_value.scalar_one_or_none.return_value = None
+
+        record_data = {
+            "media_key": "movie_12345",
+            "channel_name": "@Pan123Movie",
+            "msg_id": "100",
+            "title": "测试电影",
+            "resolution": "1080p",
+            "codec": "H.265",
+            "dovi_hdr": "",
+            "quality_score": 80,
+            "file_size": 1024,
+            "pan_dir_id": 42149741,
+            "pan_file_id": 998877,
+        }
+        # 测试直接传单一 dict 且不传 db 关键字时的兼容性
+        res_id = db.save_or_update_record(record_data, db=mock_session)
+        mock_session.add.assert_called()
+        mock_session.flush.assert_called()
 
     def test_process_message_transfer_and_upgrade(self):
         self.plugin.init_plugin({

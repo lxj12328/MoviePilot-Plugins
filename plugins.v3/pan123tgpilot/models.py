@@ -13,18 +13,30 @@ except ImportError:
     class DummyColType:
         def __init__(self, *args, **kwargs): pass
         def __call__(self, *args, **kwargs): return self
+        def __eq__(self, other): return self
+        def desc(self): return self
+
+    class DummySelect:
+        def __init__(self, *args, **kwargs): pass
+        def where(self, *args, **kwargs): return self
+        def order_by(self, *args, **kwargs): return self
+        def limit(self, *args, **kwargs): return self
 
     Mapped = Any  # type: ignore
-    mapped_column = lambda *args, **kwargs: None  # type: ignore
+    mapped_column = lambda *args, **kwargs: DummyColType()  # type: ignore
     Integer = String = BigInteger = DateTime = Text = DummyColType  # type: ignore
-    select = lambda *args, **kwargs: None  # type: ignore
+    select = lambda *args, **kwargs: DummySelect()  # type: ignore
     Session = Any  # type: ignore
 
 try:
     from app.db import Base, db_query, db_update
 except ImportError:
     class DeclarativeBaseFallback:
-        pass
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+            if not hasattr(self, "id"):
+                self.id = 1
 
     Base = DeclarativeBaseFallback  # type: ignore
     db_query = lambda func: func
@@ -74,8 +86,19 @@ class Pan123TgDatabase:
             pass
 
     @db_query
-    def get_record_by_media_key(self, db: Optional[Session] = None, *, media_key: str) -> Optional[dict]:
+    def get_record_by_media_key(
+        self,
+        media_key: str = "",
+        db: Optional[Session] = None,
+        **kwargs,
+    ) -> Optional[dict]:
         """根据媒体唯一键查找最新记录"""
+        if hasattr(media_key, "execute"):
+            db = media_key  # type: ignore
+            media_key = str(kwargs.get("media_key") or "")
+        elif not media_key:
+            media_key = str(kwargs.get("media_key") or "")
+
         if db is None or not media_key:
             return None
         stmt = (
@@ -88,8 +111,19 @@ class Pan123TgDatabase:
         return self._to_dict(rec) if rec else None
 
     @db_query
-    def has_link_processed(self, db: Optional[Session] = None, *, share_url: str = "", fslink: str = "") -> bool:
+    def has_link_processed(
+        self,
+        share_url: str = "",
+        fslink: str = "",
+        db: Optional[Session] = None,
+        **kwargs,
+    ) -> bool:
         """检查特定链接是否已转存过"""
+        if hasattr(share_url, "execute"):
+            db = share_url  # type: ignore
+            share_url = str(kwargs.get("share_url") or "")
+            fslink = str(kwargs.get("fslink") or "")
+
         if db is None:
             return False
         stmt = select(Pan123TgRecord)
@@ -107,28 +141,44 @@ class Pan123TgDatabase:
     @db_update
     def save_or_update_record(
         self,
+        data: Optional[dict] = None,
         db: Optional[Session] = None,
-        *,
-        channel: str,
-        msg_id: Optional[str],
-        media_key: str,
-        media_title: str,
-        media_type: str,
-        resolution: str,
-        codec: str,
-        dovi_hdr: str,
-        quality_score: int,
-        file_size: int,
-        share_url: Optional[str] = None,
-        fslink: Optional[str] = None,
-        target_dir_id: int = 0,
-        cloud_file_id: Optional[str] = None,
-        status: str = "SAVED",
-        error_msg: str = "",
+        **kwargs,
     ) -> int:
-        """添加或更新转存记录"""
+        """
+        添加或更新转存记录。
+        同时兼容传入单一 dict 字典或任意关键字参数。
+        """
+        if hasattr(data, "execute"):
+            db = data  # type: ignore
+            data = None
+
+        merged: dict[str, Any] = {}
+        if data and isinstance(data, dict):
+            merged.update(data)
+        merged.update(kwargs)
+
         if db is None:
             return 0
+
+        channel = str(merged.get("channel") or merged.get("channel_name") or "")
+        msg_id_val = merged.get("msg_id")
+        msg_id = str(msg_id_val) if msg_id_val is not None else None
+        media_key = str(merged.get("media_key") or "")
+        media_title = str(merged.get("media_title") or merged.get("title") or "")
+        media_type = str(merged.get("media_type") or "movie")
+        resolution = str(merged.get("resolution") or "")
+        codec = str(merged.get("codec") or "")
+        dovi_hdr = str(merged.get("dovi_hdr") or "")
+        quality_score = int(merged.get("quality_score") or 0)
+        file_size = int(merged.get("file_size") or 0)
+        share_url = merged.get("share_url")
+        fslink = merged.get("fslink")
+        target_dir_id = int(merged.get("target_dir_id") or merged.get("pan_dir_id") or 0)
+        cloud_file_id_raw = merged.get("cloud_file_id") or merged.get("pan_file_id")
+        cloud_file_id = str(cloud_file_id_raw) if cloud_file_id_raw is not None else None
+        status = str(merged.get("status") or "SAVED")
+        error_msg = str(merged.get("error_msg") or merged.get("remark") or "")
 
         existing = None
         if media_key:
@@ -183,8 +233,11 @@ class Pan123TgDatabase:
             return new_rec.id
 
     @db_query
-    def list_records(self, db: Optional[Session] = None, *, limit: int = 50) -> list[dict]:
+    def list_records(self, limit: int = 50, db: Optional[Session] = None, **kwargs) -> list[dict]:
         """获取最近转存记录"""
+        if hasattr(limit, "execute"):
+            db = limit  # type: ignore
+            limit = int(kwargs.get("limit") or 50)
         if db is None:
             return []
         records = db.execute(
@@ -197,9 +250,11 @@ class Pan123TgDatabase:
         return {
             "id": rec.id,
             "channel": rec.channel,
+            "channel_name": rec.channel,
             "msg_id": rec.msg_id,
             "media_key": rec.media_key,
             "media_title": rec.media_title,
+            "title": rec.media_title,
             "media_type": rec.media_type,
             "resolution": rec.resolution,
             "codec": rec.codec,
@@ -209,9 +264,12 @@ class Pan123TgDatabase:
             "share_url": rec.share_url,
             "fslink": rec.fslink,
             "target_dir_id": rec.target_dir_id,
+            "pan_dir_id": rec.target_dir_id,
             "cloud_file_id": rec.cloud_file_id,
+            "pan_file_id": rec.cloud_file_id,
             "status": rec.status,
             "error_msg": rec.error_msg,
+            "remark": rec.error_msg,
             "created_at": rec.created_at.strftime("%Y-%m-%d %H:%M:%S") if rec.created_at else "",
             "updated_at": rec.updated_at.strftime("%Y-%m-%d %H:%M:%S") if rec.updated_at else "",
         }

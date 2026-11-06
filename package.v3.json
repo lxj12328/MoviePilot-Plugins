@@ -16,12 +16,13 @@
     "name": "123云盘TG转存助手",
     "description": "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。实时监控指定 TG 频道影视更新，智能识别电影/剧集并分类转存，支持标准分享链接与秒传链接解析，支持画质评分与自动洗版升级。",
     "labels": "网盘,Telegram,TG转存,秒传,洗版,123云盘",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png",
     "author": "lxj12328",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.1": "紧急修复与功能增强：1. 修复 save_or_update_record 参数关键字不匹配导致转存成功后保存数据库异常的问题；2. 新增配置表单与插件详情页「立即运行一次」一键测试按钮，新增「保存配置后立即运行一次」开关，并注册 /pan123_tg_run 远程命令，方便随时调试触发。",
       "v1.0.0": "首发版本：实时监控指定 Telegram 频道影视推送；智能解析标题、年份、TMDB ID 与清晰度规格；精准分类电影与剧集并转存到对应 123 云盘目录；支持 123 网页端标准分享链接与 123FSLinkV2 秒传链接转存；内置多维画质评分与洗版机制，自动升级优质资源并安全清理旧版；支持 MoviePilot 系统消息通知。"
     }
   }
