@@ -109,39 +109,40 @@ class Pan123WebClient:
         if not self.username or not self.password:
             return False, "用户名或密码未配置"
 
-        # 尝试两个官方登录端点
+        # 尝试两个官方登录端点与兼容负载格式
         endpoints = [
             f"{self.WEB_BASE_URL}/api/user/sign_in",
             f"{self.USER_API_URL}/api/user/sign_in",
         ]
 
-        payload = {
-            "passport": self.username,
-            "password": self.password,
-            "type": 1,
-        }
+        payload_candidates = [
+            {"passport": self.username, "password": self.password, "type": 1},
+            {"passport": self.username, "password": self.password, "type": 0},
+            {"unicode": self.username, "password": self.password, "type": 0},
+        ]
 
         last_error = "登录未响应"
         for url in endpoints:
-            ok, res, msg = self._http_post(url, payload, with_auth=False)
-            if ok:
-                code = res.get("code")
-                if code == 0:
-                    data = res.get("data") or {}
-                    token = data.get("token") or data.get("accessToken")
-                    if token:
-                        self.token = token
-                        self._last_token_check = time.time()
-                        logger.info("Pan123Pilot Web 账号密码登录成功！已获取有效 Token")
-                        return True, "登录成功"
+            for payload in payload_candidates:
+                ok, res, msg = self._http_post(url, payload, with_auth=False)
+                if ok:
+                    code = res.get("code")
+                    if code == 0:
+                        data = res.get("data") or {}
+                        token = data.get("token") or data.get("accessToken")
+                        if token:
+                            self.token = token
+                            self._last_token_check = time.time()
+                            logger.info("Pan123Pilot Web 账号密码登录成功！已获取有效 Token")
+                            return True, "登录成功"
+                    else:
+                        msg_text = res.get("message") or msg
+                        last_error = f"登录失败 [{code}]: {msg_text}"
+                        if "安全风险" in msg_text or "验证码" in msg_text or "滑块" in msg_text:
+                            last_error += "（提示：环境触发风控验证码，请改用「Web Token 直填模式」复制 authorToken，100% 免滑块）"
+                            return False, last_error
                 else:
-                    msg_text = res.get("message") or msg
-                    last_error = f"登录失败 [{code}]: {msg_text}"
-                    # 若提示风控验证码
-                    if "安全风险" in msg_text or "验证码" in msg_text:
-                        last_error += "（提示：环境触发滑块风控，请使用「Web Token 直填」或「短信验证码」模式）"
-            else:
-                last_error = msg
+                    last_error = msg
 
         return False, last_error
 

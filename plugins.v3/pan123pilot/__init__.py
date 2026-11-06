@@ -205,7 +205,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -286,6 +286,13 @@ class Pan123Pilot(_PluginBase):
         self._enabled = bool(config.get("enabled"))
         self._auth_mode = str(config.get("auth_mode") or "web_token").strip()
         self._pan123_token = str(config.get("pan123_token") or "").strip()
+        if not self._pan123_token:
+            try:
+                cached_tok = self.get_data("pan123_token")
+                if cached_tok:
+                    self._pan123_token = str(cached_tok).strip()
+            except Exception:
+                pass
         self._pan123_username = str(config.get("pan123_username") or "").strip()
         self._pan123_password = str(config.get("pan123_password") or "").strip()
         self._client_id = str(config.get("client_id") or "").strip()
@@ -419,6 +426,58 @@ class Pan123Pilot(_PluginBase):
         global _plugin_instance
         _plugin_instance = self
         logger.info("Pan123Pilot (123云盘助手) 初始化完成并已启动后台调度")
+
+        # 4. 立即检验 123 云盘登录与鉴权状态并输出详细反馈
+        self._auth_status_msg = "待检测"
+        if isinstance(self.client, Pan123WebClient):
+            if self._auth_mode == "web_account" or (not self._pan123_token and self._pan123_username and self._pan123_password):
+                logger.info(f"Pan123Pilot 正在使用 123 账号密码登录 (账号: {self._pan123_username})...")
+                ok, msg = self.client.login_by_password()
+                if ok:
+                    self._auth_status_msg = "已连接 (账号密码登录成功)"
+                    logger.info(f"Pan123Pilot 123云盘登录成功！已成功获取并缓存 Token (前缀: {self.client.token[:10]}...)")
+                    self._pan123_token = self.client.token
+                    try:
+                        self.save_data("pan123_token", self._pan123_token)
+                    except Exception:
+                        pass
+                else:
+                    self._auth_status_msg = f"登录失败: {msg}"
+                    logger.error(f"Pan123Pilot 123云盘登录失败: {msg}")
+            elif self._pan123_token:
+                logger.info("Pan123Pilot 正在校验 123 云盘 Web Token 有效性...")
+                if self.client.check_token_validity():
+                    self._auth_status_msg = "已连接 (Token 有效)"
+                    logger.info(f"Pan123Pilot 123云盘 Web Token 校验成功，连接正常！(前缀: {self._pan123_token[:10]}...)")
+                else:
+                    if self._pan123_username and self._pan123_password:
+                        logger.warning("Pan123Pilot Web Token 已失效，正在尝试使用账号密码自动重新登录刷新 Token...")
+                        ok_relogin, msg_relogin = self.client.login_by_password()
+                        if ok_relogin:
+                            self._auth_status_msg = "已连接 (已自动刷新 Token)"
+                            logger.info(f"Pan123Pilot 账号密码重新登录成功！已自动更新 Token")
+                            self._pan123_token = self.client.token
+                            try:
+                                self.save_data("pan123_token", self._pan123_token)
+                            except Exception:
+                                pass
+                        else:
+                            self._auth_status_msg = f"Token 失效且自动登录失败: {msg_relogin}"
+                            logger.error(f"Pan123Pilot 自动刷新 Token 失败: {msg_relogin}")
+                    else:
+                        self._auth_status_msg = "Token 已失效"
+                        logger.error("Pan123Pilot 123云盘 Web Token 已失效，请在网页端按 F12 重新复制 authorToken 填入！")
+            else:
+                self._auth_status_msg = "未配置凭据"
+                logger.warning("Pan123Pilot 未配置 123 云盘 Token 或账号密码，请在插件配置中输入！")
+        elif isinstance(self.client, Pan123Client):
+            tok = self.client.get_access_token()
+            if tok:
+                self._auth_status_msg = "已连接 (OpenAPI Token 有效)"
+                logger.info("Pan123Pilot OpenAPI Token 获取成功，连接正常！")
+            else:
+                self._auth_status_msg = "OpenAPI Token 获取失败"
+                logger.error("Pan123Pilot OpenAPI Token 获取失败，请检查 Client ID / Secret")
 
         # 检查是否需要扫描本地历史已整理媒体
         if self._enabled and (self._scan_history_on_save or self._auto_scan_history):
@@ -1315,7 +1374,9 @@ class Pan123Pilot(_PluginBase):
 
     def get_page(self) -> list[dict]:
         """返回插件详情页展示组件"""
-        status_text = "已启用 (后台调度运行中)" if self._enabled else "未启用 (请在配置表单中启用并填入凭据)"
+        auth_info = getattr(self, "_auth_status_msg", "待检测")
+        is_auth_ok = "已连接" in auth_info
+        status_text = "已启用 (后台调度运行中)" if self._enabled else "未启用"
         cascade_text = "开启" if self._enable_path_cascade else "关闭"
         symedia_text = "已启用" if self._symedia_enabled else "未启用"
         dl_text = "手动模式" if self._downloader_select == "manual" else f"系统下载器 ({self._qb_host or '已绑定'})"
@@ -1323,10 +1384,11 @@ class Pan123Pilot(_PluginBase):
             {
                 "component": "VAlert",
                 "props": {
-                    "type": "info" if self._enabled else "warning",
+                    "type": "success" if is_auth_ok else ("info" if self._enabled else "warning"),
                     "variant": "tonal",
                     "text": (
-                        f"123云盘助手运行状态: {status_text} | "
+                        f"123云盘连接状态: {auth_info} | "
+                        f"运行状态: {status_text} | "
                         f"秒传重试间隔: {self._retry_interval} 分钟 | 做种清理巡检: {self._cleanup_interval} 分钟 | "
                         f"目录级联: {cascade_text} (根: {self._local_library_root or '未指定'} -> ID: {self._parent_file_id}) | "
                         f"下载器: {dl_text} | Symedia 联动: {symedia_text}"
