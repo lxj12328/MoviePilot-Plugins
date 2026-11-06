@@ -4,6 +4,8 @@ Pan123TgPilot Telegram 频道监控模块
 """
 
 from html import unescape
+import json
+import os
 import re
 import ssl
 import time
@@ -11,6 +13,11 @@ from typing import Any, List, Optional, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 try:
     from app.log import logger
@@ -23,16 +30,27 @@ class TgChannelWatcher:
     """Telegram 频道监听器"""
 
     def __init__(self, proxy: str = "", bot_token: str = ""):
-        self.proxy = (proxy or "").strip()
+        self.proxy = self._normalize_proxy(proxy)
         self.bot_token = (bot_token or "").strip()
         self._last_msg_ids: dict = {}  # channel -> max_msg_id
+
+    @staticmethod
+    def _normalize_proxy(proxy: Optional[str]) -> str:
+        """规范化代理地址格式，自动补全协议前缀"""
+        if not proxy:
+            return ""
+        p = str(proxy).strip()
+        if not p:
+            return ""
+        if not re.match(r"^[a-zA-Z0-9]+://", p):
+            p = f"http://{p}"
+        return p
 
     def _build_opener(self) -> urllib.request.OpenerDirector:
         """构建支持代理的 HTTP 打开器"""
         handlers: list[Any] = []
         if self.proxy:
-            proxy_clean = self.proxy.strip()
-            handlers.append(urllib.request.ProxyHandler({"http": proxy_clean, "https": proxy_clean}))
+            handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -75,16 +93,53 @@ class TgChannelWatcher:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
+        # 1. 优先尝试 requests (支持 SOCKS5 / 更好的 SSL 与连接池)
+        if requests is not None:
+            try:
+                proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+                resp = requests.get(url, headers=headers, proxies=proxies, timeout=(8, 15), verify=False)
+                if resp.status_code == 200:
+                    return self._parse_tg_web_html(resp.text, channel_username)
+                else:
+                    logger.warning(
+                        f"Pan123TgPilot 访问公开频道【@{channel_username}】返回 HTTP {resp.status_code}"
+                    )
+            except Exception as e:
+                self._log_network_failure(channel_username, e)
+                return []
+
+        # 2. 备选使用原生 urllib
         opener = self._build_opener()
         req = urllib.request.Request(url, headers=headers, method="GET")
 
         try:
-            with opener.open(req, timeout=20) as resp:
+            with opener.open(req, timeout=15) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
                 return self._parse_tg_web_html(html, channel_username)
         except Exception as e:
-            logger.warning(f"Pan123TgPilot 抓取公开频道【@{channel_username}】失败: {e}")
+            self._log_network_failure(channel_username, e)
             return []
+
+    def _log_network_failure(self, channel_username: str, e: Exception) -> None:
+        """对常见的网络异常提供排查指引"""
+        err_msg = str(e)
+        if "timed out" in err_msg.lower() or "handshake" in err_msg.lower() or "connection" in err_msg.lower():
+            if not self.proxy:
+                logger.warning(
+                    f"Pan123TgPilot 抓取公开频道【@{channel_username}】超时: {err_msg}。\n"
+                    f"💡 原因诊断：当前运行在直连模式 (未配置代理)。由于 Telegram (t.me) 在中国大陆地区被防火墙阻断 TLS 握手，直连必然会超时或被重置。\n"
+                    f"👉 解决方案：请在插件配置中填写「Telegram 网络代理」（例如 http://192.168.1.100:7890 或 http://host.docker.internal:7890），或在 MoviePilot 系统设置中配置全局代理！"
+                )
+            else:
+                logger.warning(
+                    f"Pan123TgPilot 抓取公开频道【@{channel_username}】连接超时: {err_msg} (已配置代理: {self.proxy})。\n"
+                    f"💡 原因诊断：通过代理连接 Telegram 失败，常见原因包括：\n"
+                    f"  1. MoviePilot 运行在 Docker 容器内：若代理地址填写为 127.0.0.1，在容器内指的是容器自身而非宿主机。请将 127.0.0.1 替换为宿主机局域网 IP (如 http://192.168.x.x:7890) 或 http://host.docker.internal:7890；\n"
+                    f"  2. 代理客户端限制：请确认宿主机上的代理软件 (Clash/v2ray/Surge等) 已开启「允许局域网连接 (Allow LAN)」；\n"
+                    f"  3. 代理节点故障：请检查该代理节点是否可正常访问 Telegram。"
+                )
+        else:
+            logger.warning(f"Pan123TgPilot 抓取公开频道【@{channel_username}】失败: {e}")
 
     @staticmethod
     def _parse_tg_web_html(html: str, channel_username: str) -> List[Tuple[str, str]]:
@@ -100,33 +155,49 @@ class TgChannelWatcher:
             re.DOTALL,
         )
 
-        for block_html, post_id in post_blocks:
-            msg_id = post_id.split("/")[-1] if "/" in post_id else post_id
+        for block_html, post_attr in post_blocks:
+            try:
+                # 提取 msg_id
+                msg_id = ""
+                if "/" in post_attr:
+                    msg_id = post_attr.split("/")[-1].strip()
+                elif post_attr.isdigit():
+                    msg_id = post_attr.strip()
 
-            # 提取文本区: class="tgme_widget_message_text ..."
-            m_text = re.search(r'<div class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block_html, re.DOTALL)
-            raw_content = m_text.group(1) if m_text else ""
-            if not raw_content:
+                # 提取正文容器内容
+                m_body = re.search(
+                    r'<div class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*(?:<div class="[^"]*tgme_widget_message_footer|</div>)',
+                    block_html,
+                    re.DOTALL,
+                )
+                if not m_body:
+                    continue
+
+                body_html = m_body.group(1)
+
+                # 将 <a> 链接保留为 markdown [文本](url) 形式，避免链接文本丢失
+                def _replace_anchor(match: re.Match) -> str:
+                    href = match.group(1).strip()
+                    anchor_text = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+                    return f" [{anchor_text}]({href}) "
+
+                text = re.sub(
+                    r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                    _replace_anchor,
+                    body_html,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+
+                # 替换换行与空格
+                text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+                text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
+                text = re.sub(r"<[^>]+>", "", text)
+                text = unescape(text).strip()
+
+                if text:
+                    results.append((msg_id, text))
+            except Exception:
                 continue
-
-            # 将 <a href="...">文本</a> 转换为 [文本](href) 格式，避免超链接 URL 丢失
-            processed = re.sub(
-                r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-                r'[\2](\1)',
-                raw_content,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-
-            # 替换 <br/> 与 <p> 为换行
-            processed = re.sub(r'<br\s*/?>', '\n', processed, flags=re.IGNORECASE)
-            processed = re.sub(r'</p>', '\n', processed, flags=re.IGNORECASE)
-
-            # 去除其余 HTML 标签
-            text = re.sub(r'<[^>]+>', '', processed)
-            text = unescape(text).strip()
-
-            if text:
-                results.append((msg_id, text))
 
         return results
 

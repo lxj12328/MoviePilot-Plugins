@@ -44,6 +44,14 @@ class TestClientAndWatcher(unittest.TestCase):
         success, msg = client.trash_files([172012630879389])
         self.assertTrue(success)
 
+    def test_proxy_normalization(self):
+        w1 = TgChannelWatcher(proxy="127.0.0.1:7890")
+        self.assertEqual(w1.proxy, "http://127.0.0.1:7890")
+        w2 = TgChannelWatcher(proxy="socks5://127.0.0.1:7890")
+        self.assertEqual(w2.proxy, "socks5://127.0.0.1:7890")
+        w3 = TgChannelWatcher(proxy="")
+        self.assertEqual(w3.proxy, "")
+
     def test_tg_watcher_parse_preview_html(self):
         html = """
         <div class="tgme_widget_message_wrap">

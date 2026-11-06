@@ -70,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "lxj12328"
 
     def __init__(self):
@@ -142,7 +142,31 @@ class Pan123TgPilot(_PluginBase):
                 channels.append(c)
         self._tg_channels = channels
 
+        # 代理自动探测逻辑：优先读取插件配置，若留空自动继承 MoviePilot 全局代理或系统环境变量
         self._tg_proxy = str(config.get("tg_proxy") or "").strip()
+        if not self._tg_proxy:
+            try:
+                from app.core.config import settings
+                sys_p = getattr(settings, "PROXY", None)
+                if sys_p:
+                    self._tg_proxy = str(sys_p).strip()
+            except Exception:
+                try:
+                    from app.sdk.config import settings
+                    sys_p = getattr(settings, "PROXY", None)
+                    if sys_p:
+                        self._tg_proxy = str(sys_p).strip()
+                except Exception:
+                    pass
+
+        if not self._tg_proxy:
+            import os
+            for env_k in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "all_proxy", "https_proxy", "http_proxy"):
+                val = os.environ.get(env_k)
+                if val:
+                    self._tg_proxy = val.strip()
+                    break
+
         self._tg_bot_token = str(config.get("tg_bot_token") or "").strip()
 
         try:
@@ -173,12 +197,19 @@ class Pan123TgPilot(_PluginBase):
 
         global _plugin_instance
         _plugin_instance = self
+        proxy_display = f"已配置 ({self._tg_proxy})" if self._tg_proxy else "未配置 (直连模式，境内建议配置代理)"
         logger.info(
             f"Pan123TgPilot 初始化完成: 启用={self._enabled}, "
             f"监控频道={len(self._tg_channels)}个, "
+            f"代理={proxy_display}, "
             f"电影目录ID={self._movie_target_dir_id}, 剧集目录ID={self._tv_target_dir_id}, "
             f"智能洗版={self._auto_upgrade}"
         )
+        if self._enabled and not self._tg_proxy:
+            logger.warning(
+                "Pan123TgPilot 提示：当前未检测到 Telegram 代理配置。若您的服务器位于中国大陆境内，"
+                "Telegram 官方域名 (t.me) 将被阻断导致 TLS 握手超时。建议在插件设置中填写「Telegram 网络代理」。"
+            )
 
         # 立即运行一次触发逻辑 (方便用户一键测试)
         if self._enabled and config.get("run_now_on_save"):
@@ -671,9 +702,9 @@ class Pan123TgPilot(_PluginBase):
                                 "component": "VTextField",
                                 "props": {
                                     "model": "tg_proxy",
-                                    "label": "Telegram 网络代理 (可选)",
-                                    "placeholder": "http://127.0.0.1:7890",
-                                    "hint": "国内机器访问 TG 频道预览需配置 HTTP/SOCKS5 代理；直连环境可留空",
+                                    "label": "Telegram 网络代理 (可选，国内网络必填)",
+                                    "placeholder": "http://192.168.1.100:7890",
+                                    "hint": "境内访问 TG 需配置代理。留空则自动继承 MoviePilot 全局代理。⚠️注意：若 MoviePilot 运行在 Docker 容器内，请勿填 127.0.0.1 (指容器本身)，请填写宿主机局域网 IP (如 http://192.168.x.x:7890) 或 http://host.docker.internal:7890，并确认代理软件开启了「允许局域网连接」",
                                     "persistent-hint": True,
                                 },
                             }
