@@ -86,18 +86,15 @@ class Pan123TgDatabase:
             pass
 
     @db_query
-    def get_record_by_media_key(
-        self,
-        media_key: str = "",
-        db: Optional[Session] = None,
-        **kwargs,
-    ) -> Optional[dict]:
-        """根据媒体唯一键查找最新记录"""
-        if hasattr(media_key, "execute"):
-            db = media_key  # type: ignore
-            media_key = str(kwargs.get("media_key") or "")
-        elif not media_key:
-            media_key = str(kwargs.get("media_key") or "")
+    def get_record_by_media_key(self, *args, **kwargs) -> Optional[dict]:
+        """根据媒体唯一键查找最新记录 (自适应适配 MoviePilot @db_query 注入)"""
+        db = kwargs.get("db")
+        media_key = str(kwargs.get("media_key") or "")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, str) and not media_key:
+                media_key = arg
 
         if db is None or not media_key:
             return None
@@ -111,18 +108,19 @@ class Pan123TgDatabase:
         return self._to_dict(rec) if rec else None
 
     @db_query
-    def has_link_processed(
-        self,
-        share_url: str = "",
-        fslink: str = "",
-        db: Optional[Session] = None,
-        **kwargs,
-    ) -> bool:
-        """检查特定链接是否已转存过"""
-        if hasattr(share_url, "execute"):
-            db = share_url  # type: ignore
-            share_url = str(kwargs.get("share_url") or "")
-            fslink = str(kwargs.get("fslink") or "")
+    def has_link_processed(self, *args, **kwargs) -> bool:
+        """检查特定链接是否已转存过 (自适应适配 MoviePilot @db_query 注入)"""
+        db = kwargs.get("db")
+        share_url = str(kwargs.get("share_url") or "")
+        fslink = str(kwargs.get("fslink") or "")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, str):
+                if not share_url:
+                    share_url = arg
+                elif not fslink:
+                    fslink = arg
 
         if db is None:
             return False
@@ -139,23 +137,22 @@ class Pan123TgDatabase:
         return rec is not None
 
     @db_update
-    def save_or_update_record(
-        self,
-        data: Optional[dict] = None,
-        db: Optional[Session] = None,
-        **kwargs,
-    ) -> int:
+    def save_or_update_record(self, *args, **kwargs) -> int:
         """
         添加或更新转存记录。
-        同时兼容传入单一 dict 字典或任意关键字参数。
+        同时兼容传入单一 dict 字典或任意关键字参数 (自适应适配 MoviePilot @db_update 注入)。
         """
-        if hasattr(data, "execute"):
-            db = data  # type: ignore
-            data = None
-
+        db = kwargs.get("db")
         merged: dict[str, Any] = {}
-        if data and isinstance(data, dict):
-            merged.update(data)
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, dict):
+                merged.update(arg)
+
+        data_kw = kwargs.get("data")
+        if isinstance(data_kw, dict):
+            merged.update(data_kw)
         merged.update(kwargs)
 
         if db is None:
@@ -233,11 +230,17 @@ class Pan123TgDatabase:
             return new_rec.id
 
     @db_query
-    def list_records(self, limit: int = 50, db: Optional[Session] = None, **kwargs) -> list[dict]:
-        """获取最近转存记录"""
-        if hasattr(limit, "execute"):
-            db = limit  # type: ignore
-            limit = int(kwargs.get("limit") or 50)
+    def list_records(self, *args, **kwargs) -> list[dict]:
+        """获取最近转存记录 (自适应适配 MoviePilot @db_query 注入)"""
+        db = kwargs.get("db")
+        limit = kwargs.get("limit")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, int):
+                limit = arg
+
+        limit = int(limit or 50)
         if db is None:
             return []
         records = db.execute(

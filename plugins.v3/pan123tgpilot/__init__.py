@@ -70,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_author = "lxj12328"
 
     def __init__(self):
@@ -197,7 +197,7 @@ class Pan123TgPilot(_PluginBase):
 
         global _plugin_instance
         _plugin_instance = self
-        proxy_display = f"已配置 ({self._tg_proxy})" if self._tg_proxy else "未配置 (直连模式，境内建议配置代理)"
+        proxy_display = f"已配置 ({self._tg_proxy})" if self._tg_proxy else "未配置 (直连模式)"
         logger.info(
             f"Pan123TgPilot 初始化完成: 启用={self._enabled}, "
             f"监控频道={len(self._tg_channels)}个, "
@@ -205,11 +205,6 @@ class Pan123TgPilot(_PluginBase):
             f"电影目录ID={self._movie_target_dir_id}, 剧集目录ID={self._tv_target_dir_id}, "
             f"智能洗版={self._auto_upgrade}"
         )
-        if self._enabled and not self._tg_proxy:
-            logger.warning(
-                "Pan123TgPilot 提示：当前未检测到 Telegram 代理配置。若您的服务器位于中国大陆境内，"
-                "Telegram 官方域名 (t.me) 将被阻断导致 TLS 握手超时。建议在插件设置中填写「Telegram 网络代理」。"
-            )
 
         # 立即运行一次触发逻辑 (方便用户一键测试)
         if self._enabled and config.get("run_now_on_save"):
