@@ -93,6 +93,14 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         mock_session.add.assert_called()
         mock_session.flush.assert_called()
 
+        # 测试通过 **record_data 关键字参数持久化
+        res_id2 = db.save_or_update_record(db=mock_session, **record_data)
+        self.assertIsNotNone(res_id2)
+
+        # 测试无效空记录拒绝入库
+        empty_id = db.save_or_update_record(db=mock_session, title="", media_key="")
+        self.assertEqual(empty_id, 0)
+
     def test_process_message_transfer_and_upgrade(self):
         self.plugin.init_plugin({
             "enabled": True,

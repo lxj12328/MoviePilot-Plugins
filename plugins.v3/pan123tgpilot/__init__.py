@@ -70,7 +70,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     plugin_author = "lxj12328"
 
     def __init__(self):
@@ -182,6 +182,10 @@ class Pan123TgPilot(_PluginBase):
         if not self._db:
             self._db = Pan123TgDatabase()
         self._db.ensure_table()
+        try:
+            self._db.clean_invalid_records()
+        except Exception:
+            pass
 
         # 初始化 123 客户端
         if self._auth_token:
@@ -510,7 +514,7 @@ class Pan123TgPilot(_PluginBase):
             "remark": decision_reason if is_upgrade else "首发转存",
         }
         if self._db:
-            self._db.save_or_update_record(record_data)
+            self._db.save_or_update_record(**record_data)
 
         # 发送 MoviePilot 系统通知
         action_title = "123云盘画质洗版成功" if is_upgrade else "123云盘TG转存成功"
@@ -971,17 +975,28 @@ class Pan123TgPilot(_PluginBase):
             hdr = r.get("dovi_hdr") or ""
             spec = f"{res} / {codec}" + (f" / {hdr}" if hdr else "")
 
-            status = r.get("status")
+            status = str(r.get("status") or "").lower()
             status_map = {
                 "saved": ("首发转存", "success"),
                 "upgraded": ("洗版升级", "info"),
                 "ignored": ("已跳过", "grey"),
             }
-            status_text, status_color = status_map.get(status, (status or "已转存", "primary"))
+            status_text, status_color = status_map.get(
+                status,
+                ("首发转存" if "save" in status else (status.upper() if status else "已转存"), "primary"),
+            )
 
             time_str = str(r.get("updated_at") or r.get("created_at") or "-")
             if len(time_str) > 19:
                 time_str = time_str[:19]
+
+            title_text = str(r.get("media_title") or r.get("title") or "").strip()
+            if not title_text and r.get("fslink"):
+                m_fn = re.search(r"#([^#]+\.(?:mkv|mp4|ts|avi|mov|iso|rmvb|flv))", r["fslink"], re.IGNORECASE)
+                if m_fn:
+                    title_text = m_fn.group(1)
+            if not title_text:
+                title_text = "-"
 
             rows.append({
                 "component": "tr",
@@ -989,7 +1004,7 @@ class Pan123TgPilot(_PluginBase):
                     {
                         "component": "td",
                         "props": {"class": "font-weight-medium"},
-                        "text": r.get("media_title") or r.get("title") or "-",
+                        "text": title_text,
                     },
                     {
                         "component": "td",

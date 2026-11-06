@@ -77,16 +77,52 @@ class Pan123TgDatabase:
     """数据持久化门面类"""
 
     @db_update
-    def ensure_table(self, db: Optional[Session] = None) -> None:
-        """确保数据库表存在"""
-        if db is None:
-            return
+    def ensure_table(self, *args, **kwargs) -> None:
+        """确保数据库表存在并清理历史异常空记录"""
+        db = kwargs.get("db")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+                break
         try:
             from app.db import Engine
             if Engine is not None and hasattr(Base, "metadata"):
                 Base.metadata.create_all(bind=Engine, tables=[Pan123TgRecord.__table__], checkfirst=True)
         except Exception:
             pass
+        try:
+            self.clean_invalid_records(db=db)
+        except Exception:
+            pass
+
+    @db_update
+    def clean_invalid_records(self, *args, **kwargs) -> int:
+        """清理历史因传参异常导致的空记录 (media_title 为空)"""
+        db = kwargs.get("db")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+                break
+        if db is None:
+            return 0
+        try:
+            from sqlalchemy import delete
+            stmt = delete(Pan123TgRecord).where(
+                or_(
+                    Pan123TgRecord.media_title == "",
+                    Pan123TgRecord.media_title.is_(None),
+                )
+            )
+            res = db.execute(stmt)
+            db.flush()
+            try:
+                db.commit()
+            except Exception:
+                pass
+            return getattr(res, "rowcount", 0) or 0
+        except Exception as e:
+            logger.debug(f"Pan123TgDatabase 清理无效记录异常: {e}")
+            return 0
 
     @db_query
     def get_record_by_media_key(self, *args, **kwargs) -> Optional[dict]:
@@ -189,33 +225,43 @@ class Pan123TgDatabase:
     def save_or_update_record(self, *args, **kwargs) -> int:
         """
         添加或更新转存记录。
-        同时兼容传入单一 dict 字典或任意关键字参数 (自适应适配 MoviePilot @db_update 注入)。
+        同时兼容传入单一 dict 字典或完整关键字参数 (自适应适配 MoviePilot @db_update 注入)。
         """
         db = kwargs.get("db")
-        merged: dict[str, Any] = {}
         for arg in args:
             if hasattr(arg, "execute"):
                 db = arg
-            elif isinstance(arg, dict):
+                break
+
+        merged: dict[str, Any] = {}
+        # 从 args 中提取字典对象 (兼容 positional dict)
+        for arg in args:
+            if isinstance(arg, dict):
                 merged.update(arg)
 
-        data_kw = kwargs.get("data")
-        if isinstance(data_kw, dict):
-            merged.update(data_kw)
-        merged.update(kwargs)
+        # 从 kwargs 中提取结构化字典
+        if isinstance(kwargs.get("data"), dict):
+            merged.update(kwargs["data"])
+        if isinstance(kwargs.get("record"), dict):
+            merged.update(kwargs["record"])
+
+        # 从 kwargs 提取独立字段
+        for k, v in kwargs.items():
+            if k != "db" and v is not None:
+                merged[k] = v
 
         if db is None:
             return 0
 
-        channel = str(merged.get("channel") or merged.get("channel_name") or "")
+        channel = str(merged.get("channel") or merged.get("channel_name") or "").strip()
         msg_id_val = merged.get("msg_id")
         msg_id = str(msg_id_val) if msg_id_val is not None else None
-        media_key = str(merged.get("media_key") or "")
-        media_title = str(merged.get("media_title") or merged.get("title") or "")
+        media_key = str(merged.get("media_key") or "").strip()
+        media_title = str(merged.get("media_title") or merged.get("title") or "").strip()
         media_type = str(merged.get("media_type") or "movie")
-        resolution = str(merged.get("resolution") or "")
-        codec = str(merged.get("codec") or "")
-        dovi_hdr = str(merged.get("dovi_hdr") or "")
+        resolution = str(merged.get("resolution") or "").strip()
+        codec = str(merged.get("codec") or "").strip()
+        dovi_hdr = str(merged.get("dovi_hdr") or "").strip()
         quality_score = int(merged.get("quality_score") or 0)
         file_size = int(merged.get("file_size") or 0)
         share_url = merged.get("share_url")
@@ -223,8 +269,12 @@ class Pan123TgDatabase:
         target_dir_id = int(merged.get("target_dir_id") or merged.get("pan_dir_id") or 0)
         cloud_file_id_raw = merged.get("cloud_file_id") or merged.get("pan_file_id")
         cloud_file_id = str(cloud_file_id_raw) if cloud_file_id_raw is not None else None
-        status = str(merged.get("status") or "SAVED")
+        status = str(merged.get("status") or "saved").lower()
         error_msg = str(merged.get("error_msg") or merged.get("remark") or "")
+
+        # 杜绝无意义空记录写入
+        if not media_title and not media_key:
+            return 0
 
         existing = None
         if media_key:
@@ -304,7 +354,11 @@ class Pan123TgDatabase:
         if db is None:
             return []
 
-        stmt = select(Pan123TgRecord)
+        # 默认过滤掉标题为空的异常历史记录
+        stmt = select(Pan123TgRecord).where(
+            Pan123TgRecord.media_title != "",
+            Pan123TgRecord.media_title.is_not(None),
+        )
         if keyword and str(keyword).strip():
             kw = f"%{str(keyword).strip()}%"
             stmt = stmt.where(
@@ -319,6 +373,7 @@ class Pan123TgDatabase:
         records = db.execute(
             stmt.order_by(Pan123TgRecord.updated_at.desc()).limit(limit)
         ).scalars().all()
+        return [self._to_dict(r) for r in records]
         return [self._to_dict(r) for r in records]
 
     @staticmethod
