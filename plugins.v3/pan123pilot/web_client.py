@@ -59,7 +59,7 @@ class Pan123WebClient:
         self.token = self._clean_token(token)
         self._last_token_check = 0.0
 
-    def _get_headers(self, with_auth: bool = True) -> dict[str, str]:
+    def _get_headers(self, with_auth: bool = True, extra_headers: Optional[dict] = None) -> dict[str, str]:
         """构造 Web 端标准请求头"""
         headers = {
             "Content-Type": "application/json",
@@ -71,6 +71,8 @@ class Pan123WebClient:
         }
         if with_auth and self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        if extra_headers:
+            headers.update(extra_headers)
         return headers
 
     def _http_get(
@@ -78,9 +80,10 @@ class Pan123WebClient:
         url: str,
         with_auth: bool = True,
         timeout: int = 15,
+        extra_headers: Optional[dict] = None,
     ) -> tuple[bool, dict, str]:
         """统一 HTTP GET 请求方法"""
-        headers = self._get_headers(with_auth=with_auth)
+        headers = self._get_headers(with_auth=with_auth, extra_headers=extra_headers)
         try:
             req = urllib.request.Request(url, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -103,9 +106,10 @@ class Pan123WebClient:
         data: dict,
         with_auth: bool = True,
         timeout: int = 15,
+        extra_headers: Optional[dict] = None,
     ) -> tuple[bool, dict, str]:
         """统一 HTTP POST 请求方法"""
-        headers = self._get_headers(with_auth=with_auth)
+        headers = self._get_headers(with_auth=with_auth, extra_headers=extra_headers)
         try:
             body_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
@@ -291,11 +295,10 @@ class Pan123WebClient:
                     session_uuid = remote_data.get("uuid")
                 break
 
-        # 构造官方微信授权扫码页面链接
+        # 123 云盘前端页面基于 uni-app / uni-id 开发，强制校验 uniID 字段
         target_url = (
-            (remote_data.get("url") or remote_data.get("qrcode"))
-            if remote_data
-            else f"{self.WEB_BASE_URL}/wx-app-login.html?uuid={session_uuid}&env=production"
+            f"{self.WEB_BASE_URL}/wx-app-login.html?"
+            f"env=production&uniID={session_uuid}&uuid={session_uuid}&source=123pan&type=login"
         )
 
         encoded_url = urllib.parse.quote(target_url)
@@ -304,6 +307,7 @@ class Pan123WebClient:
 
         return True, {
             "uuid": session_uuid,
+            "uniID": session_uuid,
             "url": target_url,
             "img_url": img_url,
         }, "ok"
@@ -321,12 +325,22 @@ class Pan123WebClient:
             f"{self.USER_API_URL}/api/user/qr-code/wx_code",
         ]
 
-        payload = {"uuid": session_uuid}
+        payload = {
+            "uniID": session_uuid,
+            "uuid": session_uuid,
+            "source": "123pan",
+            "type": "login",
+        }
         wx_code = None
         last_msg = "等待扫码"
 
         for url in endpoints:
-            ok, res, msg = self._http_post(url, payload, with_auth=False)
+            ok, res, msg = self._http_post(
+                url,
+                payload,
+                with_auth=False,
+                extra_headers={"loginuuid": session_uuid},
+            )
             if ok:
                 code = res.get("code")
                 if code == 0:
