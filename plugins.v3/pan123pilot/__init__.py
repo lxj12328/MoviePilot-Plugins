@@ -4,6 +4,7 @@
 """
 
 import os
+import threading
 from datetime import datetime
 from typing import Any, Optional
 
@@ -59,6 +60,12 @@ from .client import Pan123Client
 from .models import Pan123TaskDatabase
 from .qb_helper import QBHelper
 from .uploader import TaskScheduler
+
+_plugin_instance: Optional["Pan123Pilot"] = None
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".ts", ".iso", ".rmvb", ".avi", ".mov", ".flv", ".m2ts", ".wmv"
+}
 
 
 def get_system_qbittorrents() -> list[dict[str, Any]]:
@@ -197,7 +204,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -388,6 +395,8 @@ class Pan123Pilot(_PluginBase):
             symedia_config=symedia_config,
         )
         self.scheduler.start()
+        global _plugin_instance
+        _plugin_instance = self
         logger.info("Pan123Pilot (123云盘助手) 初始化完成并已启动后台调度")
 
     def get_state(self) -> bool:
@@ -499,6 +508,13 @@ class Pan123Pilot(_PluginBase):
                 "auth": "bear",
                 "summary": "手动触发一次做种清理检查",
             },
+            {
+                "path": "/scan_library",
+                "endpoint": self._api_scan_library,
+                "methods": ["POST", "GET"],
+                "auth": "bear",
+                "summary": "手动扫描本地媒体库并补录待同步媒体文件",
+            },
         ]
 
     def _api_get_tasks(self) -> dict:
@@ -513,6 +529,18 @@ class Pan123Pilot(_PluginBase):
     def _api_trigger_cleanup(self) -> dict:
         self._service_cleanup_tasks()
         return {"code": 0, "message": "已手动触发做种达标清理"}
+
+    def _api_scan_library(self) -> dict:
+        """手动扫描本地媒体库根目录，将未录入的任务录入数据库并立即触发同步"""
+        if not self._local_library_root or not os.path.exists(self._local_library_root):
+            return {"code": 1, "message": f"本地媒体库路径未配置或在容器内不存在: {self._local_library_root}"}
+
+        task_ids = _record_transferred_target(self._local_library_root)
+        return {"code": 0, "message": f"媒体库扫描完成，已录入并检查 {len(task_ids)} 个媒体文件"}
+
+    def on_transfer_completed(self, event: Any) -> None:
+        """MoviePilot 插件类反射事件监听入口"""
+        pan123_on_transfer_completed(event)
 
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         """Vuetify 配置表单及默认模型"""
@@ -1088,6 +1116,8 @@ class Pan123Pilot(_PluginBase):
 
     def stop_service(self) -> None:
         """彻底释放插件后台线程及资源"""
+        global _plugin_instance
+        _plugin_instance = None
         if self.scheduler:
             self.scheduler.stop()
             self.scheduler = None
@@ -1095,46 +1125,208 @@ class Pan123Pilot(_PluginBase):
         logger.info("Pan123Pilot 后台调度服务已安全停止")
 
 
-# 注册 MoviePilot 整理刮削完成事件监听（安全适配 TransferComplete / TransferCompleted）
-_transfer_event = getattr(EventType, "TransferComplete", getattr(EventType, "TransferCompleted", None))
+def _extract_transfer_info(event: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    全面解析 MoviePilot 各版本 TransferComplete 事件携带的数据对象。
+    支持从 transferinfo 对象/字典、target_item/target_diritem、root event_data 等全方位提取。
+    返回 (target_path, source_path, torrent_hash)
+    """
+    event_data = getattr(event, "event_data", None)
+    if event_data is None:
+        if isinstance(event, dict):
+            event_data = event
+        else:
+            event_data = {}
+
+    target_path = None
+    source_path = None
+    torrent_hash = None
+
+    # 1. 尝试从 transferinfo / transfer_info 中提取（MoviePilot V3 核心传输上下文结构）
+    transfer_info = event_data.get("transferinfo") or event_data.get("transfer_info")
+    if transfer_info:
+        # 目标文件/目录路径提取 (target_item / target_diritem / target_path / dest)
+        target_item = getattr(transfer_info, "target_item", None) or (
+            transfer_info.get("target_item") if isinstance(transfer_info, dict) else None
+        )
+        if target_item:
+            target_path = getattr(target_item, "path", None) or (
+                target_item.get("path") if isinstance(target_item, dict) else str(target_item)
+            )
+
+        if not target_path:
+            target_diritem = getattr(transfer_info, "target_diritem", None) or (
+                transfer_info.get("target_diritem") if isinstance(transfer_info, dict) else None
+            )
+            if target_diritem:
+                target_path = getattr(target_diritem, "path", None) or (
+                    target_diritem.get("path") if isinstance(target_diritem, dict) else str(target_diritem)
+                )
+
+        if not target_path:
+            target_path = getattr(transfer_info, "target_path", None) or (
+                transfer_info.get("target_path") if isinstance(transfer_info, dict) else None
+            )
+
+        # 源文件路径提取
+        file_item = (
+            getattr(transfer_info, "fileitem", None)
+            or getattr(transfer_info, "source_item", None)
+            or (transfer_info.get("fileitem") if isinstance(transfer_info, dict) else None)
+        )
+        if file_item:
+            source_path = getattr(file_item, "path", None) or (
+                file_item.get("path") if isinstance(file_item, dict) else str(file_item)
+            )
+
+        # Hash 提取
+        torrent_hash = (
+            getattr(transfer_info, "download_hash", None)
+            or getattr(transfer_info, "torrent_hash", None)
+            or getattr(transfer_info, "hash", None)
+        )
+        if not torrent_hash and isinstance(transfer_info, dict):
+            torrent_hash = (
+                transfer_info.get("download_hash")
+                or transfer_info.get("torrent_hash")
+                or transfer_info.get("hash")
+            )
+
+    # 2. 尝试从根层级直接提取
+    if not target_path:
+        target_item = event_data.get("target_item")
+        if target_item:
+            target_path = getattr(target_item, "path", None) or (
+                target_item.get("path") if isinstance(target_item, dict) else str(target_item)
+            )
+    if not target_path:
+        target_diritem = event_data.get("target_diritem")
+        if target_diritem:
+            target_path = getattr(target_diritem, "path", None) or (
+                target_diritem.get("path") if isinstance(target_diritem, dict) else str(target_diritem)
+            )
+    if not target_path:
+        target_path = (
+            event_data.get("target_path")
+            or event_data.get("dest")
+            or event_data.get("dest_path")
+            or event_data.get("file_path")
+            or event_data.get("path")
+        )
+
+    if not source_path:
+        source_item = event_data.get("fileitem") or event_data.get("source_item")
+        if source_item:
+            source_path = getattr(source_item, "path", None) or (
+                source_item.get("path") if isinstance(source_item, dict) else str(source_item)
+            )
+        if not source_path:
+            source_path = event_data.get("source_path") or event_data.get("src")
+
+    if not torrent_hash:
+        torrent_hash = (
+            event_data.get("torrent_hash")
+            or event_data.get("hash")
+            or event_data.get("download_hash")
+        )
+
+    target_str = str(target_path).strip() if target_path else None
+    source_str = str(source_path).strip() if source_path else None
+    hash_str = str(torrent_hash).strip() if torrent_hash else None
+    return target_str, source_str, hash_str
+
+
+def _record_transferred_target(
+    target_path: str,
+    source_path: Optional[str] = None,
+    torrent_hash: Optional[str] = None,
+) -> list[int]:
+    """
+    将整理后的目标文件或目录内的媒体录入任务库并触发处理。
+    支持单一文件与目录多级遍历。
+    """
+    if not target_path or not os.path.exists(target_path):
+        return []
+
+    task_ids = []
+    db = Pan123TaskDatabase()
+    db.ensure_table()
+
+    # 1. 若为目录，递归扫描所有视频媒体文件
+    if os.path.isdir(target_path):
+        for root, _, files in os.walk(target_path):
+            for f in sorted(files):
+                ext = os.path.splitext(f)[1].lower()
+                if ext in VIDEO_EXTENSIONS:
+                    file_full = os.path.join(root, f)
+                    try:
+                        f_size = os.path.getsize(file_full)
+                        tid = db.add_or_update_task(
+                            target_path=file_full,
+                            file_name=f,
+                            file_size=f_size,
+                            torrent_hash=torrent_hash,
+                            source_path=source_path,
+                        )
+                        task_ids.append(tid)
+                        logger.info(f"Pan123Pilot 已捕获目录中的新媒体文件: {f} (任务ID: {tid})")
+                    except Exception as e:
+                        logger.error(f"Pan123Pilot 录入同步任务失败: {e}")
+    else:
+        # 2. 若为单一文件
+        ext = os.path.splitext(target_path)[1].lower()
+        if ext in VIDEO_EXTENSIONS:
+            filename = os.path.basename(target_path)
+            file_size = os.path.getsize(target_path)
+            try:
+                tid = db.add_or_update_task(
+                    target_path=target_path,
+                    file_name=filename,
+                    file_size=file_size,
+                    torrent_hash=torrent_hash,
+                    source_path=source_path,
+                )
+                task_ids.append(tid)
+                logger.info(f"Pan123Pilot 已捕获新整理媒体文件: {filename} (任务ID: {tid})")
+            except Exception as e:
+                logger.error(f"Pan123Pilot 录入同步任务失败: {e}")
+
+    # 3. 若有新任务入库且调度器正在运行，即刻启动处理
+    global _plugin_instance
+    if task_ids and _plugin_instance and _plugin_instance.scheduler and _plugin_instance.get_state():
+        try:
+            threading.Thread(target=_plugin_instance.scheduler.process_pending_tasks, daemon=True).start()
+        except Exception:
+            pass
+
+    return task_ids
 
 
 def pan123_on_transfer_completed(event: Any) -> None:
     """
-    当 MoviePilot 刮削整理完成时，自动将新文件录入 123 云盘同步任务表
+    当 MoviePilot 刮削整理完成时，自动将新文件录入 123 云盘同步任务表并即刻触发同步
     """
-    event_data = getattr(event, "event_data", None) or {}
-    target_path = event_data.get("target_path") or event_data.get("dest")
-    source_path = event_data.get("source_path") or event_data.get("src")
-    torrent_hash = event_data.get("torrent_hash") or event_data.get("hash")
-
-    if not target_path:
-        return
-
-    # 只处理实际存在的视频媒体文件
-    if os.path.isdir(target_path):
-        return
-
-    filename = os.path.basename(target_path)
-    file_size = os.path.getsize(target_path) if os.path.exists(target_path) else 0
-
     try:
-        db = Pan123TaskDatabase()
-        db.ensure_table()
-        task_id = db.add_or_update_task(
-            target_path=target_path,
-            file_name=filename,
-            file_size=file_size,
-            torrent_hash=torrent_hash,
-            source_path=source_path,
-        )
-        logger.info(f"Pan123Pilot 已捕获新整理媒体文件: {filename} (任务ID: {task_id})")
+        target_path, source_path, torrent_hash = _extract_transfer_info(event)
+        if not target_path:
+            logger.debug(f"Pan123Pilot TransferComplete 事件中未能解析出目标文件路径: {getattr(event, 'event_data', event)}")
+            return
+        logger.info(f"Pan123Pilot 监听到整理完成事件: target={target_path}, hash={torrent_hash}")
+        _record_transferred_target(target_path, source_path, torrent_hash)
     except Exception as e:
-        logger.error(f"Pan123Pilot 录入同步任务失败: {e}")
+        logger.error(f"Pan123Pilot 处理 TransferComplete 事件异常: {e}")
 
 
-if _transfer_event and hasattr(eventmanager, "register"):
-    try:
-        pan123_on_transfer_completed = eventmanager.register(_transfer_event)(pan123_on_transfer_completed)
-    except Exception as e:
-        logger.warning(f"Pan123Pilot 注册 TransferComplete 事件监听失败: {e}")
+# 多重事件枚举与名称动态注册（安全适配 TransferComplete / TransferCompleted / 字符串枚举）
+_transfer_events: list[Any] = []
+for attr in ("TransferComplete", "TransferCompleted", "transfer.complete", "Transfer"):
+    val = getattr(EventType, attr, None)
+    if val and val not in _transfer_events:
+        _transfer_events.append(val)
+
+if hasattr(eventmanager, "register"):
+    for ev in _transfer_events:
+        try:
+            eventmanager.register(ev)(pan123_on_transfer_completed)
+        except Exception as e:
+            logger.warning(f"Pan123Pilot 注册事件监听 {ev} 失败: {e}")

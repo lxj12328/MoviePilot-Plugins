@@ -83,13 +83,30 @@ class TestPluginLoader(unittest.TestCase):
         plugin._service_cleanup_tasks()
 
     def test_transfer_completed_handler(self):
-        class DummyEvent:
+        class DummyFileItem:
+            def __init__(self, path):
+                self.path = path
+
+        class DummyTransferInfo:
+            def __init__(self, target_path, source_path=None, hash_val=None):
+                self.target_item = DummyFileItem(target_path)
+                self.fileitem = DummyFileItem(source_path) if source_path else None
+                self.download_hash = hash_val
+
+        class DummyEventWithTransferInfo:
+            event_data = {
+                "transferinfo": DummyTransferInfo("/tmp/test_dir_item.mkv", "/tmp/src.mkv", "hash999")
+            }
+
+        class DummyEventDict:
             event_data = {
                 "target_path": "/tmp/non_existent_test_movie.mkv",
                 "torrent_hash": "abcdef123456",
             }
-        # Calling handler should not raise exception
-        pan123_on_transfer_completed(DummyEvent())
+
+        # Calling handler should extract paths from both formats safely
+        pan123_on_transfer_completed(DummyEventDict())
+        pan123_on_transfer_completed(DummyEventWithTransferInfo())
 
 
 if __name__ == "__main__":

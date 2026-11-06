@@ -175,11 +175,14 @@
    - `GET /api/plugins/pan123pilot/tasks`：查询最近 50 条任务的流转详情。
    - `POST /api/plugins/pan123pilot/trigger_retry`：手动立即触发一次秒传重试。
    - `POST /api/plugins/pan123pilot/trigger_cleanup`：手动立即触发一次做种达标清理。
+   - `POST /api/plugins/pan123pilot/scan_library`：手动扫描本地媒体库目录，补录未同步视频并即刻发起秒传检测。
 
 ---
 
 ## 📝 版本历史 (Changelog)
 
+- **v1.1.6** (2026-11-06):
+  - **增强整理完成事件解析与多重监听**：全面解析 MoviePilot 各版本 `TransferComplete` 事件模型，完美提取 `transferinfo.target_item` 中的目标路径；支持目录层级递归扫描媒体文件，并在任务录入后毫秒级唤醒上传引擎；增加媒体库补录 API 路由。
 - **v1.1.5** (2026-11-05):
   - **重构重试与巡检时间间隔逻辑**：彻底统一“调度器执行周期”与“秒传重试间隔时间”的业务逻辑。引入任务级 `updated_at` 时间差检测，确保只有距离上次重试真正达到设定分钟数的任务才会被唤醒校验，彻底避免不必要的轮询与重试次数浪费。
 - **v1.1.4** (2026-11-05):
