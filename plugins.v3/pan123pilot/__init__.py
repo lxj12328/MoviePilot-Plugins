@@ -978,7 +978,7 @@ class Pan123Pilot(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "scan_history_on_save",
-                                            "label": "保存时扫描补录历史媒体 (自动关联 qB 种子)",
+                                            "label": "保存配置时立即扫描历史媒体库 (自动关联 qB 种子)",
                                             "hint": "保存配置后后台自动遍历本地媒体库，关联种子并把未同步的影视加入秒传队列",
                                             "persistent-hint": True,
                                         },
