@@ -269,22 +269,27 @@ class TaskScheduler:
 
             task_id = task["id"]
             target_path = task["target_path"]
-            torrent_hash = task["torrent_hash"]
             filename = os.path.basename(target_path)
+            ext = os.path.splitext(filename)[1].lower()
+            is_companion = ext in SCRAPED_EXTENSIONS
+            # 刮削伴生文件不关联与操作 qB 种子标签
+            torrent_hash = None if is_companion else task.get("torrent_hash")
 
             if not os.path.exists(target_path):
                 logger.error(f"Pan123Pilot 任务【{filename}】(ID: {task_id}) 目标文件在磁盘上不存在: {target_path}")
                 self.db.update_task_status(
                     task_id=task_id, status="FAILED", error_msg="目标文件不存在"
                 )
-                self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"), batch_tag_cache)
+                if not is_companion:
+                    self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"), batch_tag_cache)
                 continue
 
             logger.info(f"Pan123Pilot 开始执行待同步任务: 【{filename}】(ID: {task_id})")
 
             # 1. 标记为处理中
             self.db.update_task_status(task_id=task_id, status="UPLOADING")
-            self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"), batch_tag_cache)
+            if not is_companion:
+                self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"), batch_tag_cache)
 
             # 2. 计算或复用哈希 (Web 模式仅需计算 MD5，利用 C 级 file_digest 提速 2~3 倍)
             sha1_str = task.get("sha1")
@@ -346,13 +351,14 @@ class TaskScheduler:
                     parent_file_id=parent_id,
                     error_msg="",
                 )
-                self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"), batch_tag_cache)
-                self._trigger_symedia_notify(target_path, action="create")
-                self._notify(
-                    "upload",
-                    "123云盘秒传成功",
-                    f"媒体文件【{filename}】已成功零流量秒传至 123 云盘！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
-                )
+                if not is_companion:
+                    self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"), batch_tag_cache)
+                    self._trigger_symedia_notify(target_path, action="create")
+                    self._notify(
+                        "upload",
+                        "123云盘秒传成功",
+                        f"媒体文件【{filename}】已成功零流量秒传至 123 云盘！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
+                    )
             else:
                 # 若因 Token 过期导致鉴权失败，不消耗重试次数并触发报警
                 if "TOKEN_EXPIRED" in str(msg):
@@ -406,8 +412,9 @@ class TaskScheduler:
     ) -> None:
         """处理达到重试上限的任务"""
         task_id = task["id"]
-        torrent_hash = task["torrent_hash"]
         target_path = task["target_path"]
+        is_companion = os.path.splitext(target_path)[1].lower() in SCRAPED_EXTENSIONS
+        torrent_hash = None if is_companion else task.get("torrent_hash")
         parent_id = task.get("parent_file_id", 0)
 
         if not enable_real_upload:
@@ -419,18 +426,20 @@ class TaskScheduler:
                 md5=md5_str,
                 error_msg=err_text,
             )
-            self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
-            self._notify(
-                "failed",
-                "123云盘秒传失败",
-                f"媒体【{os.path.basename(target_path)}】{err_text}",
-            )
+            if not is_companion:
+                self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
+                self._notify(
+                    "failed",
+                    "123云盘秒传失败",
+                    f"媒体【{os.path.basename(target_path)}】{err_text}",
+                )
             return
 
         # 启动真实分片上传（先计算或级联解析父目录 ID）
         parent_id = self.resolve_target_parent_id(target_path)
         logger.info(f"Pan123Pilot 【{os.path.basename(target_path)}】达到重试上限，启动 123 分片真实上传 (ParentID: {parent_id})...")
-        self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"))
+        if not is_companion:
+            self._sync_qb_tag(torrent_hash, self.tags.get("uploading", "123_上传中"))
 
         if not hasattr(self.client, "upload_file_v2"):
             ok, file_id, err = False, 0, "当前客户端未实现分片真实上传"
@@ -455,13 +464,14 @@ class TaskScheduler:
                 parent_file_id=parent_id,
                 error_msg="分片真实上传完成",
             )
-            self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
-            self._trigger_symedia_notify(target_path, action="create")
-            self._notify(
-                "upload",
-                "123云盘上传成功",
-                f"媒体【{os.path.basename(target_path)}】分片断点真实上传完成！\n文件大小: {self.format_size(task.get('file_size') or 0)}\n云盘文件ID: {file_id}",
-            )
+            if not is_companion:
+                self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+                self._trigger_symedia_notify(target_path, action="create")
+                self._notify(
+                    "upload",
+                    "123云盘上传成功",
+                    f"媒体【{os.path.basename(target_path)}】分片断点真实上传完成！\n文件大小: {self.format_size(task.get('file_size') or 0)}\n云盘文件ID: {file_id}",
+                )
         else:
             self.db.update_task_status(
                 task_id=task_id,
@@ -470,12 +480,13 @@ class TaskScheduler:
                 md5=md5_str,
                 error_msg=f"真实上传失败: {err}",
             )
-            self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
-            self._notify(
-                "failed",
-                "123云盘上传失败",
-                f"媒体【{os.path.basename(target_path)}】真实上传失败: {err}",
-            )
+            if not is_companion:
+                self._sync_qb_tag(torrent_hash, self.tags.get("failed", "123_秒传失败"))
+                self._notify(
+                    "failed",
+                    "123云盘上传失败",
+                    f"媒体【{os.path.basename(target_path)}】真实上传失败: {err}",
+                )
 
     def retry_retrying_tasks(
         self,
@@ -610,7 +621,14 @@ class TaskScheduler:
 
             task_id = task["id"]
             torrent_hash = task.get("torrent_hash")
-            target_path = task.get("target_path")
+            target_path = task.get("target_path") or ""
+            fname_check = str(task.get("file_name") or target_path)
+            ext_check = os.path.splitext(fname_check)[1].lower()
+
+            # 核心规则：刮削伴生文件 (.nfo/.jpg/.png/.srt 等) 绝不独立关联或触发 qB 任务清理！
+            # 只有正片视频任务才执行 qB 做种考核与任务清理
+            if ext_check in SCRAPED_EXTENSIONS:
+                continue
 
             # 1. 检查做种条件是否达标（若触发紧急空间腾退，则无视指标直接强制放行）
             qualified = True
@@ -646,7 +664,7 @@ class TaskScheduler:
                             has_pending_companions = True
                             self.db.add_task(
                                 target_path=fpath,
-                                torrent_hash=torrent_hash,
+                                torrent_hash=None,
                                 status="PENDING",
                             )
                             logger.info(f"Pan123Pilot 补充发现尚未同步的刮削伴生文件，自动录入同步队列: {fname}")

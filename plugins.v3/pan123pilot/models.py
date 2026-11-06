@@ -4,7 +4,18 @@ Pan123Pilot 本地任务持久化数据模型
 """
 
 from datetime import datetime, timedelta
+import os
 from typing import Any, Optional
+
+MODEL_VIDEO_EXTENSIONS = (
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".ts", ".m2ts",
+    ".iso", ".rmvb", ".webm", ".strm",
+)
+MODEL_SCRAPED_EXTENSIONS = (
+    ".nfo", ".xml",
+    ".srt", ".vtt", ".ass", ".ssa", ".sub", ".idx",
+    ".jpg", ".jpeg", ".png", ".webp", ".tbn",
+)
 
 try:
     from sqlalchemy import BigInteger, DateTime, Integer, String, Text, delete, func, or_, select
@@ -246,11 +257,76 @@ class Pan123TaskDatabase:
         ).scalars().all()
         return [self._to_dict(r) for r in records]
 
+    @db_update
+    def fix_companion_records(self, db: Optional[Session] = None) -> int:
+        """
+        自动修正历史存量刮削伴生文件记录：
+        1. 剥离伴生文件上误绑定的 torrent_hash
+        2. 将伴生文件因「无对应 QB 种子」被误标为 CLEANED 的记录恢复为 COMPLETED 并清除误导文案
+        """
+        if db is None:
+            return 0
+        fixed = 0
+        try:
+            records = db.execute(select(Pan123Task)).scalars().all()
+            for task in records:
+                fname = str(task.file_name or task.target_path or "")
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in MODEL_SCRAPED_EXTENSIONS:
+                    changed = False
+                    if task.torrent_hash:
+                        task.torrent_hash = None
+                        changed = True
+                    err = str(task.error_msg or "")
+                    if "无对应 QB 种子" in err:
+                        task.error_msg = ""
+                        if task.status == "CLEANED" and (task.file_id or not os.path.exists(str(task.target_path or ""))):
+                            task.status = "COMPLETED"
+                        changed = True
+                    if changed:
+                        fixed += 1
+            if fixed > 0:
+                db.flush()
+        except Exception:
+            pass
+        return fixed
+
+    @staticmethod
+    def _apply_query_filters(stmt: Any, keyword: str = "", status: str = "", file_type: str = "all") -> Any:
+        """统一拼接 SQL 过滤条件 (支持正片/伴生类型、状态组、关键词模糊匹配)"""
+        ft = (file_type or "all").strip().lower()
+        if ft == "video":
+            stmt = stmt.where(or_(*(Pan123Task.file_name.ilike(f"%{ext}") for ext in MODEL_VIDEO_EXTENSIONS)))
+        elif ft == "companion":
+            stmt = stmt.where(or_(*(Pan123Task.file_name.ilike(f"%{ext}") for ext in MODEL_SCRAPED_EXTENSIONS)))
+
+        st = (status or "").strip().upper()
+        if st and st != "ALL":
+            if st == "PENDING_GROUP":
+                stmt = stmt.where(Pan123Task.status.in_(["PENDING", "UPLOADING", "RETRYING"]))
+            elif st == "COMPLETED_GROUP":
+                stmt = stmt.where(Pan123Task.status.in_(["COMPLETED", "CLEANED"]))
+            else:
+                stmt = stmt.where(Pan123Task.status == st)
+
+        if keyword and keyword.strip():
+            kw = f"%{keyword.strip()}%"
+            stmt = stmt.where(
+                or_(
+                    Pan123Task.file_name.ilike(kw),
+                    Pan123Task.target_path.ilike(kw),
+                    Pan123Task.error_msg.ilike(kw),
+                )
+            )
+        return stmt
+
     @db_query
-    def get_status_counts(self, db: Optional[Session] = None) -> dict[str, int]:
-        """聚合统计各状态任务数量"""
+    def get_status_counts(self, db: Optional[Session] = None, *, file_type: str = "all") -> dict[str, int]:
+        """聚合统计各状态任务数量及正片/伴生分类数量"""
         counts = {
             "TOTAL": 0,
+            "VIDEO_TOTAL": 0,
+            "COMPANION_TOTAL": 0,
             "PENDING": 0,
             "UPLOADING": 0,
             "RETRYING": 0,
@@ -261,16 +337,29 @@ class Pan123TaskDatabase:
         if db is None:
             return counts
         try:
-            rows = db.execute(
-                select(Pan123Task.status, func.count(Pan123Task.id)).group_by(Pan123Task.status)
-            ).all()
+            # 1. 统计正片与伴生总数
+            all_rows = db.execute(select(Pan123Task.file_name, Pan123Task.status)).all()
+            ft = (file_type or "all").strip().lower()
             total = 0
-            for st, cnt in rows:
-                c = int(cnt or 0)
-                total += c
+            v_total = 0
+            c_total = 0
+            for fname, st in all_rows:
+                ext = os.path.splitext(str(fname or ""))[1].lower()
+                is_vid = ext in MODEL_VIDEO_EXTENSIONS
+                if is_vid:
+                    v_total += 1
+                else:
+                    c_total += 1
+                if ft == "video" and not is_vid:
+                    continue
+                if ft == "companion" and is_vid:
+                    continue
+                total += 1
                 st_key = str(st or "").upper()
-                counts[st_key] = counts.get(st_key, 0) + c
+                counts[st_key] = counts.get(st_key, 0) + 1
             counts["TOTAL"] = total
+            counts["VIDEO_TOTAL"] = v_total
+            counts["COMPANION_TOTAL"] = c_total
         except Exception:
             pass
         return counts
@@ -282,23 +371,14 @@ class Pan123TaskDatabase:
         *,
         keyword: str = "",
         status: str = "",
+        file_type: str = "all",
     ) -> int:
         """按条件统计任务总数"""
         if db is None:
             return 0
         try:
             stmt = select(func.count(Pan123Task.id))
-            if status:
-                stmt = stmt.where(Pan123Task.status == status.strip().upper())
-            if keyword:
-                kw = f"%{keyword.strip()}%"
-                stmt = stmt.where(
-                    or_(
-                        Pan123Task.file_name.ilike(kw),
-                        Pan123Task.target_path.ilike(kw),
-                        Pan123Task.error_msg.ilike(kw),
-                    )
-                )
+            stmt = self._apply_query_filters(stmt, keyword=keyword, status=status, file_type=file_type)
             return int(db.execute(stmt).scalar() or 0)
         except Exception:
             return 0
@@ -312,23 +392,14 @@ class Pan123TaskDatabase:
         offset: int = 0,
         keyword: str = "",
         status: str = "",
+        file_type: str = "all",
     ) -> list[dict]:
         """分页、模糊检索任务列表（按更新时间与ID倒序）"""
         if db is None:
             return []
         try:
             stmt = select(Pan123Task)
-            if status:
-                stmt = stmt.where(Pan123Task.status == status.strip().upper())
-            if keyword:
-                kw = f"%{keyword.strip()}%"
-                stmt = stmt.where(
-                    or_(
-                        Pan123Task.file_name.ilike(kw),
-                        Pan123Task.target_path.ilike(kw),
-                        Pan123Task.error_msg.ilike(kw),
-                    )
-                )
+            stmt = self._apply_query_filters(stmt, keyword=keyword, status=status, file_type=file_type)
             stmt = stmt.order_by(Pan123Task.updated_at.desc(), Pan123Task.id.desc()).offset(max(0, int(offset))).limit(max(1, int(limit)))
             records = db.execute(stmt).scalars().all()
             return [self._to_dict(r) for r in records]

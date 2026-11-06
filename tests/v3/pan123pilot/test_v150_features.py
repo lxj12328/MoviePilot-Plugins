@@ -188,8 +188,8 @@ class TestV150Features(unittest.TestCase):
             if os.path.exists(nfo_path):
                 os.remove(nfo_path)
 
-    def test_get_page_renders_vtable_and_expansion_panels(self):
-        """验证 Pan123Pilot.get_page() 渲染统计卡片、VTable 数据行及 VExpansionPanels 分页"""
+    def test_get_page_renders_interactive_pagination_and_filters(self):
+        """验证 Pan123Pilot.get_page() 渲染统计卡片、VTable 数据行及交互式分页控件（首页/上一页/页码/下一页/末页）"""
         plugin = Pan123Pilot()
         mock_db = MagicMock()
         mock_db.get_status_counts.return_value = {
@@ -201,6 +201,7 @@ class TestV150Features(unittest.TestCase):
             "RETRYING": 1,
             "FAILED": 0,
         }
+        mock_db.count_tasks.return_value = 25
         fake_records = [
             {
                 "id": i,
@@ -215,7 +216,7 @@ class TestV150Features(unittest.TestCase):
                 "error_msg": "",
                 "updated_at": "2026-11-06 22:00:00",
             }
-            for i in range(1, 26)
+            for i in range(1, 16)
         ]
         mock_db.list_tasks_paginated.return_value = fake_records
         plugin.db_helper = mock_db
@@ -226,13 +227,69 @@ class TestV150Features(unittest.TestCase):
         self.assertIsInstance(page, list)
         page_str = str(page)
         self.assertIn("VTable", page_str)
-        self.assertIn("VExpansionPanels", page_str)
+        self.assertIn("⏮ 首页", page_str)
+        self.assertIn("◀ 上一页", page_str)
+        self.assertIn("下一页 ▶", page_str)
+        self.assertIn("末页 ⏭", page_str)
+        self.assertIn("plugin/Pan123Pilot/ui_page", page_str)
         self.assertIn("庆余年.S02E01.2160p.mkv", page_str)
-        self.assertIn("庆余年.S02E25.2160p.mkv", page_str)
+        self.assertIn("庆余年.S02E15.2160p.mkv", page_str)
         self.assertIn("已秒传", page_str)
 
+        # 测试点击跳转第 2 页
+        res = plugin._api_ui_page(page=2)
+        self.assertEqual(res["code"], 0)
+        self.assertEqual(plugin._ui_page, 2)
+
+        # 测试切换每页条数/筛选类型（会自动重置页码为 1）
+        res2 = plugin._api_ui_page(page_size=30, file_type="companion", status="COMPLETED_GROUP")
+        self.assertEqual(res2["code"], 0)
+        self.assertEqual(plugin._ui_page, 1)
+        self.assertEqual(plugin._ui_page_size, 30)
+        self.assertEqual(plugin._ui_file_type, "companion")
+        self.assertEqual(plugin._ui_status, "COMPLETED_GROUP")
+
+    def test_companion_files_never_trigger_qb_cleanup_or_bind_hash(self):
+        """验证刮削伴生文件 (.nfo/.jpg/.png/.srt) 不关联 qB 种子 Hash，也不触发 qB 自动清理"""
+        mock_db = MagicMock()
+        mock_db.list_tasks_by_status.return_value = [
+            {
+                "id": 101,
+                "file_name": "tvshow.nfo",
+                "target_path": "/video/tv/Small Town Remedy (2026)/tvshow.nfo",
+                "torrent_hash": None,
+                "status": "COMPLETED",
+            },
+            {
+                "id": 102,
+                "file_name": "poster.jpg",
+                "target_path": "/video/tv/Small Town Remedy (2026)/poster.jpg",
+                "torrent_hash": "hash_should_be_ignored",
+                "status": "COMPLETED",
+            },
+        ]
+        mock_qb = MagicMock()
+        mock_qb.is_configured.return_value = True
+
+        scheduler = TaskScheduler(
+            db_helper=mock_db,
+            client=MagicMock(),
+            qb_helper=mock_qb,
+            tags_config={},
+        )
+        scheduler.cleanup_completed_tasks(
+            min_seed_time_hours=1.0,
+            min_ratio=1.0,
+            delete_torrent_file=True,
+            delete_hardlink_file=True,
+            emergency_free_space_gb=0.0,
+        )
+        # 刮削伴生文件必须全部跳过，绝不执行清理或标记“无对应 QB 种子”
+        mock_db.update_task_status.assert_not_called()
+        mock_qb.delete_torrent.assert_not_called()
+
     def test_real_sqlite_database_pagination_counts_and_purge(self):
-        """使用真实 SQLite + SQLAlchemy 验证状态聚合、分页模糊检索与超期清理"""
+        """使用真实 SQLite + SQLAlchemy 验证状态聚合、文件类型过滤、旧数据修复与分页模糊检索"""
         try:
             from sqlalchemy import create_engine
             from sqlalchemy.orm import sessionmaker
@@ -254,8 +311,8 @@ class TestV150Features(unittest.TestCase):
             )
             tid2 = db.add_or_update_task(
                 db=session,
-                target_path="/video/movies/流浪地球2.nfo",
-                file_name="流浪地球2.nfo",
+                target_path="/video/movies/poster.jpg",
+                file_name="poster.jpg",
                 file_size=4096,
                 torrent_hash="h1",
             )
@@ -266,17 +323,41 @@ class TestV150Features(unittest.TestCase):
                 file_id=123456,
                 parent_file_id=888,
             )
+            # 模拟 v1.5.0 误标为 CLEANED + 无对应 QB 种子的伴生文件记录
+            db.update_task_status(
+                db=session,
+                task_id=tid2,
+                status="CLEANED",
+                file_id=654321,
+                error_msg="已完成自动清理: 无对应 QB 种子",
+            )
             session.commit()
 
-            counts = db.get_status_counts(db=session)
+            # 执行历史脏数据自动修复
+            fixed = db.fix_companion_records(db=session)
+            self.assertGreaterEqual(fixed, 1)
+
+            # 验证修复后 poster.jpg 恢复为 COMPLETED、清空了 error_msg 和 torrent_hash
+            companion_items = db.list_tasks_paginated(db=session, file_type="companion")
+            self.assertEqual(len(companion_items), 1)
+            self.assertEqual(companion_items[0]["file_name"], "poster.jpg")
+            self.assertEqual(companion_items[0]["status"], "COMPLETED")
+            self.assertEqual(companion_items[0]["error_msg"], "")
+            self.assertIsNone(companion_items[0]["torrent_hash"])
+
+            # 验证按正片视频筛选
+            video_counts = db.get_status_counts(db=session, file_type="video")
+            self.assertEqual(video_counts["TOTAL"], 1)
+            self.assertEqual(video_counts["COMPLETED"], 1)
+
+            counts = db.get_status_counts(db=session, file_type="all")
             self.assertEqual(counts["TOTAL"], 2)
-            self.assertEqual(counts["COMPLETED"], 1)
-            self.assertEqual(counts["PENDING"], 1)
+            self.assertEqual(counts["COMPLETED"], 2)
 
-            self.assertEqual(db.count_tasks(db=session, keyword="流浪地球2"), 2)
-            self.assertEqual(db.count_tasks(db=session, status="COMPLETED"), 1)
+            self.assertEqual(db.count_tasks(db=session, keyword="流浪地球2"), 1)
+            self.assertEqual(db.count_tasks(db=session, status="COMPLETED", file_type="video"), 1)
 
-            page_items = db.list_tasks_paginated(db=session, limit=1, offset=0, status="COMPLETED")
+            page_items = db.list_tasks_paginated(db=session, limit=1, offset=0, status="COMPLETED", file_type="video")
             self.assertEqual(len(page_items), 1)
             self.assertEqual(page_items[0]["file_name"], "流浪地球2.mkv")
             self.assertEqual(page_items[0]["file_id"], 123456)

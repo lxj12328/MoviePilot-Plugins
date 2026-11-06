@@ -210,7 +210,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -238,6 +238,11 @@ class Pan123Pilot(_PluginBase):
     _max_retry_count: int = 10
     _enable_real_upload: bool = True
     _retention_days: int = 0
+
+    _ui_page: int = 1
+    _ui_page_size: int = 15
+    _ui_file_type: str = "video"
+    _ui_status: str = "ALL"
 
     _downloader_select: str = "manual"
     _qb_host: str = ""
@@ -420,6 +425,12 @@ class Pan123Pilot(_PluginBase):
         # 2. 基础组件初始化（即使未启用也能安全响应页面与状态查询）
         self.db_helper = Pan123TaskDatabase()
         self.db_helper.ensure_table()
+        try:
+            fixed_companions = self.db_helper.fix_companion_records()
+            if fixed_companions > 0:
+                logger.info(f"Pan123Pilot 已自动修正 {fixed_companions} 条刮削伴生文件的状态与种子关联记录")
+        except Exception:
+            pass
         if self._retention_days > 0:
             try:
                 purged = self.db_helper.purge_expired_tasks(days=self._retention_days)
@@ -687,6 +698,13 @@ class Pan123Pilot(_PluginBase):
                 "summary": "分页与关键词检索123云盘秒传/同步任务清单",
             },
             {
+                "path": "/ui_page",
+                "endpoint": self._api_ui_page,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "切换插件详情页分页页码、每页条数与类型/状态筛选条件",
+            },
+            {
                 "path": "/purge",
                 "endpoint": self._api_purge_records,
                 "methods": ["POST", "GET"],
@@ -738,10 +756,11 @@ class Pan123Pilot(_PluginBase):
         self,
         keyword: str = "",
         status: str = "",
+        file_type: str = "all",
         page: int = 1,
         page_size: int = 20,
     ) -> dict:
-        """支持关键词、状态过滤与分页的同步任务清单接口"""
+        """支持关键词、文件类型、状态过滤与分页的同步任务清单接口"""
         if not self.db_helper:
             return {"code": 0, "message": "ok", "total": 0, "page": 1, "page_size": 20, "data": []}
         try:
@@ -753,15 +772,65 @@ class Pan123Pilot(_PluginBase):
         except (ValueError, TypeError):
             ps = 20
         offset = (p - 1) * ps
-        total = self.db_helper.count_tasks(keyword=keyword, status=status)
-        items = self.db_helper.list_tasks_paginated(limit=ps, offset=offset, keyword=keyword, status=status)
+        total = self.db_helper.count_tasks(keyword=keyword, status=status, file_type=file_type)
+        items = self.db_helper.list_tasks_paginated(
+            limit=ps, offset=offset, keyword=keyword, status=status, file_type=file_type
+        )
         return {
             "code": 0,
             "message": "ok",
             "total": total,
             "page": p,
             "page_size": ps,
+            "file_type": file_type,
             "data": items,
+        }
+
+    def _api_ui_page(
+        self,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
+        file_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> dict:
+        """响应详情页分页器与筛选栏点击事件，更新视图状态并触发前端自动重绘"""
+        reset_to_first = False
+        if file_type is not None:
+            ft = str(file_type).strip().lower()
+            if ft in ("video", "companion", "all") and ft != self._ui_file_type:
+                self._ui_file_type = ft
+                reset_to_first = True
+
+        if status is not None:
+            st = str(status).strip().upper()
+            if st != self._ui_status:
+                self._ui_status = st
+                reset_to_first = True
+
+        if page_size is not None:
+            try:
+                ps = min(100, max(5, int(page_size)))
+                if ps != self._ui_page_size:
+                    self._ui_page_size = ps
+                    reset_to_first = True
+            except (ValueError, TypeError):
+                pass
+
+        if page is not None and not reset_to_first:
+            try:
+                self._ui_page = max(1, int(page))
+            except (ValueError, TypeError):
+                self._ui_page = 1
+        elif reset_to_first:
+            self._ui_page = 1
+
+        return {
+            "code": 0,
+            "message": "ok",
+            "page": self._ui_page,
+            "page_size": self._ui_page_size,
+            "file_type": self._ui_file_type,
+            "status": self._ui_status,
         }
 
     def _api_purge_records(self, days: Optional[int] = None) -> dict:
@@ -1584,11 +1653,69 @@ class Pan123Pilot(_PluginBase):
         }
         return form, defaults
 
+    def _build_ui_page_btn(
+        self,
+        text: str,
+        *,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
+        file_type: Optional[str] = None,
+        status: Optional[str] = None,
+        color: str = "default",
+        variant: str = "outlined",
+        size: str = "small",
+        disabled: bool = False,
+        min_width: Optional[str] = None,
+    ) -> dict:
+        """构建绑定 /ui_page 事件的交互按钮，点击后自动更新视图状态并触发详情页重绘"""
+        plugin_id = self.__class__.__name__
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = int(page)
+        if page_size is not None:
+            params["page_size"] = int(page_size)
+        if file_type is not None:
+            params["file_type"] = str(file_type)
+        if status is not None:
+            params["status"] = str(status)
+
+        props: dict[str, Any] = {
+            "size": size,
+            "variant": variant,
+            "color": color,
+            "disabled": disabled,
+            "class": "ma-1",
+            "text": text,
+        }
+        if min_width:
+            props["style"] = f"min-width: {min_width};"
+
+        btn: dict[str, Any] = {
+            "component": "VBtn",
+            "props": props,
+            "text": text,
+        }
+        if not disabled:
+            btn["events"] = {
+                "click": {
+                    "api": f"plugin/{plugin_id}/ui_page",
+                    "method": "get",
+                    "params": params,
+                }
+            }
+        return btn
+
     def get_page(self) -> list[dict]:
-        """返回插件详情页展示组件：状态统计看板 + 分页秒传/同步媒体数据清单"""
+        """返回插件详情页展示组件：状态统计看板 + 类型/状态筛选工具栏 + 标准交互式分页数据表"""
         if not self.db_helper:
             self.db_helper = Pan123TaskDatabase()
             self.db_helper.ensure_table()
+
+        if hasattr(self.db_helper, "fix_companion_records"):
+            try:
+                self.db_helper.fix_companion_records()
+            except Exception:
+                pass
 
         auth_info = getattr(self, "_auth_status_msg", "待检测")
         is_auth_ok = "已连接" in auth_info
@@ -1598,18 +1725,74 @@ class Pan123Pilot(_PluginBase):
         dl_text = "手动模式" if self._downloader_select == "manual" else f"系统下载器 ({self._qb_host or '已绑定'})"
         retention_text = "永久保留" if int(self._retention_days or 0) <= 0 else f"保留 {self._retention_days} 天"
 
-        status_counts = self.db_helper.get_status_counts() if self.db_helper else {}
-        records = self.db_helper.list_tasks_paginated(limit=500, offset=0) if self.db_helper else []
+        cur_file_type = str(getattr(self, "_ui_file_type", "video") or "video").lower()
+        cur_status = str(getattr(self, "_ui_status", "ALL") or "ALL").upper()
+        page_size = max(5, int(getattr(self, "_ui_page_size", 15) or 15))
 
-        total_count = status_counts.get("TOTAL", len(records))
-        completed_count = status_counts.get("COMPLETED", 0) + status_counts.get("CLEANED", 0)
+        try:
+            status_counts = self.db_helper.get_status_counts(file_type=cur_file_type) if self.db_helper else {}
+        except TypeError:
+            status_counts = self.db_helper.get_status_counts() if self.db_helper else {}
+
+        total_count = int(status_counts.get("TOTAL", 0) or 0)
+        video_total = int(status_counts.get("VIDEO_TOTAL", total_count) or 0)
+        companion_total = int(status_counts.get("COMPANION_TOTAL", 0) or 0)
+        all_files_total = video_total + companion_total if (video_total or companion_total) else total_count
+
+        completed_only = int(status_counts.get("COMPLETED", 0) or 0)
+        cleaned_count = int(status_counts.get("CLEANED", 0) or 0)
+        completed_count = completed_only + cleaned_count
         pending_count = (
-            status_counts.get("PENDING", 0)
-            + status_counts.get("UPLOADING", 0)
-            + status_counts.get("RETRYING", 0)
+            int(status_counts.get("PENDING", 0) or 0)
+            + int(status_counts.get("UPLOADING", 0) or 0)
+            + int(status_counts.get("RETRYING", 0) or 0)
         )
-        cleaned_count = status_counts.get("CLEANED", 0)
-        failed_count = status_counts.get("FAILED", 0)
+        failed_count = int(status_counts.get("FAILED", 0) or 0)
+
+        # 计算当前筛选条件下的总记录数与当前页切片
+        filtered_total = 0
+        if self.db_helper and hasattr(self.db_helper, "count_tasks"):
+            try:
+                cnt_val = self.db_helper.count_tasks(status=cur_status, file_type=cur_file_type)
+                if isinstance(cnt_val, int):
+                    filtered_total = cnt_val
+            except TypeError:
+                try:
+                    cnt_val = self.db_helper.count_tasks(status=cur_status)
+                    if isinstance(cnt_val, int):
+                        filtered_total = cnt_val
+                except Exception:
+                    pass
+
+        total_pages_est = max(1, (max(filtered_total, total_count) + page_size - 1) // page_size)
+        cur_page = min(max(1, int(getattr(self, "_ui_page", 1) or 1)), total_pages_est)
+        offset = (cur_page - 1) * page_size
+
+        raw_records: list[dict] = []
+        if self.db_helper:
+            try:
+                raw_records = self.db_helper.list_tasks_paginated(
+                    limit=page_size,
+                    offset=offset,
+                    status=cur_status,
+                    file_type=cur_file_type,
+                )
+            except TypeError:
+                raw_records = self.db_helper.list_tasks_paginated(limit=page_size, offset=offset)
+
+        if filtered_total <= 0 and raw_records:
+            filtered_total = max(total_count, len(raw_records))
+
+        total_pages = max(1, (filtered_total + page_size - 1) // page_size)
+        if cur_page > total_pages:
+            cur_page = total_pages
+            offset = (cur_page - 1) * page_size
+
+        # 兼容单测中 mock 一次性返回超过 page_size 条记录的情况
+        if len(raw_records) > page_size:
+            page_records = raw_records[offset:offset + page_size]
+        else:
+            page_records = raw_records
 
         status_map = {
             "COMPLETED": ("已秒传", "success"),
@@ -1622,13 +1805,13 @@ class Pan123Pilot(_PluginBase):
 
         def _build_task_table(rows_slice: list[dict]) -> dict:
             tr_items = []
-            for r in rows_slice:
+            for idx, r in enumerate(rows_slice, start=offset + 1):
                 fname = str(r.get("file_name") or os.path.basename(str(r.get("target_path") or "")) or "-")
                 target_path = str(r.get("target_path") or "")
                 ext = os.path.splitext(fname)[1].lower()
-                is_video = ext in VIDEO_EXTENSIONS
-                type_label = "正片视频" if is_video else "刮削伴生"
-                type_color = "primary" if is_video else "purple"
+                is_companion = ext in SCRAPED_EXTENSIONS
+                type_label = "刮削伴生" if is_companion else "正片视频"
+                type_color = "purple" if is_companion else "primary"
 
                 rel_dir = ""
                 if target_path:
@@ -1642,6 +1825,13 @@ class Pan123Pilot(_PluginBase):
                 fsize_str = TaskScheduler.format_size(fsize_bytes) if fsize_bytes > 0 else "-"
 
                 st_raw = str(r.get("status") or "PENDING").upper()
+                err_msg = str(r.get("error_msg") or "").strip()
+                # 兜底防护：若伴生文件历史记录仍残留「无对应 QB 种子」，界面直接净化展示为「已秒传」
+                if is_companion and "无对应 QB 种子" in err_msg:
+                    err_msg = ""
+                    if st_raw == "CLEANED":
+                        st_raw = "COMPLETED"
+
                 st_label, st_color = status_map.get(st_raw, (st_raw, "default"))
                 if st_raw == "RETRYING":
                     st_label = f"待重试 ({r.get('retry_count', 0)}/{r.get('max_retry', 10)})"
@@ -1649,7 +1839,6 @@ class Pan123Pilot(_PluginBase):
                 file_id_val = r.get("file_id")
                 parent_id_val = r.get("parent_file_id") or 0
                 cloud_info = f"FileID: {file_id_val}" if file_id_val else f"目录ID: {parent_id_val}"
-                err_msg = str(r.get("error_msg") or "").strip()
                 sub_line = f"📁 {rel_dir}" if rel_dir and rel_dir != "." else ""
                 if err_msg:
                     sub_line = f"{sub_line} | {err_msg}" if sub_line else err_msg
@@ -1658,6 +1847,11 @@ class Pan123Pilot(_PluginBase):
                     {
                         "component": "tr",
                         "content": [
+                            {
+                                "component": "td",
+                                "props": {"class": "text-caption text-medium-emphasis", "style": "width: 48px;"},
+                                "text": f"#{idx}",
+                            },
                             {
                                 "component": "td",
                                 "props": {"class": "py-2"},
@@ -1690,7 +1884,7 @@ class Pan123Pilot(_PluginBase):
                             },
                             {
                                 "component": "td",
-                                "props": {"class": "text-body-2"},
+                                "props": {"class": "text-body-2 font-weight-medium"},
                                 "text": fsize_str,
                             },
                             {
@@ -1731,6 +1925,7 @@ class Pan123Pilot(_PluginBase):
                             {
                                 "component": "tr",
                                 "content": [
+                                    {"component": "th", "text": "序号"},
                                     {"component": "th", "text": "文件名称 / 相对路径"},
                                     {"component": "th", "text": "类型"},
                                     {"component": "th", "text": "文件大小"},
@@ -1748,53 +1943,248 @@ class Pan123Pilot(_PluginBase):
                 ],
             }
 
-        page_size = 20
-        table_sections: list[dict] = []
-        if not records:
+        # 1. 构建顶部文件类型与状态筛选工具栏
+        type_filter_buttons = [
+            self._build_ui_page_btn(
+                f"🎬 正片视频 ({video_total})",
+                file_type="video",
+                color="primary" if cur_file_type == "video" else "default",
+                variant="flat" if cur_file_type == "video" else "tonal",
+            ),
+            self._build_ui_page_btn(
+                f"📎 刮削伴生 ({companion_total})",
+                file_type="companion",
+                color="purple" if cur_file_type == "companion" else "default",
+                variant="flat" if cur_file_type == "companion" else "tonal",
+            ),
+            self._build_ui_page_btn(
+                f"🗂 全部文件 ({all_files_total})",
+                file_type="all",
+                color="secondary" if cur_file_type == "all" else "default",
+                variant="flat" if cur_file_type == "all" else "tonal",
+            ),
+        ]
+
+        status_filter_buttons = [
+            self._build_ui_page_btn(
+                f"全部状态 ({total_count})",
+                status="ALL",
+                color="primary" if cur_status == "ALL" else "default",
+                variant="flat" if cur_status == "ALL" else "outlined",
+                size="x-small",
+            ),
+            self._build_ui_page_btn(
+                f"✅ 已秒传 ({completed_only})",
+                status="COMPLETED",
+                color="success" if cur_status == "COMPLETED" else "default",
+                variant="flat" if cur_status == "COMPLETED" else "outlined",
+                size="x-small",
+            ),
+            self._build_ui_page_btn(
+                f"⏳ 排队/待重试 ({pending_count})",
+                status="PENDING_GROUP",
+                color="warning" if cur_status == "PENDING_GROUP" else "default",
+                variant="flat" if cur_status == "PENDING_GROUP" else "outlined",
+                size="x-small",
+            ),
+            self._build_ui_page_btn(
+                f"🧹 已达标清理 ({cleaned_count})",
+                status="CLEANED",
+                color="teal" if cur_status == "CLEANED" else "default",
+                variant="flat" if cur_status == "CLEANED" else "outlined",
+                size="x-small",
+            ),
+            self._build_ui_page_btn(
+                f"❌ 失败 ({failed_count})",
+                status="FAILED",
+                color="error" if cur_status == "FAILED" else "default",
+                variant="flat" if cur_status == "FAILED" else "outlined",
+                size="x-small",
+            ),
+        ]
+
+        page_size_buttons = [
+            self._build_ui_page_btn(
+                f"{ps}条/页",
+                page_size=ps,
+                color="primary" if page_size == ps else "default",
+                variant="tonal" if page_size == ps else "text",
+                size="x-small",
+            )
+            for ps in (15, 30, 50)
+        ]
+
+        filter_toolbar = {
+            "component": "div",
+            "props": {"class": "px-4 py-2 bg-surface-light"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center justify-space-between mb-1"},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap align-center"},
+                            "content": type_filter_buttons,
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap align-center"},
+                            "content": page_size_buttons,
+                        },
+                    ],
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center"},
+                    "content": status_filter_buttons,
+                },
+            ],
+        }
+
+        # 2. 构建底部现代化分页导航栏（首页 / 上一页 / 数字页码滑动窗口 / 下一页 / 末页 / 跨页快跳）
+        start_num = offset + 1 if page_records else 0
+        end_num = offset + len(page_records)
+
+        nav_buttons: list[dict] = [
+            self._build_ui_page_btn(
+                "⏮ 首页",
+                page=1,
+                disabled=(cur_page <= 1),
+                variant="tonal",
+            ),
+        ]
+        if total_pages > 5:
+            nav_buttons.append(
+                self._build_ui_page_btn(
+                    "-5页",
+                    page=max(1, cur_page - 5),
+                    disabled=(cur_page <= 1),
+                    variant="outlined",
+                )
+            )
+        nav_buttons.append(
+            self._build_ui_page_btn(
+                "◀ 上一页",
+                page=max(1, cur_page - 1),
+                disabled=(cur_page <= 1),
+                variant="tonal",
+                color="primary" if cur_page > 1 else "default",
+            )
+        )
+
+        # 计算居中页码按钮窗口 (最多展示 7 个连续页码，附带首尾页跳转)
+        win_radius = 2
+        p_start = max(1, cur_page - win_radius)
+        p_end = min(total_pages, cur_page + win_radius)
+        if p_end - p_start < win_radius * 2:
+            if p_start == 1:
+                p_end = min(total_pages, p_start + win_radius * 2)
+            elif p_end == total_pages:
+                p_start = max(1, p_end - win_radius * 2)
+
+        if p_start > 1:
+            nav_buttons.append(
+                self._build_ui_page_btn("1", page=1, variant="outlined", min_width="36px")
+            )
+            if p_start > 2:
+                nav_buttons.append(
+                    {
+                        "component": "span",
+                        "props": {"class": "px-1 text-caption text-medium-emphasis"},
+                        "text": "...",
+                    }
+                )
+
+        for p_num in range(p_start, p_end + 1):
+            is_cur = p_num == cur_page
+            nav_buttons.append(
+                self._build_ui_page_btn(
+                    str(p_num),
+                    page=p_num,
+                    color="primary" if is_cur else "default",
+                    variant="flat" if is_cur else "outlined",
+                    min_width="36px",
+                )
+            )
+
+        if p_end < total_pages:
+            if p_end < total_pages - 1:
+                nav_buttons.append(
+                    {
+                        "component": "span",
+                        "props": {"class": "px-1 text-caption text-medium-emphasis"},
+                        "text": "...",
+                    }
+                )
+            nav_buttons.append(
+                self._build_ui_page_btn(str(total_pages), page=total_pages, variant="outlined", min_width="36px")
+            )
+
+        nav_buttons.append(
+            self._build_ui_page_btn(
+                "下一页 ▶",
+                page=min(total_pages, cur_page + 1),
+                disabled=(cur_page >= total_pages),
+                variant="tonal",
+                color="primary" if cur_page < total_pages else "default",
+            )
+        )
+        if total_pages > 5:
+            nav_buttons.append(
+                self._build_ui_page_btn(
+                    "+5页",
+                    page=min(total_pages, cur_page + 5),
+                    disabled=(cur_page >= total_pages),
+                    variant="outlined",
+                )
+            )
+        nav_buttons.append(
+            self._build_ui_page_btn(
+                "末页 ⏭",
+                page=total_pages,
+                disabled=(cur_page >= total_pages),
+                variant="tonal",
+            )
+        )
+
+        pagination_footer = {
+            "component": "div",
+            "props": {"class": "d-flex flex-wrap align-center justify-space-between px-4 py-3"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis my-1"},
+                    "text": f"显示第 {start_num} - {end_num} 条 / 共 {filtered_total} 条记录 · 当前第 {cur_page} / {total_pages} 页",
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center"},
+                    "content": nav_buttons,
+                },
+            ],
+        }
+
+        table_sections: list[dict] = [
+            filter_toolbar,
+            {"component": "VDivider"},
+        ]
+        if not page_records:
             table_sections.append(
                 {
                     "component": "VAlert",
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "class": "ma-3",
-                        "text": "暂无秒传/同步媒体记录。当 MoviePilot 完成影视刮削整理或开启「扫描历史媒体库」后，秒传记录将在此实时展示。",
+                        "class": "ma-4",
+                        "text": "当前筛选条件下暂无媒体记录。可点击上方「🎬 正片视频 / 📎 刮削伴生 / 🗂 全部文件」或状态标签切换视图。",
                     },
                 }
             )
         else:
-            first_page = records[:page_size]
-            table_sections.append(_build_task_table(first_page))
-
-            if len(records) > page_size:
-                panels = []
-                total_pages = (len(records) + page_size - 1) // page_size
-                for p_idx in range(2, total_pages + 1):
-                    start_i = (p_idx - 1) * page_size
-                    end_i = min(p_idx * page_size, len(records))
-                    chunk = records[start_i:end_i]
-                    panels.append(
-                        {
-                            "component": "VExpansionPanel",
-                            "content": [
-                                {
-                                    "component": "VExpansionPanelTitle",
-                                    "text": f"📄 第 {p_idx} 页 (第 {start_i + 1} - {end_i} 条，点击展开)",
-                                },
-                                {
-                                    "component": "VExpansionPanelText",
-                                    "content": [_build_task_table(chunk)],
-                                },
-                            ],
-                        }
-                    )
-                table_sections.append(
-                    {
-                        "component": "VExpansionPanels",
-                        "props": {"variant": "accordion", "class": "mt-2"},
-                        "content": panels,
-                    }
-                )
+            table_sections.append(_build_task_table(page_records))
+            table_sections.append({"component": "VDivider"})
+            table_sections.append(pagination_footer)
 
         return [
             {
@@ -1831,12 +2221,12 @@ class Pan123Pilot(_PluginBase):
                                             {
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
-                                                "text": "累计媒体任务",
+                                                "text": "正片视频 / 全部任务",
                                             },
                                             {
                                                 "component": "div",
                                                 "props": {"class": "text-h6 font-weight-bold"},
-                                                "text": str(total_count),
+                                                "text": f"{video_total} / {all_files_total}",
                                             },
                                         ],
                                     }
@@ -1915,7 +2305,7 @@ class Pan123Pilot(_PluginBase):
                                             {
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
-                                                "text": "已达标清理 / 失败",
+                                                "text": "正片达标清理 / 失败",
                                             },
                                             {
                                                 "component": "div",
@@ -1940,18 +2330,19 @@ class Pan123Pilot(_PluginBase):
                             {
                                 "component": "VCardTitle",
                                 "props": {"class": "text-subtitle-1 font-weight-bold"},
-                                "text": f"🎬 已秒传 / 同步媒体数据清单 (共 {total_count} 条)",
+                                "text": f"🎬 已秒传 / 同步媒体数据清单 (当前筛选 {filtered_total} 条)",
                             },
                             {
                                 "component": "VCardSubtitle",
                                 "props": {"class": "text-caption"},
                                 "text": (
-                                    f"按更新时间倒序排列，每页 {page_size} 条（第 2 页起点击底部折叠面板翻页，最多展示最近 500 条）；"
-                                    "支持调用 /api/v1/plugin/Pan123Pilot/records?keyword=&status=&page=1&page_size=20 检索"
+                                    f"默认展示正片视频（已自动过滤刮削伴生 NFO/海报干扰，点击下方按钮可随时切换）；"
+                                    f"当前第 {cur_page} / {total_pages} 页，每页 {page_size} 条"
                                 ),
                             },
                         ],
                     },
+                    {"component": "VDivider"},
                     {
                         "component": "VCardText",
                         "props": {"class": "pa-0"},
@@ -2217,16 +2608,25 @@ def _record_transferred_target(
             if f_size == 0:
                 continue
 
-            cur_hash = torrent_hash
-            cur_src = source_path
+            ext = os.path.splitext(fname)[1].lower()
+            is_companion = ext in SCRAPED_EXTENSIONS
 
-            # 1. 若无 hash，尝试从 MoviePilot 整理历史库查询
-            if not cur_hash:
-                cur_hash, cur_src = _query_transfer_history(file_full)
+            if is_companion:
+                # 刮削伴生文件 (.nfo, .jpg, .png, .srt 等) 仅用于上传到 123 云盘，
+                # 严禁关联 qBittorrent 种子 Hash、严禁打标、严禁参与 qB 做种清理！
+                cur_hash = None
+                cur_src = None
+            else:
+                cur_hash = torrent_hash
+                cur_src = source_path
 
-            # 2. 若仍未匹配到 hash，尝试从 qBittorrent 逆向搜寻
-            if not cur_hash and _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
-                cur_hash = _plugin_instance.qb_helper.match_torrent_by_path(file_full, torrents=qb_torrents)
+                # 1. 若无 hash，尝试从 MoviePilot 整理历史库查询
+                if not cur_hash:
+                    cur_hash, cur_src = _query_transfer_history(file_full)
+
+                # 2. 若仍未匹配到 hash，尝试从 qBittorrent 逆向搜寻
+                if not cur_hash and _plugin_instance and _plugin_instance.qb_helper and _plugin_instance.qb_helper.is_configured():
+                    cur_hash = _plugin_instance.qb_helper.match_torrent_by_path(file_full, torrents=qb_torrents)
 
             # 3. 录入或更新任务
             tid = db.add_or_update_task(
@@ -2238,13 +2638,19 @@ def _record_transferred_target(
                 force_reset=force_resync,
             )
             task_ids.append(tid)
-            logger.info(
-                f"Pan123Pilot 已录入媒体任务: {fname} (任务ID: {tid}, 关联种子: {cur_hash or '未关联'})"
-            )
+            if is_companion:
+                logger.info(
+                    f"Pan123Pilot 已录入刮削伴生文件任务: {fname} (任务ID: {tid})"
+                )
+            else:
+                logger.info(
+                    f"Pan123Pilot 已录入正片媒体任务: {fname} (任务ID: {tid}, 关联种子: {cur_hash or '未关联'})"
+                )
 
-            # 4. 联动 qBittorrent 打上“待处理”标签 (同一批次相同种子 Hash 仅打标一次，避免 API 洪水)
+            # 4. 仅正片视频联动 qBittorrent 打上“待处理”标签 (同一批次相同种子 Hash 仅打标一次)
             if (
-                cur_hash
+                not is_companion
+                and cur_hash
                 and cur_hash not in tagged_hashes
                 and _plugin_instance
                 and _plugin_instance.qb_helper
