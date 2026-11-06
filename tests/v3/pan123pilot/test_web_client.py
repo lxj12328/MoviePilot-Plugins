@@ -107,6 +107,87 @@ class TestPan123WebClient(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(dir_id, 2001)
 
+    def test_list_files_infolist_parsing(self):
+        client = Pan123WebClient(token="mock_token")
+        with patch.object(client, "check_token_validity", return_value=True):
+            with patch.object(client, "_http_get") as mock_get:
+                mock_get.return_value = (
+                    True,
+                    {
+                        "code": 0,
+                        "data": {
+                            "InfoList": [
+                                {"FileId": 12345, "FileName": "emby-TV", "Type": 1},
+                                {"FileId": 67890, "FileName": "movie.mkv", "Type": 0},
+                            ],
+                            "Next": "-1",
+                            "Total": 2,
+                        },
+                    },
+                    "ok",
+                )
+                ok, items, msg = client.list_files(parent_file_id=100)
+                self.assertTrue(ok)
+                self.assertEqual(len(items), 2)
+                self.assertEqual(items[0]["FileName"], "emby-TV")
+                # 验证调用包含了 /b/api/file/list/new 端点
+                called_url = mock_get.call_args[0][0]
+                self.assertIn("/b/api/file/list/new", called_url)
+                self.assertIn("driveId=0", called_url)
+                self.assertIn("parentFileId=100", called_url)
+
+    def test_mkdir_info_fileid_parsing(self):
+        client = Pan123WebClient(token="mock_token")
+        with patch.object(client, "check_token_validity", return_value=True):
+            with patch.object(client, "_http_post") as mock_post:
+                mock_post.return_value = (
+                    True,
+                    {
+                        "code": 0,
+                        "message": "成功",
+                        "data": {
+                            "Info": {
+                                "FileId": 987654,
+                                "FileName": "谷雨",
+                            }
+                        },
+                    },
+                    "ok",
+                )
+                ok, dir_id, msg = client.mkdir("谷雨", parent_file_id=12345)
+                self.assertTrue(ok)
+                self.assertEqual(dir_id, 987654)
+                # 验证 payload 包含 duplicate=2 及 event=newCreateFolder
+                payload = mock_post.call_args[0][1]
+                self.assertEqual(payload.get("duplicate"), 2)
+                self.assertEqual(payload.get("event"), "newCreateFolder")
+                self.assertEqual(payload.get("parentFileId"), 12345)
+
+    def test_dir_cascade_reuses_existing_folder_without_duplicate(self):
+        client = Pan123WebClient(token="mock_token")
+        with patch.object(client, "check_token_validity", return_value=True):
+            # 模拟第一层 emby-TV 已存在，第二层 谷雨 不存在需创建
+            def mock_list(parent_file_id=0):
+                if parent_file_id == 0:
+                    return True, [{"FileId": 1111, "FileName": "emby-TV", "Type": 1}], "ok"
+                elif parent_file_id == 1111:
+                    return True, [], "ok"
+                return True, [], "ok"
+
+            client.list_files = MagicMock(side_effect=mock_list)
+            client.mkdir = MagicMock(return_value=(True, 2222, "ok"))
+
+            ok, dir_id, msg = client.get_or_create_dir_by_path(
+                root_parent_id=0,
+                relative_dir_path="emby-TV/谷雨",
+            )
+            self.assertTrue(ok)
+            self.assertEqual(dir_id, 2222)
+            # emby-TV 已经存在，严禁对其调用 mkdir 产生 emby-TV(1)！
+            self.assertEqual(client.mkdir.call_count, 1)
+            self.assertEqual(client.mkdir.call_args[0][0], "谷雨")
+            self.assertEqual(client.mkdir.call_args[1].get("parent_file_id"), 1111)
+
 
     def test_token_cleaner(self):
         # 测试自动剔除双引号、单引号与 Bearer 前缀

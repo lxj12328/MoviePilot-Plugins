@@ -76,12 +76,17 @@ class TaskScheduler:
         if file_dir.startswith(norm_root):
             rel_dir = os.path.relpath(file_dir, norm_root)
             if rel_dir and rel_dir not in (".", "/", "\\"):
-                ok, dir_id, _ = self.client.get_or_create_dir_by_path(
+                ok, dir_id, err = self.client.get_or_create_dir_by_path(
                     root_parent_id=root_id,
                     relative_dir_path=rel_dir,
                 )
                 if ok and dir_id > 0:
+                    logger.info(f"Pan123Pilot 目录级联成功: 本地【{rel_dir}】-> 123云盘 ParentID: {dir_id}")
                     return dir_id
+                else:
+                    logger.error(
+                        f"Pan123Pilot 目录级联未完全命中: 本地【{rel_dir}】在 123 云盘递归创建/查找失败: {err}，将回退至根 ParentID: {root_id}"
+                    )
         return root_id
 
     def _trigger_symedia_notify(self, target_path: str, action: str = "create") -> None:

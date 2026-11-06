@@ -276,10 +276,11 @@ class Pan123WebClient:
         payload = {
             "parentFileId": int(parent_file_id or 0),
             "filename": filename,
+            "fileName": filename,
             "etag": etag,
             "size": int(size),
             "type": 0,
-            "duplicate": 1,
+            "duplicate": 2,
         }
 
         candidate_urls = [
@@ -305,8 +306,14 @@ class Pan123WebClient:
             if code == 0:
                 data = res.get("data") or {}
                 reuse = bool(data.get("reuse") or data.get("Reuse"))
-                file_id = data.get("fileId") or data.get("FileId")
-                if reuse:
+                info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
+                file_id = (
+                    data.get("fileId")
+                    or data.get("FileId")
+                    or info.get("FileId")
+                    or info.get("fileId")
+                )
+                if reuse or (file_id and not data.get("preuploadID")):
                     return True, int(file_id or 0), "秒传命中成功"
                 else:
                     return False, None, "云端未命中秒传特征"
@@ -330,20 +337,41 @@ class Pan123WebClient:
             return False, [], auth_msg
 
         query_params = urllib.parse.urlencode({
-            "parentFileId": int(parent_file_id or 0),
-            "page": 1,
+            "driveId": 0,
             "limit": 100,
-            "order": "filename",
-            "orderBy": "asc",
+            "next": 0,
+            "orderBy": "file_name",
+            "orderDirection": "asc",
+            "parentFileId": int(parent_file_id or 0),
+            "trashed": "false",
+            "SearchData": "",
+            "Page": 1,
+            "page": 1,
+            "event": "homeListFile",
+            "operateType": 1,
         })
-        url = f"{self.WEB_BASE_URL}/api/file/list/new?{query_params}"
 
-        ok, res, msg = self._http_get(url, with_auth=True)
-        if ok and res.get("code") == 0:
-            data = res.get("data") or {}
-            items = data.get("fileList") or data.get("InfoList") or []
-            return True, items, "ok"
-        return False, [], res.get("message") if ok else msg
+        candidate_hosts = [self.WEB_BASE_URL, self.BACKUP_BASE_URL]
+        candidate_paths = ["/b/api/file/list/new", "/api/file/list/new"]
+
+        last_fail_msg = "获取文件列表失败"
+        for host in candidate_hosts:
+            for path in candidate_paths:
+                url = f"{host}{path}?{query_params}"
+                ok, res, msg = self._http_get(url, with_auth=True)
+                if ok and res.get("code") == 0:
+                    data = res.get("data") or {}
+                    items = (
+                        data.get("InfoList")
+                        or data.get("infoList")
+                        or data.get("fileList")
+                        or data.get("list")
+                        or []
+                    )
+                    return True, items, "ok"
+                last_fail_msg = res.get("message") if ok else msg
+
+        return False, [], last_fail_msg
 
     def mkdir(self, dirname: str, parent_file_id: int = 0) -> tuple[bool, int, str]:
         """在指定目录下创建新文件夹"""
@@ -352,12 +380,17 @@ class Pan123WebClient:
             return False, 0, auth_msg
 
         payload = {
+            "driveId": 0,
             "parentFileId": int(parent_file_id or 0),
             "filename": dirname,
+            "fileName": dirname,
             "type": 1,  # 1 代表文件夹
             "size": 0,
             "etag": "",
-            "duplicate": 1,
+            "duplicate": 2,  # 2: 若同名则重用/覆盖，避免自动生成 (1), (2) 副本
+            "NotReuse": True,
+            "event": "newCreateFolder",
+            "operateType": 1,
         }
 
         candidate_urls = [
@@ -370,12 +403,18 @@ class Pan123WebClient:
             ok, res, msg = self._http_post(url, payload, with_auth=True)
             if ok and res.get("code") == 0:
                 data = res.get("data") or {}
-                dir_id = data.get("fileId") or data.get("FileId")
+                info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
+                dir_id = (
+                    info.get("FileId")
+                    or info.get("fileId")
+                    or data.get("fileId")
+                    or data.get("FileId")
+                    or data.get("id")
+                )
                 if dir_id:
                     return True, int(dir_id), "创建文件夹成功"
             last_msg = res.get("message") if ok else msg
         return False, 0, last_msg
-        return False, 0, res.get("message") if ok else msg
 
     def get_or_create_dir_by_path(
         self,
@@ -408,10 +447,14 @@ class Pan123WebClient:
             ok_list, items, _ = self.list_files(parent_file_id=current_parent_id)
             if ok_list:
                 for item in items:
-                    name = item.get("filename") or item.get("FileName")
-                    is_folder = item.get("type") == 1 or item.get("Type") == 1
-                    if is_folder and name == part:
-                        current_parent_id = int(item.get("fileId") or item.get("FileId"))
+                    name = str(item.get("filename") or item.get("FileName") or item.get("file_name") or "").strip()
+                    is_folder = (
+                        item.get("type") in (1, "1")
+                        or item.get("Type") in (1, "1")
+                        or item.get("category") in (1, "1")
+                    )
+                    if is_folder and name.lower() == part.lower():
+                        current_parent_id = int(item.get("fileId") or item.get("FileId") or item.get("file_id"))
                         self._dir_cache[cache_key] = current_parent_id
                         found = True
                         break
@@ -419,19 +462,23 @@ class Pan123WebClient:
             # 3. 远端不存在，创建新文件夹
             if not found:
                 ok_mk, new_dir_id, err_msg = self.mkdir(part, parent_file_id=current_parent_id)
-                if not ok_mk:
-                    # 再次重试列表，防止并发重名创建冲突
+                if not ok_mk or new_dir_id <= 0:
+                    # 再次重试列表，防止已有同名文件夹或并发冲突
                     ok_retry, retry_items, _ = self.list_files(parent_file_id=current_parent_id)
                     for item in retry_items:
-                        if (item.get("type") == 1 or item.get("Type") == 1) and (
-                            item.get("filename") == part or item.get("FileName") == part
-                        ):
-                            current_parent_id = int(item.get("fileId") or item.get("FileId"))
+                        name = str(item.get("filename") or item.get("FileName") or item.get("file_name") or "").strip()
+                        is_folder = (
+                            item.get("type") in (1, "1")
+                            or item.get("Type") in (1, "1")
+                            or item.get("category") in (1, "1")
+                        )
+                        if is_folder and name.lower() == part.lower():
+                            current_parent_id = int(item.get("fileId") or item.get("FileId") or item.get("file_id"))
                             self._dir_cache[cache_key] = current_parent_id
                             found = True
                             break
                     if not found:
-                        return False, current_parent_id, f"创建目录【{part}】失败: {err_msg}"
+                        return False, current_parent_id, f"创建或定位目录【{part}】失败: {err_msg}"
                 else:
                     current_parent_id = new_dir_id
                     self._dir_cache[cache_key] = current_parent_id
