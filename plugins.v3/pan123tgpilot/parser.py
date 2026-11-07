@@ -30,8 +30,9 @@ class TgMessageParser:
         r"(?:\b(?:EP|E)|第)\s*(\d{1,4})\s*[-~～至]\s*(?:EP|E|第)?\s*(\d{1,4})\s*(?:集|话|期|\b)",
         re.IGNORECASE,
     )
+    # 严格匹配集数：必须带有集/话/期，或明确写有 EPxx/Exx/更新至第xx集，杜绝将「第5部/第2场」等非集数数字误判为集数
     RE_EPISODE_ONLY = re.compile(
-        r"(?:\b(?:EP|E)\s*(\d{1,4})\b|(?:(?:更新至|更至)\s*第?\s*|第\s*)(\d{1,4})\s*(?:集|话|期)?)",
+        r"(?:\b(?:EP|E)\s*(\d{1,4})\b|(?:更新至|更至)\s*第?\s*(\d{1,4})\s*(?:集|话|期)?|第\s*(\d{1,4})\s*(?:集|话|期))",
         re.IGNORECASE,
     )
     RE_SEASON_ONLY = re.compile(r"(?:\b(?:Season|S)\s*(\d{1,2})\b|第\s*(\d{1,2})\s*季)", re.IGNORECASE)
@@ -267,11 +268,39 @@ class TgMessageParser:
         episode: Optional[int] = None
         ep_tag = ""
 
+        # ---------------------------------------------------------
+        # 1. 优先检查 TMDB 链接特征 (最权威类型指示，防止电影被正文/伴生文本弱正则误判为电视剧)
+        # 例如: TMDB: [8.0](https://www.themoviedb.org/movie/1368337) 权威代表电影
+        #       TMDB: [8.5](https://www.themoviedb.org/tv/12345) 权威代表剧集
+        # ---------------------------------------------------------
+        tmdb_m = cls.RE_TMDB.search(combined)
+        is_tmdb_movie = bool(tmdb_m and tmdb_m.group(1).lower() == "movie")
+        is_tmdb_tv = bool(tmdb_m and tmdb_m.group(1).lower() == "tv")
+
+        # ---------------------------------------------------------
+        # 2. 检查正文中的显式类型/分类声明 (例如: 📺类型 : 欧美电影, 🎬 电影：xxx)
+        # ---------------------------------------------------------
+        has_explicit_movie = bool(
+            re.search(r"(?:^|\n)\s*[🎬📺🎥🏷️📌📢🔥✨\s#*]*(?:电影)[：:\s]", combined)
+            or re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:欧美电影|华语电影|日韩电影|网络电影|动画电影|纪录片电影|电影)", combined)
+        )
+        has_explicit_tv = bool(
+            re.search(r"(?:^|\n)\s*[🎬📺🎥🏷️📌📢🔥✨\s#*]*(?:剧集|电视剧|短剧|番剧)[：:\s]", combined)
+            or re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:国产剧集|欧美剧集|日韩剧集|剧集|电视剧|美剧|日剧|韩剧|国剧|国产剧|泰剧|连续剧|短剧|番剧)", combined)
+        )
+
+        # 权威电影判定：若 TMDB 确认为 movie，或正文明确声明为电影 (且未声明为剧集)，则强制判定为电影，清空所有季集
+        if is_tmdb_movie or (has_explicit_movie and not has_explicit_tv):
+            return "movie", None, None, ""
+
         # 预探测显式季号 (如 S02 / Season 2 / 第2季)
         m_s_only = cls.RE_SEASON_ONLY.search(combined)
         detected_season = int(m_s_only.group(1) or m_s_only.group(2)) if m_s_only else 1
 
-        # 1. 季+集范围探测 (如 S01E01-E04 / S01E01-04)
+        # ---------------------------------------------------------
+        # 3. 季集特征探测 (仅在未判定为电影的前提下执行)
+        # ---------------------------------------------------------
+        # 3.1 季+集范围探测 (如 S01E01-E04 / S01E01-04)
         m_ser = cls.RE_SEASON_EP_RANGE.search(combined)
         if m_ser:
             season = int(m_ser.group(1))
@@ -285,7 +314,7 @@ class TgMessageParser:
             )
             return "tv", season, episode, ep_tag
 
-        # 2. 标准季+单集正则探测 (如 S05E217 / S01E06)
+        # 3.2 标准季+单集正则探测 (如 S05E217 / S01E06)
         m_se = cls.RE_SEASON_EPISODE.search(combined)
         if m_se and m_se.group(2):
             season = int(m_se.group(1))
@@ -293,7 +322,7 @@ class TgMessageParser:
             ep_tag = f"S{season:02d}E{episode:02d}"
             return "tv", season, episode, ep_tag
 
-        # 3. 纯集数范围探测 (如 📼 集数：E01-E04 / EP01-04 / 第1-4集)
+        # 3.3 纯集数范围探测 (如 📼 集数：E01-E04 / EP01-04 / 第1-4集)
         m_epr = cls.RE_EP_RANGE_ONLY.search(combined)
         if m_epr:
             season = int(m_se.group(1)) if m_se else detected_season
@@ -307,15 +336,17 @@ class TgMessageParser:
             )
             return "tv", season, episode, ep_tag
 
-        # 4. 纯单集探测 (如 E06 / EP12 / 第32集 / 更新至第82集)
+        # 3.4 纯单集探测 (如 E06 / EP12 / 第32集 / 更新至第82集)
         m_ep = cls.RE_EPISODE_ONLY.search(combined)
         if m_ep:
-            episode = int(m_ep.group(1) or m_ep.group(2))
-            season = int(m_se.group(1)) if m_se else detected_season
-            ep_tag = f"S{season:02d}E{episode:02d}"
-            return "tv", season, episode, ep_tag
+            ep_val = m_ep.group(1) or m_ep.group(2) or m_ep.group(3)
+            if ep_val:
+                episode = int(ep_val)
+                season = int(m_se.group(1)) if m_se else detected_season
+                ep_tag = f"S{season:02d}E{episode:02d}"
+                return "tv", season, episode, ep_tag
 
-        # 5. 仅含季号探测 (如 S01 / Season 1 / 第1季)
+        # 3.5 仅含季号探测 (如 S01 / Season 1 / 第1季)
         if m_se:
             season = int(m_se.group(1))
             ep_tag = f"S{season:02d}"
@@ -325,32 +356,13 @@ class TgMessageParser:
             ep_tag = f"S{season:02d}"
             return "tv", season, None, ep_tag
 
-        # 2. 检查 TMDB 链接特征 (权威判定)
-        tmdb_m = cls.RE_TMDB.search(combined)
-        if tmdb_m:
-            t = tmdb_m.group(1).lower()
-            if t == "tv":
-                return "tv", 1, None, "S01"
-            elif t == "movie":
-                return "movie", None, None, ""
+        # ---------------------------------------------------------
+        # 4. 若无具体集数，但 TMDB 或类型明确为剧集
+        # ---------------------------------------------------------
+        if is_tmdb_tv or has_explicit_tv:
+            return "tv", detected_season, None, f"S{detected_season:02d}"
 
-        # 3. 文本类型与分类关键字匹配（兼容「📺 剧集：xxx」「🗂 分类：国产剧集」「类型：剧集」等）
-        if re.search(r"(?:^|\n)\s*[🎬📺🎥🏷️📌📢🔥✨\s#*]*(?:剧集|电视剧|短剧|番剧)[：:\s]", combined):
-            return "tv", 1, None, "S01"
-
-        if re.search(r"(?:^|\n)\s*[🎬📺🎥🏷️📌📢🔥✨\s#*]*(?:电影)[：:\s]", combined):
-            return "movie", None, None, ""
-
-        if re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:剧集|电视剧|美剧|日剧|韩剧|国剧|国产剧|泰剧|连续剧|短剧|番剧)", combined):
-            return "tv", 1, None, "S01"
-
-        if re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:电影|网络电影|动画电影|纪录片电影)", combined):
-            return "movie", None, None, ""
-
-        if re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:动漫|国漫)", combined):
-            return "movie", None, None, ""
-
-        # 默认归为电影
+        # 默认归为电影 (无季集)
         return "movie", None, None, ""
 
     @classmethod

@@ -175,6 +175,47 @@ https://1840976528.share.123pan.cn/123pan/cHCOTd-RLSP"""
         self.assertEqual(parsed["share_key"], "cHCOTd-RLSP")
         self.assertEqual(parsed["share_url"], "https://1840976528.share.123pan.cn/123pan/cHCOTd-RLSP")
 
+    def test_parse_odyssey_movie_never_recognized_as_tv(self):
+        """
+        验证电影《奥德赛 (2026)》具备 TMDB movie 与「📺类型 : 欧美电影」特征，
+        100% 判定为 movie，绝不误带 S01E05 等季集标识。
+        """
+        msg_odyssey = """奥德赛 (2026)
+🏷️标签 : #奥德赛 #冒险 #动作 #奇幻
+📺类型 : 欧美电影
+📅首播 : 2026-07-15
+⭐评分 : TMDB: [8.0](https://www.themoviedb.org/movie/1368337) | 豆瓣: [8.6](https://movie.douban.com/subject/36808876/)
+🆔TMDB : [1368337](https://www.themoviedb.org/movie/1368337)
+📝简介 : 改编自荷马史诗《奥德赛》。特洛伊战争结束后，伊萨卡国王奥德修斯历经艰险、踏上漫长归乡之旅。
+🖼️版本 : 2160p.Blu-ray.H.265.HDR10.10bit.24fps.DTS-HD MA 5.1
+💾体积 : 82.19 GB
+🔗分享链接 : 123FSLinkV2$8cea83224545651bb8ad54ea015c0801#88246460648#奥德赛 (2026) - 2160p.Ultra HD BluRay.Remux.HDR10.H.265.10-bit.24fps.DTS-HD MA 5.1 {tmdb-1368337}.mkv"""
+        parsed = self.parser.parse(msg_odyssey, msg_id="301", channel="@regeng123")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["title"], "奥德赛")
+        self.assertEqual(parsed["display_title"], "奥德赛")
+        self.assertEqual(parsed["media_title"], "奥德赛")
+        self.assertEqual(parsed["media_type"], "movie")
+        self.assertEqual(parsed["ep_tag"], "")
+        self.assertIsNone(parsed["season"])
+        self.assertIsNone(parsed["episode"])
+        self.assertEqual(parsed["media_key"], "movie_奥德赛_2026")
+        self.assertEqual(parsed["resolution"], "2160p")
+        self.assertEqual(parsed["dovi_hdr"], "HDR")
+
+    def test_movie_with_polluted_reply_text_remains_movie(self):
+        """验证即使用户消息中混入了历史回复引用或弱匹配数字 (如提及第5部、或带 S01E05 字符串)，只要明确为电影即锁定 movie"""
+        polluted_msg = """奥德赛 (2026)
+📺类型 : 欧美电影
+⭐评分 : TMDB: [8.0](https://www.themoviedb.org/movie/1368337)
+📝简介 : 这是第5部史诗大作，前篇曾有 S01E05 特别记录。
+🔗分享链接 : 123FSLinkV2$8cea83224545651bb8ad54ea015c0801#88246460648#奥德赛.mkv"""
+        parsed = self.parser.parse(polluted_msg)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["media_type"], "movie")
+        self.assertEqual(parsed["display_title"], "奥德赛")
+        self.assertEqual(parsed["ep_tag"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

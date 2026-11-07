@@ -242,6 +242,33 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertIn("凡人修仙传", text)
         self.assertIn("https://www.123865.com/s/XyZ987-abcd?pwd=6666", text)
 
+    def test_tg_watcher_strips_reply_block_to_avoid_pollution(self):
+        """验证 TG 消息中包含上一条被引用消息 (tgme_widget_message_reply) 时能干净剥离，不污染当前正文"""
+        html = """
+        <div class="tgme_widget_message_wrap">
+            <div class="tgme_widget_message" data-post="regeng123/3001">
+                <a class="tgme_widget_message_reply" href="https://t.me/regeng123/3000">
+                    <span class="tgme_widget_message_author_name">热更频道</span>
+                    <div class="tgme_widget_message_text">折月亮 (2026) S01E05</div>
+                </a>
+                <div class="tgme_widget_message_text js-message_text" dir="auto">
+                    奥德赛 (2026)
+                    📺类型 : 欧美电影
+                    ⭐评分 : TMDB: [8.0](https://www.themoviedb.org/movie/1368337)
+                    🔗分享链接 : 123FSLinkV2$8cea83224545651bb8ad54ea015c0801#88246460648#奥德赛.mkv
+                </div>
+            </div>
+        </div>
+        """
+        messages = TgChannelWatcher._parse_tg_web_html(html, "regeng123")
+        self.assertEqual(len(messages), 1)
+        msg_id, text = messages[0]
+        self.assertEqual(msg_id, "3001")
+        self.assertNotIn("折月亮", text)
+        self.assertNotIn("S01E05", text)
+        self.assertIn("奥德赛", text)
+        self.assertIn("欧美电影", text)
+
 
 if __name__ == "__main__":
     unittest.main()

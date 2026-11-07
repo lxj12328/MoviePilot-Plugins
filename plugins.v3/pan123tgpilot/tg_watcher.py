@@ -164,17 +164,31 @@ class TgChannelWatcher:
                 elif post_attr.isdigit():
                     msg_id = post_attr.strip()
 
+                # 剥离引用回复块 (tgme_widget_message_reply) 与转发源块，杜绝上一条消息的剧集/季集信息与链接污染当前消息
+                clean_block = re.sub(
+                    r'<a\s+[^>]*class=["\'][^"\']*tgme_widget_message_reply[^"\']*["\'][^>]*>.*?</a>',
+                    "",
+                    block_html,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                clean_block = re.sub(
+                    r'<div\s+[^>]*class=["\'][^"\']*tgme_widget_message_reply[^"\']*["\'][^>]*>.*?</div>',
+                    "",
+                    clean_block,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+
                 # 提取正文容器内容：优先匹配到 tgme_widget_message_footer 之前，避免正文内嵌套 <div> 或 <blockquote> 导致提前截断
                 m_body = re.search(
                     r'<div class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)(?=<div class="[^"]*(?:tgme_widget_message_footer|tgme_widget_message_link_preview|tgme_widget_message_inline_keyboard)|\Z)',
-                    block_html,
+                    clean_block,
                     re.DOTALL,
                 )
                 body_html = m_body.group(1) if m_body else ""
 
                 # 额外提取内联按钮 (tgme_widget_message_inline_button) 与链接卡片中的 123 云盘链接
                 extra_links: List[str] = []
-                for m_href in re.finditer(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', block_html, flags=re.DOTALL | re.IGNORECASE):
+                for m_href in re.finditer(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', clean_block, flags=re.DOTALL | re.IGNORECASE):
                     href_val = unescape(m_href.group(1).strip())
                     if "/s/" in href_val or "123" in href_val:
                         extra_links.append(href_val)
