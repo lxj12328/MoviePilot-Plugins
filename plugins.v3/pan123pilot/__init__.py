@@ -210,7 +210,7 @@ class Pan123Pilot(_PluginBase):
     plugin_name = "123云盘助手"
     plugin_desc = "MoviePilot V3 的 123 云盘自动化秒传与做种清理助手。优先 SHA1 秒传，未命中定时重试，支持失败转真实分片上传，联动 qBittorrent 标签并按 H&R 规则安全清理。"
     plugin_icon = "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png"
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     plugin_author = "lxj12328"
     author_url = "https://github.com/lxj12328/MoviePilot-Plugins"
     plugin_config_prefix = "pan123pilot_"
@@ -750,7 +750,7 @@ class Pan123Pilot(_PluginBase):
 
     def _api_get_tasks(self) -> dict:
         tasks = self.db_helper.list_all_tasks(limit=50) if self.db_helper else []
-        return {"code": 0, "message": "ok", "data": tasks}
+        return {"success": True, "message": "", "data": tasks}
 
     def _api_get_records(
         self,
@@ -762,7 +762,17 @@ class Pan123Pilot(_PluginBase):
     ) -> dict:
         """支持关键词、文件类型、状态过滤与分页的同步任务清单接口"""
         if not self.db_helper:
-            return {"code": 0, "message": "ok", "total": 0, "page": 1, "page_size": 20, "data": []}
+            return {
+                "success": True,
+                "message": "",
+                "data": {
+                    "total": 0,
+                    "page": 1,
+                    "page_size": 20,
+                    "file_type": file_type,
+                    "items": [],
+                },
+            }
         try:
             p = max(1, int(page or 1))
         except (ValueError, TypeError):
@@ -777,14 +787,51 @@ class Pan123Pilot(_PluginBase):
             limit=ps, offset=offset, keyword=keyword, status=status, file_type=file_type
         )
         return {
-            "code": 0,
-            "message": "ok",
-            "total": total,
-            "page": p,
-            "page_size": ps,
-            "file_type": file_type,
-            "data": items,
+            "success": True,
+            "message": "",
+            "data": {
+                "total": total,
+                "page": p,
+                "page_size": ps,
+                "file_type": file_type,
+                "items": items,
+            },
         }
+
+    def _load_ui_view_state(self) -> None:
+        """从插件持久化存储恢复详情页视图状态（页码、每页条数、文件类型、状态过滤）"""
+        if not hasattr(self, "get_data"):
+            return
+        try:
+            saved = self.get_data("ui_view_state")
+            if isinstance(saved, dict):
+                if "page" in saved:
+                    self._ui_page = max(1, int(saved["page"] or 1))
+                if "page_size" in saved:
+                    self._ui_page_size = min(100, max(5, int(saved["page_size"] or 15)))
+                if "file_type" in saved and str(saved["file_type"]).lower() in ("video", "companion", "all"):
+                    self._ui_file_type = str(saved["file_type"]).lower()
+                if "status" in saved and saved["status"]:
+                    self._ui_status = str(saved["status"]).upper()
+        except Exception:
+            pass
+
+    def _save_ui_view_state(self) -> None:
+        """将详情页当前视图状态持久化保存，防止多 Worker 或重载丢失状态"""
+        if not hasattr(self, "save_data"):
+            return
+        try:
+            self.save_data(
+                "ui_view_state",
+                {
+                    "page": self._ui_page,
+                    "page_size": self._ui_page_size,
+                    "file_type": self._ui_file_type,
+                    "status": self._ui_status,
+                },
+            )
+        except Exception:
+            pass
 
     def _api_ui_page(
         self,
@@ -793,7 +840,12 @@ class Pan123Pilot(_PluginBase):
         file_type: Optional[str] = None,
         status: Optional[str] = None,
     ) -> dict:
-        """响应详情页分页器与筛选栏点击事件，更新视图状态并触发前端自动重绘"""
+        """
+        响应详情页分页器与筛选栏点击事件，更新视图状态并触发前端自动重绘。
+        注意：MoviePilot V3 前端拦截器强制校验普通 JSON 端点顶层结构必须严格为
+        {"success": bool, "message": str, "data": ...} 三段式信封，不得在顶层附加未知字段！
+        """
+        self._load_ui_view_state()
         reset_to_first = False
         if file_type is not None:
             ft = str(file_type).strip().lower()
@@ -824,48 +876,69 @@ class Pan123Pilot(_PluginBase):
         elif reset_to_first:
             self._ui_page = 1
 
+        self._save_ui_view_state()
+
         return {
-            "code": 0,
-            "message": "ok",
-            "page": self._ui_page,
-            "page_size": self._ui_page_size,
-            "file_type": self._ui_file_type,
-            "status": self._ui_status,
+            "success": True,
+            "message": "",
+            "data": {
+                "code": 0,
+                "page": self._ui_page,
+                "page_size": self._ui_page_size,
+                "file_type": self._ui_file_type,
+                "status": self._ui_status,
+            },
         }
 
     def _api_purge_records(self, days: Optional[int] = None) -> dict:
         """手动清理超过指定天数的已完结记录"""
         if not self.db_helper:
-            return {"code": 1, "message": "数据库未就绪", "purged": 0}
+            return {"success": False, "message": "数据库未就绪", "data": {"code": 1, "purged": 0}}
         target_days = int(days if days is not None else self._retention_days or 0)
         if target_days <= 0:
-            return {"code": 0, "message": "当前设置为永久保留 (days=0)，未清理任何记录", "purged": 0}
+            return {
+                "success": True,
+                "message": "当前设置为永久保留 (days=0)，未清理任何记录",
+                "data": {"code": 0, "purged": 0},
+            }
         purged = self.db_helper.purge_expired_tasks(days=target_days)
-        return {"code": 0, "message": f"已清理超过 {target_days} 天的完结记录共 {purged} 条", "purged": purged}
+        return {
+            "success": True,
+            "message": f"已清理超过 {target_days} 天的完结记录共 {purged} 条",
+            "data": {"code": 0, "purged": purged},
+        }
 
     def _api_trigger_retry(self) -> dict:
         if self.scheduler and self._enabled:
             self.scheduler.process_pending_tasks(enable_real_upload=self._enable_real_upload)
             self.scheduler.retry_retrying_tasks(enable_real_upload=self._enable_real_upload, retry_interval_minutes=0)
-        return {"code": 0, "message": "已手动触发待处理与秒传重试任务"}
+        return {"success": True, "message": "已手动触发待处理与秒传重试任务", "data": {"code": 0}}
 
     def _api_trigger_cleanup(self) -> dict:
         self._service_cleanup_tasks()
-        return {"code": 0, "message": "已手动触发做种达标清理"}
+        return {"success": True, "message": "已手动触发做种达标清理", "data": {"code": 0}}
 
     def _api_test_auth(self) -> dict:
         """测试 123 云盘认证状态"""
         if isinstance(self.client, Pan123WebClient):
             ok, msg = self.client.ensure_authenticated()
             if ok:
-                return {"code": 0, "message": f"Web 鉴权成功！当前 Token 有效 (前缀: {self.client.token[:10]}...)"}
-            return {"code": 1, "message": f"Web 鉴权失败: {msg}"}
+                return {
+                    "success": True,
+                    "message": f"Web 鉴权成功！当前 Token 有效 (前缀: {self.client.token[:10]}...)",
+                    "data": {"code": 0},
+                }
+            return {"success": False, "message": f"Web 鉴权失败: {msg}", "data": {"code": 1}}
         elif isinstance(self.client, Pan123Client):
             token = self.client.get_access_token()
             if token:
-                return {"code": 0, "message": f"OpenAPI Token 获取成功: {token[:10]}..."}
-            return {"code": 1, "message": "OpenAPI Token 获取失败，请检查 Client ID / Secret"}
-        return {"code": 1, "message": "客户端未初始化"}
+                return {
+                    "success": True,
+                    "message": f"OpenAPI Token 获取成功: {token[:10]}...",
+                    "data": {"code": 0},
+                }
+            return {"success": False, "message": "OpenAPI Token 获取失败，请检查 Client ID / Secret", "data": {"code": 1}}
+        return {"success": False, "message": "客户端未初始化", "data": {"code": 1}}
 
     def _scan_and_sync_history_library(self, force_resync: bool = False) -> int:
         """
@@ -892,21 +965,33 @@ class Pan123Pilot(_PluginBase):
     def _api_scan_library(self) -> dict:
         """手动扫描本地媒体库根目录，将未录入的任务录入数据库并立即触发同步"""
         if not self._local_library_root or not os.path.exists(self._local_library_root):
-            return {"code": 1, "message": f"本地媒体库路径未配置或在容器内不存在: {self._local_library_root}"}
+            return {
+                "success": False,
+                "message": f"本地媒体库路径未配置或在容器内不存在: {self._local_library_root}",
+                "data": {"code": 1},
+            }
 
         count = self._scan_and_sync_history_library(force_resync=self._force_resync_completed)
-        return {"code": 0, "message": f"媒体库扫描完成，已录入并检查 {count} 个媒体文件"}
+        return {
+            "success": True,
+            "message": f"媒体库扫描完成，已录入并检查 {count} 个媒体文件",
+            "data": {"code": 0, "count": count},
+        }
 
     def _api_reset_tasks(self) -> dict:
         """手动一键重置所有已完成及异常任务为待同步并立即触发流转"""
         if not self.db_helper:
-            return {"code": 1, "message": "数据库未就绪"}
+            return {"success": False, "message": "数据库未就绪", "data": {"code": 1}}
         count = self.db_helper.reset_tasks_status()
         if self._local_library_root and os.path.exists(self._local_library_root):
             _record_transferred_target(self._local_library_root, force_resync=True)
         if self.scheduler and self._enabled:
             self.scheduler.process_pending_tasks(enable_real_upload=self._enable_real_upload)
-        return {"code": 0, "message": f"已成功重置 {count} 个任务为待同步，后台正在全速重新秒传/上传！"}
+        return {
+            "success": True,
+            "message": f"已成功重置 {count} 个任务为待同步，后台正在全速重新秒传/上传！",
+            "data": {"code": 0, "count": count},
+        }
 
     def on_transfer_completed(self, event: Any) -> None:
         """MoviePilot 插件类反射事件监听入口"""
@@ -1716,6 +1801,8 @@ class Pan123Pilot(_PluginBase):
                 self.db_helper.fix_companion_records()
             except Exception:
                 pass
+
+        self._load_ui_view_state()
 
         auth_info = getattr(self, "_auth_status_msg", "待检测")
         is_auth_ok = "已连接" in auth_info

@@ -327,7 +327,9 @@ class TestPan123WebClient(unittest.TestCase):
         pilot.scheduler = MagicMock()
 
         res = pilot._api_reset_tasks()
-        self.assertEqual(res["code"], 0)
+        self.assertEqual(set(res.keys()), {"success", "message", "data"})
+        self.assertTrue(res["success"])
+        self.assertEqual(res["data"]["code"], 0)
         self.assertIn("7 个任务", res["message"])
         pilot.scheduler.process_pending_tasks.assert_called_once()
 

@@ -236,14 +236,18 @@ class TestV150Features(unittest.TestCase):
         self.assertIn("庆余年.S02E15.2160p.mkv", page_str)
         self.assertIn("已秒传", page_str)
 
-        # 测试点击跳转第 2 页
+        # 测试点击跳转第 2 页（验证 V3 标准三段式信封: 顶层仅含 success/message/data）
         res = plugin._api_ui_page(page=2)
-        self.assertEqual(res["code"], 0)
+        self.assertEqual(set(res.keys()), {"success", "message", "data"})
+        self.assertTrue(res["success"])
+        self.assertEqual(res["data"]["code"], 0)
         self.assertEqual(plugin._ui_page, 2)
 
         # 测试切换每页条数/筛选类型（会自动重置页码为 1）
         res2 = plugin._api_ui_page(page_size=30, file_type="companion", status="COMPLETED_GROUP")
-        self.assertEqual(res2["code"], 0)
+        self.assertEqual(set(res2.keys()), {"success", "message", "data"})
+        self.assertTrue(res2["success"])
+        self.assertEqual(res2["data"]["code"], 0)
         self.assertEqual(plugin._ui_page, 1)
         self.assertEqual(plugin._ui_page_size, 30)
         self.assertEqual(plugin._ui_file_type, "companion")
