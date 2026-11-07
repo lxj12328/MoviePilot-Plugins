@@ -235,7 +235,8 @@ S05E217 4K WEB-DL H.265
         self.assertEqual(page[0]["component"], "VCard")
         table_card = page[1]
         self.assertIn("共 1 条", table_card["content"][0]["content"][0]["text"])
-        table = table_card["content"][1]
+        # content: [0]=VCardItem, [1]=filter_toolbar, [2]=VDivider, [3]=_records_table
+        table = table_card["content"][3]
         self.assertEqual(table["component"], "VTable")
         rows = table["content"][1]["content"]
         self.assertEqual(len(rows), 1)
@@ -253,10 +254,11 @@ S05E217 4K WEB-DL H.265
             {"media_title": f"片{i}", "status": "saved", "updated_at": "2026-11-06 20:00:00"} for i in range(45)
         ]
         card = self.plugin.get_page()[1]
-        first = card["content"][1]
-        self.assertEqual(len(first["content"][1]["content"]), self.plugin.PAGE_SIZE)
-        # 验证包含顶部筛选工具栏与底部交互式分页导航栏 (共 3 页)
-        footer = card["content"][3]
+        # 验证卡片结构: [0]=VCardItem标题, [1]=filter_toolbar(置顶), [2]=VDivider, [3]=_records_table, [4]=VDivider, [5]=pagination_footer
+        self.assertEqual(card["content"][1]["props"]["class"], "px-4 py-2 bg-surface-light")
+        table = card["content"][3]
+        self.assertEqual(len(table["content"][1]["content"]), self.plugin.PAGE_SIZE)
+        footer = card["content"][5]
         self.assertIn("当前第 1 / 3 页", footer["content"][0]["text"])
 
     def test_ui_page_switching_and_tv_ep_display(self):
