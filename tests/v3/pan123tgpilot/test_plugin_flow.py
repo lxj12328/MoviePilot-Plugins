@@ -57,6 +57,7 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
 
     @patch("threading.Thread")
     def test_run_now_on_save(self, mock_thread):
+        self.plugin.update_config = MagicMock()
         config = {
             "enabled": True,
             "run_now_on_save": True,
@@ -64,6 +65,11 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         }
         self.plugin.init_plugin(config)
         mock_thread.assert_called()
+        # 验证保存后立即自动将 run_now_on_save 开关复位为 False 并调用 update_config 持久化
+        self.assertFalse(config["run_now_on_save"])
+        self.plugin.update_config.assert_called_once()
+        saved_cfg = self.plugin.update_config.call_args[0][0]
+        self.assertFalse(saved_cfg["run_now_on_save"])
 
     @patch("threading.Thread")
     def test_run_action(self, mock_thread):

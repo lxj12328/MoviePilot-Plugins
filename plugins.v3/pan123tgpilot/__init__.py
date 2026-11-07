@@ -71,7 +71,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -217,10 +217,17 @@ class Pan123TgPilot(_PluginBase):
             f"智能洗版={self._auto_upgrade}"
         )
 
-        # 立即运行一次触发逻辑 (方便用户一键测试)
-        if self._enabled and config.get("run_now_on_save"):
-            logger.info("Pan123TgPilot 检测到勾选「保存配置后立即运行一次」，立即在后台启动全量巡检测试...")
-            threading.Thread(target=self._service_check_channels, daemon=True).start()
+        # 立即运行一次触发逻辑：触发后立即自动将「保存后立即运行一次」开关复位为关闭状态，无需人工再手动关一次
+        if config.get("run_now_on_save"):
+            config["run_now_on_save"] = False
+            if hasattr(self, "update_config"):
+                try:
+                    self.update_config(dict(config))
+                except Exception as e:
+                    logger.warning(f"Pan123TgPilot 自动复位 run_now_on_save 开关异常: {e}")
+            if self._enabled:
+                logger.info("Pan123TgPilot 检测到勾选「保存后立即运行一次」，已自动复位开关并在后台启动全量巡检...")
+                threading.Thread(target=self._service_check_channels, daemon=True).start()
 
     @staticmethod
     def get_command() -> list[dict]:
@@ -624,17 +631,9 @@ class Pan123TgPilot(_PluginBase):
 
         basic = self._section("基础设置", "mdi-cog", [
             {"component": "VRow", "content": [
-                col([sw("enabled", "启用插件")]),
-                col([sw("notify_enabled", "发送转存成功通知")]),
-                col([sw("run_now_on_save", "保存后立即运行一次", "保存配置时在后台立刻巡检一次，便于测试")]),
-                col([{
-                    "component": "VBtn",
-                    "props": {
-                        "color": "primary", "variant": "elevated", "block": True,
-                        "prepend-icon": "mdi-play-circle", "text": "立即执行一次巡检",
-                    },
-                    "events": {"click": "api.post('/plugin/Pan123TgPilot/manual_check')"},
-                }]),
+                col([sw("enabled", "启用插件")], md=4),
+                col([sw("notify_enabled", "发送转存成功通知")], md=4),
+                col([sw("run_now_on_save", "保存后立即运行一次", "保存后自动触发一次巡检并自动恢复为关闭状态")], md=4),
             ]},
         ])
 
@@ -817,12 +816,6 @@ class Pan123TgPilot(_PluginBase):
                               f"洗版 {'开' if self._auto_upgrade else '关'} · "
                               f"清理旧版 {'开' if self._auto_delete_old_version else '关'} · 记录保留 {retention}")},
                 ]},
-                {"component": "VCardActions", "props": {"class": "px-4 pb-4"}, "content": [{
-                    "component": "VBtn",
-                    "props": {"color": "primary", "variant": "elevated", "block": True,
-                              "prepend-icon": "mdi-play-circle", "text": "立即运行一次巡检"},
-                    "events": {"click": "api.post('/plugin/Pan123TgPilot/manual_check')"},
-                }]},
             ],
         }
 
