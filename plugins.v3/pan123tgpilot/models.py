@@ -40,12 +40,16 @@ except ImportError:
 try:
     from app.db import Base, db_query, db_update
 except ImportError:
-    class DeclarativeBaseFallback:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-            if not hasattr(self, "id"):
-                self.id = 1
+    try:
+        class DeclarativeBaseFallback(DeclarativeBase):
+            pass
+    except Exception:
+        class DeclarativeBaseFallback:  # type: ignore
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+                if not hasattr(self, "id"):
+                    self.id = 1
 
     Base = DeclarativeBaseFallback  # type: ignore
     db_query = lambda func: func
@@ -421,7 +425,7 @@ class Pan123TgDatabase:
                 db.commit()
             except Exception:
                 pass
-            return new_rec.id
+            return int(new_rec.id if new_rec.id is not None else 1)
 
     @staticmethod
     def _build_filter(keyword: Any = None, status: Any = None):

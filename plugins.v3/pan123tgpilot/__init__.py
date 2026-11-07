@@ -71,7 +71,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -887,14 +887,14 @@ class Pan123TgPilot(_PluginBase):
     def _api_manual_check(self) -> dict[str, Any]:
         """API: 手动触发频道巡检"""
         threading.Thread(target=self._service_check_channels, daemon=True).start()
-        return {"code": 200, "message": "已在后台启动 TG 频道巡检与转存任务"}
+        return {"success": True, "code": 200, "message": "已在后台启动 TG 频道巡检与转存任务", "data": None}
 
     def _api_get_records(
         self, keyword: str = "", status: str = "", page: int = 1, page_size: int = 20
     ) -> dict[str, Any]:
         """API: 分页获取转存记录，支持关键字与状态检索"""
         if not self._db:
-            return {"code": 500, "message": "数据库未就绪", "data": []}
+            return {"success": False, "code": 500, "message": "数据库未就绪", "data": []}
         try:
             page = max(1, int(page or 1))
             page_size = min(200, max(1, int(page_size or 20)))
@@ -905,6 +905,7 @@ class Pan123TgPilot(_PluginBase):
             limit=page_size, offset=(page - 1) * page_size, keyword=keyword or "", status=status or ""
         )
         return {
+            "success": True,
             "code": 200,
             "message": "success",
             "total": total,
@@ -917,24 +918,26 @@ class Pan123TgPilot(_PluginBase):
     def _api_purge(self) -> dict[str, Any]:
         """API: 立即按保留天数清理过期记录"""
         if self._retention_days <= 0:
-            return {"code": 200, "message": "记录保留天数为 0 (永久保留)，未执行清理", "deleted": 0}
+            return {"success": True, "code": 200, "message": "记录保留天数为 0 (永久保留)，未执行清理", "deleted": 0, "data": {"deleted": 0}}
         n = self._service_purge_records()
-        return {"code": 200, "message": f"已清理 {n} 条过期记录", "deleted": n}
+        return {"success": True, "code": 200, "message": f"已清理 {n} 条过期记录", "deleted": n, "data": {"deleted": n}}
 
     def _api_test_tg(self) -> dict[str, Any]:
         """API: 测试 TG 连通性"""
         if not self._watcher:
-            return {"code": 500, "message": "监听器未初始化"}
+            return {"success": False, "code": 500, "message": "监听器未初始化", "data": None}
         test_ch = self._tg_channels[0] if self._tg_channels else "Pan123Movie"
         try:
             msgs = self._watcher.fetch_channel_messages(test_ch, limit=5)
             return {
+                "success": True,
                 "code": 200,
                 "message": f"成功连通 Telegram 并获取频道 {test_ch} 的 {len(msgs)} 条消息预览",
                 "sample_messages": [m[1][:100] for m in msgs[:2]] if msgs else [],
+                "data": {"sample_messages": [m[1][:100] for m in msgs[:2]] if msgs else []},
             }
         except Exception as e:
-            return {"code": 500, "message": f"连接 Telegram 失败: {e}"}
+            return {"success": False, "code": 500, "message": f"连接 Telegram 失败: {e}", "data": None}
 
 
 @eventmanager.register(EventType.PluginAction)

@@ -84,12 +84,32 @@ class TestClientAndWatcher(unittest.TestCase):
 
     def test_client_save_fslink_fallback_on_folder_not_found(self):
         client = Pan123TgClient(token="test_token")
-        # 第一次请求 mkdir 报错 文件夹不存在，第二次在根目录 0 下创建成功，随后秒传成功
-        client._http_request = MagicMock(side_effect=[
-            (False, {"code": 10404, "message": "文件夹不存在"}, "文件夹不存在"),
-            (True, {"code": 0, "message": "ok", "data": {"dirID": 99990}}, "ok"),
-            (True, {"code": 0, "message": "ok", "data": {"reuse": True, "fileId": 888123}}, "ok"),
-        ])
+        # 模拟：
+        # 1. list_files 首次返回旧失效的子文件夹 ID 52958217；
+        # 2. 尝试向 52958217 秒传时报错 "文件夹不存在"；
+        # 3. 清除缓存后重新在用户配置的目录 42149741 下 list_files (为空) 并 mkdir 创建新子文件夹 99990；
+        # 4. 秒传至 99990（在 42149741 下，绝不降级到根目录 0）成功！
+        call_log = []
+
+        def mock_req(url, method="GET", payload=None, with_auth=True):
+            call_log.append((url, method, dict(payload) if payload else None))
+            if "file/list/new" in url:
+                if len(call_log) == 1:
+                    return True, {
+                        "code": 0,
+                        "data": {"InfoList": [{"fileId": 52958217, "fileName": "夜曲 (2026)", "type": 1}]},
+                    }, "ok"
+                return True, {"code": 0, "data": {"InfoList": []}}, "ok"
+            if "upload_request" in url and payload:
+                if payload.get("type") == 0 and payload.get("parentFileId") == 52958217:
+                    return False, {"code": 10404, "message": "文件夹不存在"}, "文件夹不存在"
+                if payload.get("type") == 1 and payload.get("parentFileId") == 42149741:
+                    return True, {"code": 0, "data": {"fileId": 99990}}, "ok"
+                if payload.get("type") == 0 and payload.get("parentFileId") == 99990:
+                    return True, {"code": 0, "data": {"reuse": True, "fileId": 888123}}, "ok"
+            return False, {}, "error"
+
+        client._http_request = MagicMock(side_effect=mock_req)
         success, file_id, msg = client.save_fslink(
             fslink="123FSLinkV2$82467be2147f26532298438bf7015238#32855978205#夜曲.mkv",
             parent_file_id=42149741,
@@ -97,13 +117,27 @@ class TestClientAndWatcher(unittest.TestCase):
         )
         self.assertTrue(success)
         self.assertEqual(file_id, "888123")
+        # 验证全程没有任何请求将 parentFileId 设为根目录 0
+        for _, _, pl in call_log:
+            if pl and "parentFileId" in pl:
+                self.assertNotEqual(pl["parentFileId"], 0)
 
     def test_client_trash_files(self):
         client = Pan123TgClient(token="test_token")
-        client._http_request = MagicMock(return_value=(True, {"code": 0, "message": "success"}, "ok"))
+        captured_payloads = []
 
-        success, msg = client.trash_files([172012630879389])
+        def mock_trash(url, method="POST", payload=None, with_auth=True):
+            captured_payloads.append(payload)
+            return True, {"code": 0, "message": "success"}, "ok"
+
+        client._http_request = MagicMock(side_effect=mock_trash)
+
+        success, msg = client.trash_files([78719249199166])
         self.assertTrue(success)
+        self.assertEqual(len(captured_payloads), 1)
+        self.assertEqual(captured_payloads[0]["fileTrashInfoList"], [{"FileId": 78719249199166}])
+        self.assertTrue(captured_payloads[0]["operation"])
+        self.assertEqual(captured_payloads[0]["event"], "intoRecycle")
 
     def test_proxy_normalization(self):
         w1 = TgChannelWatcher(proxy="127.0.0.1:7890")

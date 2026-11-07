@@ -116,17 +116,102 @@ class Pan123TgClient:
             return True
         return False
 
-    def mkdir(self, dirname: str, parent_file_id: int = 0) -> Tuple[bool, int, str]:
-        """在指定目录下创建新文件夹 (若同名则复用现有文件夹)"""
+    def list_files(self, parent_file_id: int = 0) -> Tuple[bool, List[dict], str]:
+        """获取指定目录下的文件及子文件夹列表，用于先查后建同名归集文件夹"""
+        if not self.is_configured():
+            return False, [], "123 云盘 Web Token 未配置"
+
+        query_params = urllib.parse.urlencode({
+            "driveId": 0,
+            "limit": 100,
+            "next": 0,
+            "orderBy": "file_name",
+            "orderDirection": "asc",
+            "parentFileId": int(parent_file_id or 0),
+            "trashed": "false",
+            "SearchData": "",
+            "Page": 1,
+            "page": 1,
+            "event": "homeListFile",
+            "operateType": 1,
+        })
+
+        hosts = [self.WEB_BASE_URL, self.BACKUP_BASE_URL]
+        paths = ["/b/api/file/list/new", "/api/file/list/new"]
+        last_msg = "获取目录列表失败"
+
+        for host in hosts:
+            for path in paths:
+                url = f"{host}{path}?{query_params}"
+                ok, res, msg = self._http_request(url, method="GET", with_auth=True)
+                if ok and res.get("code") == 0:
+                    data = res.get("data") or {}
+                    items = (
+                        data.get("InfoList")
+                        or data.get("infoList")
+                        or data.get("fileList")
+                        or data.get("list")
+                        or []
+                    )
+                    return True, items, "ok"
+                last_msg = res.get("message") if ok else msg
+
+        return False, [], str(last_msg or "获取目录列表失败")
+
+    def invalidate_dir_cache(self, parent_file_id: Optional[int] = None, dirname: Optional[str] = None) -> None:
+        """清除已失效的目录缓存，防止网盘目录被移动/重建后继续使用旧的失效目录ID"""
+        if not hasattr(self, "_dir_cache") or not isinstance(self._dir_cache, dict):
+            return
+        if parent_file_id is not None and dirname is not None:
+            self._dir_cache.pop((int(parent_file_id), dirname.strip()), None)
+        elif parent_file_id is not None:
+            pid = int(parent_file_id)
+            keys_to_del = [k for k, v in self._dir_cache.items() if k[0] == pid or v == pid]
+            for k in keys_to_del:
+                self._dir_cache.pop(k, None)
+        else:
+            self._dir_cache.clear()
+
+    def mkdir(self, dirname: str, parent_file_id: int = 0, force_refresh: bool = False) -> Tuple[bool, int, str]:
+        """
+        在指定目录下检索或创建同名文件夹：
+        1. 优先命中内存缓存（除非 force_refresh=True）；
+        2. 先尝试在 parent_file_id 下检索是否已有未删除的同名文件夹（Type == 1）；
+        3. 若不存在，再调用 upload_request 创建文件夹。
+        """
         clean_name = (dirname or "").strip()
         if not clean_name:
             return False, 0, "文件夹名称为空"
 
         parent_id = int(parent_file_id or 0)
+        if not hasattr(self, "_dir_cache"):
+            self._dir_cache = {}
         cache_key = (parent_id, clean_name)
-        if hasattr(self, "_dir_cache") and cache_key in self._dir_cache:
+
+        if force_refresh:
+            self._dir_cache.pop(cache_key, None)
+        elif cache_key in self._dir_cache:
             return True, self._dir_cache[cache_key], "命中缓存"
 
+        # 1. 先查：若 list_files 可用且返回了同名文件夹，直接复用真实存在的 FileId
+        ok_list, items, list_msg = self.list_files(parent_file_id=parent_id)
+        if ok_list and items:
+            for item in items:
+                name = str(item.get("filename") or item.get("FileName") or item.get("file_name") or "").strip()
+                is_folder = (
+                    item.get("type") in (1, "1")
+                    or item.get("Type") in (1, "1")
+                    or item.get("category") in (1, "1")
+                )
+                is_trashed = item.get("trashed") in (True, 1, "1", "true") or item.get("Trashed") in (True, 1, "1", "true")
+                if is_folder and not is_trashed and name.lower() == clean_name.lower():
+                    fid_val = item.get("fileId") or item.get("FileId") or item.get("file_id") or item.get("id")
+                    if fid_val:
+                        did = int(fid_val)
+                        self._dir_cache[cache_key] = did
+                        return True, did, "复用已有同名文件夹"
+
+        # 2. 后建：调用 upload_request 创建新文件夹
         payload = {
             "driveId": 0,
             "parentFileId": parent_id,
@@ -157,12 +242,11 @@ class Pan123TgClient:
                     or info.get("fileId")
                     or data.get("fileId")
                     or data.get("FileId")
+                    or data.get("dirID")
                     or data.get("id")
                 )
                 if dir_id:
                     did = int(dir_id)
-                    if not hasattr(self, "_dir_cache"):
-                        self._dir_cache = {}
                     self._dir_cache[cache_key] = did
                     return True, did, "创建/获取文件夹成功"
             last_msg = res.get("message") if ok else msg
@@ -183,6 +267,7 @@ class Pan123TgClient:
         if not self.is_configured():
             return False, None, "123 云盘 Web Token 未配置"
 
+        configured_parent_id = int(target_parent_id or 0)
         hosts = [self.WEB_BASE_URL, self.BACKUP_BASE_URL]
         last_msg = ""
 
@@ -229,26 +314,19 @@ class Pan123TgClient:
                 continue
 
             # 判断是否需要归集至影视同名子文件夹：
-            # 若分享根目录本身就是一个文件夹 (Type == 1)，直接转存至 target_parent_id 即可完整保留该文件夹；
-            # 若分享根目录下直接平铺了多个文件 (如 .mkv + .nfo + .srt + .jpg)，则自动在目标目录下创建影视同名文件夹并转存入内
-            final_target_id = int(target_parent_id or 0)
+            # 若分享根目录本身就是一个文件夹 (Type == 1)，直接转存至 configured_parent_id 即可完整保留该文件夹；
+            # 若分享根目录下直接平铺了多个文件 (如 .mkv + .nfo + .srt + .jpg)，则自动在配置的目录ID下创建影视同名文件夹并转存入内
+            final_target_id = configured_parent_id
             has_single_root_folder = (
                 len(items) == 1 and int(items[0].get("type") or items[0].get("Type") or 0) == 1
             )
             if not has_single_root_folder and folder_name:
-                ok_mk, dir_id, msg_mk = self.mkdir(dirname=folder_name, parent_file_id=final_target_id)
+                ok_mk, dir_id, msg_mk = self.mkdir(dirname=folder_name, parent_file_id=configured_parent_id)
                 if ok_mk and dir_id:
                     final_target_id = dir_id
-                elif "文件夹不存在" in str(msg_mk) and final_target_id != 0:
-                    logger.warning(
-                        f"Pan123TgPilot 目标目录ID [{final_target_id}] 在云盘中不存在 (可能已被删除)，"
-                        f"自动降级至根目录 (0) 下创建影视文件夹【{folder_name}】并转存..."
-                    )
-                    ok_retry, dir_retry, _ = self.mkdir(dirname=folder_name, parent_file_id=0)
-                    if ok_retry and dir_retry:
-                        final_target_id = dir_retry
-                    else:
-                        final_target_id = 0
+                else:
+                    # 若创建子文件夹失败，保留用户配置的 configured_parent_id，绝不随意丢到根目录 0
+                    final_target_id = configured_parent_id
 
             # 2. 调用批量转存接口，全量转存所有文件夹与伴生文件
             save_payload = {
@@ -266,18 +344,46 @@ class Pan123TgClient:
                 data_s = res_save.get("data") or {}
                 fid = data_s.get("fileId") or data_s.get("FileId") or str(final_target_id or file_id_list[0])
                 return True, str(fid), f"分享转存成功 (共包含 {len(file_id_list)} 个文件/文件夹)"
-            elif ok_save and "文件夹不存在" in str(res_save.get("message")) and final_target_id != 0:
-                logger.warning(
-                    f"Pan123TgPilot 目录ID [{final_target_id}] 不存在，自动降级至根目录 (0) 重试分享转存..."
-                )
-                save_payload["parentFileId"] = 0
-                ok_fb, res_fb, msg_fb = self._http_request(
-                    save_url, method="POST", payload=save_payload, with_auth=True
-                )
-                if ok_fb and res_fb.get("code") == 0:
-                    data_s = res_fb.get("data") or {}
-                    fid = data_s.get("fileId") or data_s.get("FileId") or str(file_id_list[0])
-                    return True, str(fid), f"分享转存成功 (已降级至根目录，共 {len(file_id_list)} 个文件/文件夹)"
+            else:
+                err_save = res_save.get("message") if ok_save else msg_save
+                if "文件夹不存在" in str(err_save):
+                    # 情况 A：归集子文件夹 final_target_id 失效（例如被用户在网盘移动或删除），
+                    # 先清除子目录缓存并在用户配置的 configured_parent_id 下重新创建子文件夹或直接存入 configured_parent_id！
+                    self.invalidate_dir_cache(parent_file_id=final_target_id)
+                    if folder_name:
+                        self.invalidate_dir_cache(parent_file_id=configured_parent_id, dirname=folder_name)
+
+                    if final_target_id != configured_parent_id and configured_parent_id != 0:
+                        logger.warning(
+                            f"Pan123TgPilot 归集子目录ID [{final_target_id}] 在云端已失效，正在配置的目录ID [{configured_parent_id}] 下重建/直存..."
+                        )
+                        retry_target_id = configured_parent_id
+                        if not has_single_root_folder and folder_name:
+                            ok_re, new_sub_id, _ = self.mkdir(
+                                dirname=folder_name, parent_file_id=configured_parent_id, force_refresh=True
+                            )
+                            if ok_re and new_sub_id and new_sub_id != final_target_id:
+                                retry_target_id = new_sub_id
+
+                        save_payload["parentFileId"] = retry_target_id
+                        ok_fb, res_fb, msg_fb = self._http_request(
+                            save_url, method="POST", payload=save_payload, with_auth=True
+                        )
+                        if ok_fb and res_fb.get("code") == 0:
+                            data_s = res_fb.get("data") or {}
+                            fid = data_s.get("fileId") or data_s.get("FileId") or str(retry_target_id or file_id_list[0])
+                            return True, str(fid), f"分享转存成功 (已归集至配置目录 {retry_target_id}，共 {len(file_id_list)} 个文件)"
+
+                        # 若重建子目录仍报不存在，则直接存入用户配置的 configured_parent_id
+                        if retry_target_id != configured_parent_id:
+                            save_payload["parentFileId"] = configured_parent_id
+                            ok_fb2, res_fb2, _ = self._http_request(
+                                save_url, method="POST", payload=save_payload, with_auth=True
+                            )
+                            if ok_fb2 and res_fb2.get("code") == 0:
+                                data_s = res_fb2.get("data") or {}
+                                fid = data_s.get("fileId") or data_s.get("FileId") or str(configured_parent_id)
+                                return True, str(fid), f"分享转存成功 (已存入配置目录 {configured_parent_id})"
 
             last_msg = res_save.get("message") if ok_save else msg_save
 
@@ -294,28 +400,28 @@ class Pan123TgClient:
         folder_name: str = "",
     ) -> Tuple[bool, Optional[str], str]:
         """
-        解析 123 秒传码 (123FSLink) 并零流量直接秒传至指定目录 (支持自动归集至同名文件夹)
+        解析 123 秒传码 (123FSLink) 并零流量直接秒传至用户配置的目录 (支持自动归集至同名子文件夹)。
+        当归集子文件夹在云端不存在/失效时，优先在配置的目录ID (configured_parent_id) 下重建子文件夹或直接存入配置目录，
+        绝不越过用户配置的目录ID随意丢到根目录 (0)！
         """
         if not self.is_configured():
             return False, None, "123 云盘 Web Token 未配置"
 
-        target_id = int(parent_file_id or target_parent_id or 0)
+        configured_parent_id = int(parent_file_id or target_parent_id or 0)
+        target_id = configured_parent_id
 
-        # 若提供了影视文件夹名称，自动创建或复用该子文件夹
+        # 若提供了影视文件夹名称，在用户配置的目录下自动检索或创建该同名子文件夹
         if folder_name:
-            ok_mk, dir_id, msg_mk = self.mkdir(dirname=folder_name, parent_file_id=target_id)
+            ok_mk, dir_id, msg_mk = self.mkdir(dirname=folder_name, parent_file_id=configured_parent_id)
             if ok_mk and dir_id:
                 target_id = dir_id
-            elif "文件夹不存在" in str(msg_mk) and target_id != 0:
+            else:
+                # 若创建子文件夹失败，保持 target_id = configured_parent_id（存入用户配置的目录ID下）
                 logger.warning(
-                    f"Pan123TgPilot 检测到配置的目标目录ID [{target_id}] 在 123 云盘中不存在 (可能已被删除或移入回收站)，"
-                    f"自动降级至根目录 (0) 下创建同名影视文件夹【{folder_name}】并重试秒传..."
+                    f"Pan123TgPilot 在配置目录 [{configured_parent_id}] 下创建归集子文件夹【{folder_name}】未成功 ({msg_mk})，"
+                    f"将直接转存至配置目录 [{configured_parent_id}] 下"
                 )
-                ok_retry, dir_retry, _ = self.mkdir(dirname=folder_name, parent_file_id=0)
-                if ok_retry and dir_retry:
-                    target_id = dir_retry
-                else:
-                    target_id = 0
+                target_id = configured_parent_id
 
         # 若直接传入了秒传码字符串，自动解构
         if fslink and (not etag or not size or not filename):
@@ -332,6 +438,20 @@ class Pan123TgClient:
                     filename = filename or fn
             except Exception:
                 pass
+
+        def _extract_reuse_file_id(res_dict: dict) -> Tuple[bool, Optional[str]]:
+            data = res_dict.get("data") or {}
+            reuse = bool(data.get("reuse") or data.get("Reuse"))
+            info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
+            fid = (
+                data.get("fileId")
+                or data.get("FileId")
+                or info.get("FileId")
+                or info.get("fileId")
+            )
+            if reuse or (fid and not data.get("preuploadID")):
+                return True, str(fid or 0)
+            return False, None
 
         payload = {
             "parentFileId": target_id,
@@ -352,59 +472,95 @@ class Pan123TgClient:
         for url in urls:
             ok, res, msg = self._http_request(url, method="POST", payload=payload, with_auth=True)
             if ok and res.get("code") == 0:
-                data = res.get("data") or {}
-                reuse = bool(data.get("reuse") or data.get("Reuse"))
-                info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
-                file_id = (
-                    data.get("fileId")
-                    or data.get("FileId")
-                    or info.get("FileId")
-                    or info.get("fileId")
-                )
-                if reuse or (file_id and not data.get("preuploadID")):
-                    return True, str(file_id or 0), "秒传转存成功"
-                else:
-                    return False, None, "云端未命中秒传特征"
+                hit, fid_str = _extract_reuse_file_id(res)
+                if hit:
+                    return True, fid_str, "秒传转存成功"
+                return False, None, "云端未命中秒传特征"
             else:
                 resp_msg = res.get("message") if ok else msg
-                if "文件夹不存在" in str(resp_msg) and payload.get("parentFileId") != 0:
-                    logger.warning(
-                        f"Pan123TgPilot 目标目录ID [{payload.get('parentFileId')}] 在云端不存在，正在降级至根目录 (0) 重试秒传..."
-                    )
-                    payload["parentFileId"] = 0
-                    ok_fb, res_fb, msg_fb = self._http_request(url, method="POST", payload=payload, with_auth=True)
-                    if ok_fb and res_fb.get("code") == 0:
-                        data = res_fb.get("data") or {}
-                        reuse = bool(data.get("reuse") or data.get("Reuse"))
-                        info = data.get("Info") if isinstance(data.get("Info"), dict) else {}
-                        file_id = (
-                            data.get("fileId")
-                            or data.get("FileId")
-                            or info.get("FileId")
-                            or info.get("fileId")
+                if "文件夹不存在" in str(resp_msg):
+                    # 清除失效的目录缓存
+                    self.invalidate_dir_cache(parent_file_id=target_id)
+                    if folder_name:
+                        self.invalidate_dir_cache(parent_file_id=configured_parent_id, dirname=folder_name)
+
+                    # 优先回退方案 1：如果刚才报错的是归集子文件夹 (如 52958217 != 42149741)，
+                    # 先尝试在用户配置的目录 (42149741) 下强制刷新重建同名子文件夹，若仍不行则直接秒传到用户配置的目录 (42149741) 下！
+                    if target_id != configured_parent_id:
+                        logger.warning(
+                            f"Pan123TgPilot 归集子文件夹 [{target_id}] 在云端不存在，正在用户配置的目录ID [{configured_parent_id}] 下重新归集秒传..."
                         )
-                        if reuse or (file_id and not data.get("preuploadID")):
-                            return True, str(file_id or 0), "秒传转存成功 (已降级至根目录)"
-            last_msg = res.get("message") if ok else msg
+                        fallback_dir_id = configured_parent_id
+                        if folder_name:
+                            ok_re, new_dir_id, _ = self.mkdir(
+                                dirname=folder_name, parent_file_id=configured_parent_id, force_refresh=True
+                            )
+                            if ok_re and new_dir_id and new_dir_id != target_id:
+                                fallback_dir_id = new_dir_id
+
+                        payload["parentFileId"] = fallback_dir_id
+                        ok_fb1, res_fb1, msg_fb1 = self._http_request(url, method="POST", payload=payload, with_auth=True)
+                        if ok_fb1 and res_fb1.get("code") == 0:
+                            hit, fid_str = _extract_reuse_file_id(res_fb1)
+                            if hit:
+                                return True, fid_str, f"秒传转存成功 (目录ID: {fallback_dir_id})"
+
+                        # 若重建后的子目录仍报错，直接存入用户配置的 configured_parent_id 下
+                        if fallback_dir_id != configured_parent_id:
+                            payload["parentFileId"] = configured_parent_id
+                            ok_fb2, res_fb2, msg_fb2 = self._http_request(
+                                url, method="POST", payload=payload, with_auth=True
+                            )
+                            if ok_fb2 and res_fb2.get("code") == 0:
+                                hit, fid_str = _extract_reuse_file_id(res_fb2)
+                                if hit:
+                                    return True, fid_str, f"秒传转存成功 (已直接存入配置目录ID: {configured_parent_id})"
+                            resp_msg = res_fb2.get("message") if ok_fb2 else msg_fb2
+                        else:
+                            resp_msg = res_fb1.get("message") if ok_fb1 else msg_fb1
+
+                last_msg = resp_msg
 
         return False, None, f"秒传转存失败: {last_msg}"
 
     def trash_files(self, file_ids: List[int]) -> Tuple[bool, str]:
         """
-        洗版时将旧版本文件移至回收站
+        洗版时将旧版本文件移至回收站。
+        采用 123 云盘 Web 端标准回收站协议: fileTrashInfoList: [{"FileId": fid}] + event: "intoRecycle"
         """
-        if not file_ids or not self.is_configured():
+        clean_ids = []
+        for fid in file_ids or []:
+            try:
+                val = int(fid)
+                if val > 0:
+                    clean_ids.append(val)
+            except (ValueError, TypeError):
+                continue
+
+        if not clean_ids or not self.is_configured():
             return False, "无有效文件 ID"
 
         urls = [
             f"{self.WEB_BASE_URL}/b/api/file/trash",
             f"{self.BACKUP_BASE_URL}/b/api/file/trash",
+            f"{self.WEB_BASE_URL}/a/api/file/trash",
         ]
-        payload = {"fileIdList": file_ids}
+        # 优先使用 123 云盘 Web V3 标准格式 fileTrashInfoList，兼容旧格式兜底
+        payload_v3 = {
+            "driveId": 0,
+            "fileTrashInfoList": [{"FileId": fid} for fid in clean_ids],
+            "operation": True,
+            "event": "intoRecycle",
+            "operatePlace": 1,
+            "RequestSource": None,
+            "safeBox": False,
+        }
 
+        last_err = "未知错误"
         for url in urls:
-            ok, res, msg = self._http_request(url, method="POST", payload=payload, with_auth=True)
+            ok, res, msg = self._http_request(url, method="POST", payload=payload_v3, with_auth=True)
             if ok and res.get("code") == 0:
                 return True, "已成功移至回收站"
+            last_err = res.get("message") if ok else msg
 
-        return False, "移至回收站失败"
+        return False, f"移至回收站失败 ({last_err})"
