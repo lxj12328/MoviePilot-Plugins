@@ -84,6 +84,23 @@ S05E217 4K WEB-DL H.265 10bit 25fps [国语][内嵌简中字幕]
         parsed = self.parser.parse(msg)
         self.assertIsNone(parsed)
 
+    def test_parse_alternate_123pan_share_domains_and_title_prefix(self):
+        """验证 @regeng123 / @yun123pan 常用的 123865.com / 123912.com / 123952.com 等分流域名与「名称：」标题前缀"""
+        for domain in ("www.123865.com", "www.123912.com", "www.123952.com", "www.123592.com", "123685.com"):
+            msg = f"""
+名称：《仙逆》 (2023) 更新至第82集
+类型：剧集 / 动画
+画质：4K 2160p H.265 DoVi
+链接：https://{domain}/s/AbCdEf-1234?pwd=abcd
+            """
+            parsed = self.parser.parse(msg, msg_id="88", channel="@regeng123")
+            self.assertIsNotNone(parsed, f"Failed to parse domain {domain}")
+            self.assertEqual(parsed["title"], "仙逆")
+            self.assertEqual(parsed["year"], "2023")
+            self.assertEqual(parsed["media_type"], "tv")
+            self.assertEqual(parsed["share_key"], "AbCdEf-1234")
+            self.assertEqual(parsed["share_pwd"], "abcd")
+
 
 if __name__ == "__main__":
     unittest.main()

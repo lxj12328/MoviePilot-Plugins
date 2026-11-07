@@ -164,20 +164,27 @@ class TgChannelWatcher:
                 elif post_attr.isdigit():
                     msg_id = post_attr.strip()
 
-                # 提取正文容器内容
+                # 提取正文容器内容：优先匹配到 tgme_widget_message_footer 之前，避免正文内嵌套 <div> 或 <blockquote> 导致提前截断
                 m_body = re.search(
-                    r'<div class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>\s*(?:<div class="[^"]*tgme_widget_message_footer|</div>)',
+                    r'<div class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)(?=<div class="[^"]*(?:tgme_widget_message_footer|tgme_widget_message_link_preview|tgme_widget_message_inline_keyboard)|\Z)',
                     block_html,
                     re.DOTALL,
                 )
-                if not m_body:
-                    continue
+                body_html = m_body.group(1) if m_body else ""
 
-                body_html = m_body.group(1)
+                # 额外提取内联按钮 (tgme_widget_message_inline_button) 与链接卡片中的 123 云盘链接
+                extra_links: List[str] = []
+                for m_href in re.finditer(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', block_html, flags=re.DOTALL | re.IGNORECASE):
+                    href_val = unescape(m_href.group(1).strip())
+                    if "/s/" in href_val or "123" in href_val:
+                        extra_links.append(href_val)
+
+                if not body_html and not extra_links:
+                    continue
 
                 # 将 <a> 链接保留为 markdown [文本](url) 形式，避免链接文本丢失
                 def _replace_anchor(match: re.Match) -> str:
-                    href = match.group(1).strip()
+                    href = unescape(match.group(1).strip())
                     anchor_text = re.sub(r"<[^>]+>", "", match.group(2)).strip()
                     return f" [{anchor_text}]({href}) "
 
@@ -190,9 +197,13 @@ class TgChannelWatcher:
 
                 # 替换换行与空格
                 text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-                text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
+                text = re.sub(r"</p>|</div>|</blockquote>", "\n", text, flags=re.IGNORECASE)
                 text = re.sub(r"<[^>]+>", "", text)
                 text = unescape(text).strip()
+
+                for lk in extra_links:
+                    if lk not in text:
+                        text = f"{text}\n{lk}".strip()
 
                 if text:
                     results.append((msg_id, text))

@@ -71,7 +71,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -342,6 +342,8 @@ class Pan123TgPilot(_PluginBase):
                 logger.error(f"Pan123TgPilot 抓取频道 {channel} 消息失败: {e}")
                 continue
 
+            ch_valid = 0
+            ch_no_link = 0
             for msg_item in messages:
                 # msg_item 为 (msg_id, text) 元组
                 if isinstance(msg_item, (tuple, list)) and len(msg_item) >= 2:
@@ -356,21 +358,38 @@ class Pan123TgPilot(_PluginBase):
                 try:
                     res = self._process_single_message(channel=channel, msg_id=m_id, raw_text=m_text)
                     if res == "transferred":
+                        ch_valid += 1
                         stats["transferred"] += 1
                         self._check_stats["transferred_count"] += 1
                     elif res == "upgraded":
+                        ch_valid += 1
                         stats["upgraded"] += 1
                         self._check_stats["upgraded_count"] += 1
                     elif res == "skipped":
+                        ch_valid += 1
+                        stats["skipped"] += 1
+                        self._check_stats["skipped_count"] += 1
+                    elif res == "no_link":
+                        ch_no_link += 1
                         stats["skipped"] += 1
                         self._check_stats["skipped_count"] += 1
                     elif res == "failed":
+                        ch_valid += 1
                         stats["failed"] += 1
                         self._check_stats["failed_count"] += 1
                 except Exception as e:
                     logger.error(f"Pan123TgPilot 处理消息异常 ({channel}): {e}")
                     stats["failed"] += 1
                     self._check_stats["failed_count"] += 1
+
+            if messages and ch_valid == 0:
+                logger.info(
+                    f"Pan123TgPilot 频道 {channel} 本次检查的 {len(messages)} 条消息中未包含有效 123 云盘分享链接或秒传码 (普通非资源消息 {ch_no_link} 条)"
+                )
+            elif ch_no_link > 0:
+                logger.info(
+                    f"Pan123TgPilot 频道 {channel} 解析完成: 有效 123 资源消息 {ch_valid} 条, 普通无链接消息 {ch_no_link} 条"
+                )
 
         logger.info(
             f"Pan123TgPilot 频道巡检结束: 检查消息 {stats['messages_checked']} 条, "
@@ -390,7 +409,7 @@ class Pan123TgPilot(_PluginBase):
         resource = TgMessageParser.parse_message(text=raw_text, msg_id=msg_id, channel=channel)
         if not resource:
             # 该消息非影视资源或无法识别 123 链接
-            return "skipped"
+            return "no_link"
 
         # 判断转存目录 ID
         is_tv = (resource.get("media_type") == "tv")

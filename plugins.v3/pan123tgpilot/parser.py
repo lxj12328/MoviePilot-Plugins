@@ -13,9 +13,12 @@ from .ranker import calculate_quality_score
 class TgMessageParser:
     """Telegram 消息解析引擎"""
 
-    # 正则规则库
-    RE_FS_LINK = re.compile(r"(123FSLink(?:V2)?\$[a-fA-F0-9]{32,40}#\d+#[^\r\n]+)")
-    RE_SHARE_URL = re.compile(r"https?://(?:www\.)?(?:123pan\.com|123684\.com|123pan\.cn)/s/([a-zA-Z0-9_-]+)(?:\?[^ \r\n\"'\)\]]*)?")
+    # 正则规则库 (全面覆盖 123pan.com / 123pan.cn 及 123684/123865/123912/123952/123592 等官方分流域名)
+    RE_FS_LINK = re.compile(r"(123FSLink(?:V2)?\$[a-fA-F0-9]{32,40}#\d+#[^\r\n]+)", re.IGNORECASE)
+    RE_SHARE_URL = re.compile(
+        r"https?://(?:www\.)?(?:123pan\.(?:com|cn)|123(?:684|685|865|912|952|592|\d{3})\.com)/s/([a-zA-Z0-9_-]+)(?:\?[^ \r\n\"'\)\]]*)?",
+        re.IGNORECASE,
+    )
     RE_EXTRACT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
 
     RE_SEASON_EPISODE = re.compile(r"\bS(\d{1,3})(?:E(\d{1,4}))?\b", re.IGNORECASE)
@@ -136,22 +139,57 @@ class TgMessageParser:
 
     @classmethod
     def _extract_title_and_year(cls, text: str, fallback_filename: str = "") -> Tuple[str, str]:
-        """提取影视主标题与上映年份"""
+        """提取影视主标题与上映年份（兼容 @Pan123Movie / @regeng123 / @yun123pan 等多频道排版）"""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         candidate_title = ""
         year = ""
 
-        # 1. 优先扫描首行或带电影/剧集图标的行
-        for line in lines[:5]:
-            # 清理常见 emoji 与前缀
-            cleaned = re.sub(r"^[🎬📺🎥🏷️📌\s#]+", "", line).strip()
+        skip_keywords = (
+            "类型", "标签", "评分", "简介", "链接", "版本", "提取码", "访问码", "密码",
+            "大小", "体积", "画质", "编码", "字幕", "频道", "群组", "投稿", "注意",
+            "http://", "https://", "123FSLink",
+        )
+
+        # 1. 优先扫描前 8 行，寻找带「名称：/片名：/剧名：」或带年份或首行标题
+        for line in lines[:8]:
+            # 清理常见 emoji、markdown 加粗星号与话题符号
+            cleaned = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹\s#*]+", "", line).strip()
+            cleaned = re.sub(r"\*+", "", cleaned).strip()
+            if not cleaned:
+                continue
+
+            # 剥离常见字段前缀，例如 "名称：仙逆 (2023)" / "片名：《夜曲》" / "资源名称: xxx"
+            has_title_prefix = bool(
+                re.match(r"^(?:影视|资源|影片|剧集|动[画漫]|节目|中文)?(?:名称|片名|剧名|番名|标题|译名)[：:\s]+", cleaned)
+            )
+            cleaned = re.sub(
+                r"^(?:影视|资源|影片|剧集|动[画漫]|节目|中文)?(?:名称|片名|剧名|番名|标题|译名)[：:\s]+",
+                "",
+                cleaned,
+            ).strip()
+
+            # 移除 Markdown 链接包裹 [标题](https://...) -> 标题
+            cleaned = re.sub(r"\[([^\]]+)\]\(https?://[^\)]+\)", r"\1", cleaned).strip()
+
+            if not cleaned:
+                continue
+
+            if not has_title_prefix and any(cleaned.lower().startswith(k.lower()) or k in cleaned for k in skip_keywords):
+                continue
+
             # 匹配 标题 (2026) 格式
             m_year = re.search(r"^(.*?)(?:\s*[（\(](\d{4})[）\)]|\s*\[(\d{4})\])", cleaned)
-            if m_year:
+            if m_year and m_year.group(1).strip():
                 candidate_title = m_year.group(1).strip()
                 year = m_year.group(2) or m_year.group(3) or ""
                 break
-            elif not candidate_title and not any(k in cleaned for k in ("类型", "标签", "评分", "简介", "链接", "版本")):
+
+            # 若显式带有「名称：/片名：」前缀，直接采纳
+            if has_title_prefix and cleaned:
+                candidate_title = cleaned
+                break
+
+            if not candidate_title:
                 candidate_title = cleaned
 
         if not candidate_title and fallback_filename:
@@ -163,8 +201,24 @@ class TgMessageParser:
             else:
                 candidate_title = re.sub(r"-\s*\d{3,4}p.*", "", fallback_filename).strip()
 
-        # 进一步剔除中英文标点残留
-        candidate_title = re.sub(r"^[🎬📺🎥🏷️\s]+", "", candidate_title).strip()
+        # 剥离外层书名号《》或【】以及尾随的季集/更新说明
+        candidate_title = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨\s]+", "", candidate_title).strip()
+        m_book = re.match(r"^《([^》]+)》", candidate_title)
+        if m_book:
+            candidate_title = m_book.group(1).strip()
+        else:
+            m_bracket = re.match(r"^【([^】]+)】$", candidate_title)
+            if m_bracket:
+                candidate_title = m_bracket.group(1).strip()
+
+        # 若标题尾部跟有明显的更新/集数说明（如 "仙逆 更新至80集" 或 "仙逆 S01E05"），截取主标题
+        candidate_title = re.sub(r"\s+(?:更新至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|4K|2160[pP]|1080[pP]).*$", "", candidate_title).strip()
+
+        if not year:
+            m_any_yr = re.search(r"[（\(\[](\d{4})[）\)\]]", text)
+            if m_any_yr:
+                year = m_any_yr.group(1)
+
         return candidate_title or "未知影视", year
 
     @classmethod

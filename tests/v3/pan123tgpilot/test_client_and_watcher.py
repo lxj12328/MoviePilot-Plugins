@@ -165,6 +165,29 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertIn("https://www.123pan.com/s/7Tx1jv-8e4tv?pwd=xoxo", text)
         self.assertIn("斗破苍穹", text)
 
+    def test_tg_watcher_parse_inline_button_and_nested_div(self):
+        """验证 TG 消息中包含嵌套 blockquote/div 或底部 inline_button 分享链接时能完整提取"""
+        html = """
+        <div class="tgme_widget_message_wrap">
+            <div class="tgme_widget_message" data-post="regeng123/2048">
+                <div class="tgme_widget_message_text js-message_text" dir="auto">
+                    <div>名称：凡人修仙传 (2020)</div>
+                    <blockquote>S01E120 2160p H.265</blockquote>
+                </div>
+                <div class="tgme_widget_message_footer"></div>
+                <div class="tgme_widget_message_inline_keyboard">
+                    <a class="tgme_widget_message_inline_button" href="https://www.123865.com/s/XyZ987-abcd?pwd=6666">点击保存 123云盘</a>
+                </div>
+            </div>
+        </div>
+        """
+        messages = TgChannelWatcher._parse_tg_web_html(html, "regeng123")
+        self.assertEqual(len(messages), 1)
+        msg_id, text = messages[0]
+        self.assertEqual(msg_id, "2048")
+        self.assertIn("凡人修仙传", text)
+        self.assertIn("https://www.123865.com/s/XyZ987-abcd?pwd=6666", text)
+
 
 if __name__ == "__main__":
     unittest.main()
