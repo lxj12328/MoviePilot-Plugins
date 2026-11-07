@@ -4,7 +4,7 @@ Pan123TgPilot Telegram 消息智能提取器
 """
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from .ranker import calculate_quality_score

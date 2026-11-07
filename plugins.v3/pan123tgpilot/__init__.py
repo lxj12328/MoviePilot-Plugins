@@ -6,6 +6,7 @@
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Optional
 
@@ -71,7 +72,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.1.7"
+    plugin_version = "1.2.0"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -94,6 +95,12 @@ class Pan123TgPilot(_PluginBase):
         self._auto_delete_old_version: bool = True
         self._notify_enabled: bool = False
         self._retention_days: int = 0
+        # 并发配置：消息级并发转存数与单个分享内文件级并发秒传数 (1 = 串行)
+        self._msg_concurrency: int = 3
+        self._file_concurrency: int = 4
+        self._stop_event = threading.Event()
+        self._stats_lock = threading.Lock()
+        self._db_lock = threading.Lock()
 
         # 详情页交互式分页与筛选视图状态
         self._ui_page: int = 1
@@ -195,6 +202,19 @@ class Pan123TgPilot(_PluginBase):
         except (ValueError, TypeError):
             self._retention_days = 0
 
+        # 并发参数 (范围 1~8，非法值或 <=0 回退默认；1 表示串行)
+        try:
+            mc = int(config.get("msg_concurrency") or 3)
+            self._msg_concurrency = 3 if mc <= 0 else min(8, mc)
+        except (ValueError, TypeError):
+            self._msg_concurrency = 3
+        try:
+            fc = int(config.get("file_concurrency") or 4)
+            self._file_concurrency = 4 if fc <= 0 else min(8, fc)
+        except (ValueError, TypeError):
+            self._file_concurrency = 4
+        self._stop_event.clear()
+
         # 初始化数据库 (ensure_table 内含可重复执行的结构迁移与空记录清理)
         if not self._db:
             self._db = Pan123TgDatabase()
@@ -202,7 +222,7 @@ class Pan123TgPilot(_PluginBase):
 
         # 初始化 123 客户端
         if self._auth_token:
-            self._client = Pan123TgClient(token=self._auth_token)
+            self._client = Pan123TgClient(token=self._auth_token, file_concurrency=self._file_concurrency)
         else:
             self._client = None
 
@@ -259,7 +279,8 @@ class Pan123TgPilot(_PluginBase):
         return self._enabled
 
     def stop_service(self) -> None:
-        """停止后台服务"""
+        """停止后台服务 (通知并发转存任务不再启动新的任务)"""
+        self._stop_event.set()
         logger.info("Pan123TgPilot 服务已停止")
 
     def get_service(self) -> list[dict[str, Any]]:
@@ -346,13 +367,29 @@ class Pan123TgPilot(_PluginBase):
             "failed": 0,
         }
 
-        for channel in self._tg_channels:
-            stats["channels_checked"] += 1
+        # 阶段 0：并发抓取各频道最新消息 (纯网络 I/O)
+        def _fetch(ch: str) -> tuple[str, Optional[list]]:
             try:
-                messages = self._watcher.fetch_channel_messages(channel, limit=30)
-                logger.info(f"Pan123TgPilot 成功获取频道 {channel} 的 {len(messages)} 条最近消息")
+                msgs = self._watcher.fetch_channel_messages(ch, limit=30)
+                logger.info(f"Pan123TgPilot 成功获取频道 {ch} 的 {len(msgs)} 条最近消息")
+                return ch, msgs
             except Exception as e:
-                logger.error(f"Pan123TgPilot 抓取频道 {channel} 消息失败: {e}")
+                logger.error(f"Pan123TgPilot 抓取频道 {ch} 消息失败: {e}")
+                return ch, None
+
+        fetch_workers = max(1, min(4, len(self._tg_channels)))
+        if fetch_workers > 1:
+            with ThreadPoolExecutor(max_workers=fetch_workers, thread_name_prefix="pan123tg-fetch") as pool:
+                fetch_results = list(pool.map(_fetch, self._tg_channels))
+        else:
+            fetch_results = [_fetch(c) for c in self._tg_channels]
+
+        # 阶段 A：串行完成解析、链接去重与洗版判定 (纯本地、毫秒级)，收集待转存任务
+        batch_links: set = set()
+        jobs: list[dict] = []
+        for channel, messages in fetch_results:
+            stats["channels_checked"] += 1
+            if messages is None:
                 continue
 
             ch_valid = 0
@@ -367,33 +404,32 @@ class Pan123TgPilot(_PluginBase):
                     continue
 
                 stats["messages_checked"] += 1
-                self._check_stats["total_checked"] += 1
+                with self._stats_lock:
+                    self._check_stats["total_checked"] += 1
                 try:
-                    res = self._process_single_message(channel=channel, msg_id=m_id, raw_text=m_text)
-                    if res == "transferred":
-                        ch_valid += 1
-                        stats["transferred"] += 1
-                        self._check_stats["transferred_count"] += 1
-                    elif res == "upgraded":
-                        ch_valid += 1
-                        stats["upgraded"] += 1
-                        self._check_stats["upgraded_count"] += 1
-                    elif res == "skipped":
-                        ch_valid += 1
-                        stats["skipped"] += 1
-                        self._check_stats["skipped_count"] += 1
-                    elif res == "no_link":
-                        ch_no_link += 1
-                        stats["skipped"] += 1
-                        self._check_stats["skipped_count"] += 1
-                    elif res == "failed":
-                        ch_valid += 1
-                        stats["failed"] += 1
-                        self._check_stats["failed_count"] += 1
+                    status, job = self._prepare_message(
+                        channel=channel, msg_id=m_id, raw_text=m_text, batch_links=batch_links
+                    )
                 except Exception as e:
                     logger.error(f"Pan123TgPilot 处理消息异常 ({channel}): {e}")
                     stats["failed"] += 1
-                    self._check_stats["failed_count"] += 1
+                    with self._stats_lock:
+                        self._check_stats["failed_count"] += 1
+                    continue
+
+                if status == "no_link":
+                    ch_no_link += 1
+                    stats["skipped"] += 1
+                    with self._stats_lock:
+                        self._check_stats["skipped_count"] += 1
+                elif job is not None:
+                    ch_valid += 1
+                    jobs.append(job)
+                else:
+                    ch_valid += 1
+                    stats["skipped"] += 1
+                    with self._stats_lock:
+                        self._check_stats["skipped_count"] += 1
 
             if messages and ch_valid == 0:
                 logger.info(
@@ -404,6 +440,64 @@ class Pan123TgPilot(_PluginBase):
                     f"Pan123TgPilot 频道 {channel} 解析完成: 有效 123 资源消息 {ch_valid} 条, 普通无链接消息 {ch_no_link} 条"
                 )
 
+        # 批内合并：同一资源 (相同 media_key) 只转存评分最高的一条，避免先转低画质再洗版的重复转存
+        best_jobs: dict[str, dict] = {}
+        job_order: list[str] = []
+        merged_skipped = 0
+        for idx, job in enumerate(jobs):
+            key = job["media_key"] or f"__job_{idx}"
+            cur = best_jobs.get(key)
+            if cur is None:
+                best_jobs[key] = job
+                job_order.append(key)
+                continue
+            merged_skipped += 1
+            if (job["resource"].get("quality_score") or 0) > (cur["resource"].get("quality_score") or 0):
+                best_jobs[key] = job
+        merged_jobs = [best_jobs[k] for k in job_order]
+        if merged_skipped:
+            stats["skipped"] += merged_skipped
+            with self._stats_lock:
+                self._check_stats["skipped_count"] += merged_skipped
+            logger.info(f"Pan123TgPilot 批内合并同一资源的多条消息，仅保留评分最高者，合并跳过 {merged_skipped} 条")
+
+        # 阶段 B：线程池并发执行转存 (失败的任务不写入记录，下一轮巡检自动重试)
+        def _run(job: dict) -> tuple[dict, str]:
+            if self._stop_event.is_set():
+                return job, "cancelled"
+            try:
+                return job, self._execute_transfer(job)
+            except Exception as e:
+                logger.error(f"Pan123TgPilot 执行转存任务异常 (【{job.get('display_title')}】): {e}")
+                return job, "failed"
+
+        if merged_jobs:
+            workers = max(1, min(8, int(self._msg_concurrency or 1)))
+            workers = min(workers, len(merged_jobs))
+            logger.info(
+                f"Pan123TgPilot 共 {len(merged_jobs)} 部资源待转存，消息并发数 {workers}，单分享文件并发数 {self._file_concurrency}"
+            )
+            if workers <= 1:
+                run_results = [_run(j) for j in merged_jobs]
+            else:
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pan123tg-msg") as pool:
+                    run_results = list(pool.map(_run, merged_jobs))
+
+            for _job, res in run_results:
+                with self._stats_lock:
+                    if res == "transferred":
+                        stats["transferred"] += 1
+                        self._check_stats["transferred_count"] += 1
+                    elif res == "upgraded":
+                        stats["upgraded"] += 1
+                        self._check_stats["upgraded_count"] += 1
+                    elif res == "cancelled":
+                        stats["skipped"] += 1
+                        self._check_stats["skipped_count"] += 1
+                    else:
+                        stats["failed"] += 1
+                        self._check_stats["failed_count"] += 1
+
         logger.info(
             f"Pan123TgPilot 频道巡检结束: 检查消息 {stats['messages_checked']} 条, "
             f"新转存 {stats['transferred']} 部, 洗版升级 {stats['upgraded']} 部, "
@@ -411,18 +505,20 @@ class Pan123TgPilot(_PluginBase):
         )
         return {"success": True, "stats": stats}
 
-    def _process_single_message(self, channel: str, msg_id: str, raw_text: str) -> str:
+    def _prepare_message(
+        self, channel: str, msg_id: str, raw_text: str, batch_links: Optional[set] = None
+    ) -> tuple[str, Optional[dict]]:
         """
-        处理单条消息的转存决策与执行
-        返回值: "transferred" | "upgraded" | "skipped" | "failed"
+        阶段 A (纯本地、快速)：解析消息并完成链接去重与洗版决策，不执行任何网络转存。
+        返回 (状态, 转存任务)：状态为 "no_link" | "skipped" | "pending"，仅 "pending" 时任务非空。
         """
         if not raw_text:
-            return "skipped"
+            return "skipped", None
 
         resource = TgMessageParser.parse_message(text=raw_text, msg_id=msg_id, channel=channel)
         if not resource:
             # 该消息非影视资源或无法识别 123 链接
-            return "no_link"
+            return "no_link", None
 
         # 判断转存目录 ID
         is_tv = (resource.get("media_type") == "tv")
@@ -436,7 +532,12 @@ class Pan123TgPilot(_PluginBase):
         fslink = resource.get("fslink") or ""
         if self._db and self._db.has_link_processed(share_url=share_url, fslink=fslink):
             logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{display_title}】")
-            return "skipped"
+            return "skipped", None
+
+        # 同一批次内相同分享链接/秒传码只处理一次
+        link_token = str(resource.get("share_key") or resource.get("fs_etag") or "")
+        if batch_links is not None and link_token and link_token in batch_links:
+            return "skipped", None
 
         # 2. 媒体级去重与智能洗版对比 (剧集严格限定同剧名 + 同季集 ep_tag 对比)
         media_key = resource.get("media_key", "")
@@ -456,19 +557,64 @@ class Pan123TgPilot(_PluginBase):
         if existing_record:
             if not self._auto_upgrade:
                 logger.info(f"Pan123TgPilot 本地库已存在【{display_title}】且未开启自动洗版，跳过转存")
-                return "skipped"
+                return "skipped", None
 
             should_up, decision_reason = evaluate_upgrade(existing_record, resource)
             if not should_up:
                 logger.info(
                     f"Pan123TgPilot 【{display_title}】已有同质或更优资源 (当前得分: {existing_record.get('quality_score', 0)} >= 新资源: {resource.get('quality_score', 0)})，跳过转存"
                 )
-                return "skipped"
+                return "skipped", None
 
             is_upgrade = True
             logger.info(
                 f"Pan123TgPilot 发现更高画质资源【{display_title}】: {decision_reason}，准备洗版转存"
             )
+
+        if batch_links is not None and link_token:
+            batch_links.add(link_token)
+
+        job = {
+            "channel": channel,
+            "msg_id": msg_id,
+            "resource": resource,
+            "title": title,
+            "display_title": display_title,
+            "target_dir_id": target_dir_id,
+            "media_type_cn": media_type_cn,
+            "media_key": media_key,
+            "existing_record": existing_record,
+            "is_upgrade": is_upgrade,
+            "decision_reason": decision_reason,
+        }
+        return "pending", job
+
+    def _process_single_message(self, channel: str, msg_id: str, raw_text: str) -> str:
+        """
+        处理单条消息的转存决策与执行 (串行便捷入口：先判定再转存)
+        返回值: "transferred" | "upgraded" | "skipped" | "failed" | "no_link"
+        """
+        status, job = self._prepare_message(channel, msg_id, raw_text)
+        if job is None:
+            return status
+        return self._execute_transfer(job)
+
+    def _execute_transfer(self, job: dict) -> str:
+        """
+        阶段 B (网络 I/O，可并发)：对已通过判定的任务执行转存、旧版清理、记录落库与通知。
+        返回值: "transferred" | "upgraded" | "failed"
+        """
+        channel = job["channel"]
+        msg_id = job["msg_id"]
+        resource = job["resource"]
+        title = job["title"]
+        display_title = job["display_title"]
+        target_dir_id = job["target_dir_id"]
+        media_type_cn = job["media_type_cn"]
+        media_key = job["media_key"]
+        existing_record = job["existing_record"]
+        is_upgrade = job["is_upgrade"]
+        decision_reason = job["decision_reason"]
 
         # 执行转存
         save_success = False
@@ -577,7 +723,8 @@ class Pan123TgPilot(_PluginBase):
             "remark": decision_reason if is_upgrade else "首发转存",
         }
         if self._db:
-            self._db.save_or_update_record(**record_data)
+            with self._db_lock:
+                self._db.save_or_update_record(**record_data)
 
         # 发送 MoviePilot 系统通知
         action_title = "123云盘画质洗版成功" if is_upgrade else "123云盘TG转存成功"
@@ -689,6 +836,14 @@ class Pan123TgPilot(_PluginBase):
                 col([sw("auto_upgrade", "智能画质洗版", "同一影视出现更高评分版本时自动转存")]),
                 col([sw("auto_delete_old_version", "洗版后清理旧版本", "旧版文件移入网盘回收站")]),
                 col([fld(
+                    "msg_concurrency", "消息并发转存数", "同时转存的资源数 (1-8，默认 3)；调高可提速，但过高可能触发 123 风控，1 为串行",
+                    type="number", placeholder="3",
+                )]),
+                col([fld(
+                    "file_concurrency", "单分享文件并发数", "单个分享内同时秒传的文件数 (1-8，默认 4)；剧集集数多时提速明显，1 为串行",
+                    type="number", placeholder="4",
+                )]),
+                col([fld(
                     "retention_days", "记录保留天数", "0 = 永久保留；填 N 则每天 03:00 清理 N 天前的记录 (清理后同资源可能被重新转存)",
                     type="number", placeholder="0",
                 )], md=12),
@@ -720,6 +875,8 @@ class Pan123TgPilot(_PluginBase):
             "auto_delete_old_version": True,
             "notify_enabled": False,
             "retention_days": 0,
+            "msg_concurrency": 3,
+            "file_concurrency": 4,
         }
         return form, model
 

@@ -5,8 +5,10 @@ Pan123TgPilot 123云盘 Web 端转存与秒传客户端
 
 import json
 import ssl
+import threading
 import time
-from typing import Any, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,15 +21,50 @@ except ImportError:
 
 
 class Pan123TgClient:
-    """123云盘 Web 端转存客户端"""
+    """123云盘 Web 端转存客户端 (线程安全：支持多线程并发秒传，带全局限速与 429 退避)"""
 
     WEB_BASE_URL = "https://www.123684.com"
     BACKUP_BASE_URL = "https://yun.123pan.com"
 
-    def __init__(self, token: str = ""):
+    # 目录缓存/创建的可重入锁 (多线程并发时防止同名归集目录被重复创建)
+    _dir_lock = threading.RLock()
+    # 全局限速器锁
+    _rate_lock = threading.Lock()
+    # 默认全局请求速率上限 (次/秒)，用于降低并发时触发 123 风控的概率
+    DEFAULT_REQUEST_QPS = 6.0
+    # 单个分享内文件并发秒传线程数默认值
+    DEFAULT_FILE_CONCURRENCY = 4
+
+    def __init__(self, token: str = "", file_concurrency: int = 4, request_qps: float = 6.0):
         self.token = self._clean_token(token)
         self.user_info: dict = {}
         self._last_token_check = 0.0
+        self.file_concurrency = max(1, min(8, int(file_concurrency or 1)))
+        try:
+            qps = float(request_qps or self.DEFAULT_REQUEST_QPS)
+        except (ValueError, TypeError):
+            qps = self.DEFAULT_REQUEST_QPS
+        self._min_interval = 1.0 / max(0.5, qps)
+        self._next_slot = 0.0
+
+    def _throttle(self) -> None:
+        """全局令牌桶式限速：保证所有线程合计请求速率不超过上限"""
+        interval = getattr(self, "_min_interval", 1.0 / self.DEFAULT_REQUEST_QPS)
+        with self._rate_lock:
+            now = time.monotonic()
+            slot = max(now, getattr(self, "_next_slot", 0.0))
+            self._next_slot = slot + interval
+            wait = slot - now
+        if wait > 0:
+            time.sleep(wait)
+
+    @staticmethod
+    def _is_rate_limited(code: Any, message: Any) -> bool:
+        """判断响应是否为 123 的限流/请求过频提示"""
+        if str(code) == "429":
+            return True
+        msg = str(message or "")
+        return "频繁" in msg or "too many" in msg.lower()
 
     @staticmethod
     def _clean_token(token: Optional[str]) -> str:
@@ -80,23 +117,40 @@ class Pan123TgClient:
 
         last_err = ""
         for attempt in range(max_retries):
+            self._throttle()
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                     resp_data = resp.read().decode("utf-8")
                     try:
                         res_json = json.loads(resp_data)
-                        return True, res_json, "ok"
                     except Exception:
                         return True, {"code": 0, "raw": resp_data}, "ok"
+                    # 业务层限流 (HTTP 200 但 body code=429 / 提示请求过频)：指数退避后重试
+                    if (
+                        isinstance(res_json, dict)
+                        and self._is_rate_limited(res_json.get("code"), res_json.get("message"))
+                        and attempt < max_retries - 1
+                    ):
+                        last_err = str(res_json.get("message") or "请求过于频繁")
+                        time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+                        continue
+                    return True, res_json, "ok"
             except urllib.error.HTTPError as e:
                 err_text = ""
                 try:
                     err_text = e.read().decode("utf-8")
                     res_json = json.loads(err_text)
+                    if e.code == 429 and attempt < max_retries - 1:
+                        last_err = f"HTTP 429: {res_json.get('message', e.reason)}"
+                        time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+                        continue
                     return False, res_json, f"HTTP {e.code}: {res_json.get('message', e.reason)}"
                 except Exception:
                     last_err = f"HTTP {e.code}: {e.reason} ({err_text})"
+                if e.code == 429:
+                    time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+                    continue
                 if e.code in (401, 403):
                     break
             except Exception as ex:
@@ -160,19 +214,25 @@ class Pan123TgClient:
 
     def invalidate_dir_cache(self, parent_file_id: Optional[int] = None, dirname: Optional[str] = None) -> None:
         """清除已失效的目录缓存，防止网盘目录被移动/重建后继续使用旧的失效目录ID"""
-        if not hasattr(self, "_dir_cache") or not isinstance(self._dir_cache, dict):
-            return
-        if parent_file_id is not None and dirname is not None:
-            self._dir_cache.pop((int(parent_file_id), dirname.strip()), None)
-        elif parent_file_id is not None:
-            pid = int(parent_file_id)
-            keys_to_del = [k for k, v in self._dir_cache.items() if k[0] == pid or v == pid]
-            for k in keys_to_del:
-                self._dir_cache.pop(k, None)
-        else:
-            self._dir_cache.clear()
+        with self._dir_lock:
+            if not hasattr(self, "_dir_cache") or not isinstance(self._dir_cache, dict):
+                return
+            if parent_file_id is not None and dirname is not None:
+                self._dir_cache.pop((int(parent_file_id), dirname.strip()), None)
+            elif parent_file_id is not None:
+                pid = int(parent_file_id)
+                keys_to_del = [k for k, v in self._dir_cache.items() if k[0] == pid or v == pid]
+                for k in keys_to_del:
+                    self._dir_cache.pop(k, None)
+            else:
+                self._dir_cache.clear()
 
     def mkdir(self, dirname: str, parent_file_id: int = 0, force_refresh: bool = False) -> Tuple[bool, int, str]:
+        """线程安全的检索/创建同名文件夹 (加锁，防止并发时重复创建同名归集目录)"""
+        with self._dir_lock:
+            return self._mkdir_locked(dirname, parent_file_id, force_refresh)
+
+    def _mkdir_locked(self, dirname: str, parent_file_id: int = 0, force_refresh: bool = False) -> Tuple[bool, int, str]:
         """
         在指定目录下检索或创建同名文件夹：
         1. 优先命中内存缓存（除非 force_refresh=True）；
@@ -315,11 +375,13 @@ class Pan123TgClient:
         share_pwd: str = "",
         target_parent_id: int = 0,
         folder_name: str = "",
+        file_concurrency: Optional[int] = None,
     ) -> Tuple[bool, Optional[str], str]:
         """
         转存标准 123 分享链接中的全量文件夹与所有文件 (包含视频、字幕、nfo、图片等刮削信息)
         采用「递归遍历 /b/api/share/get 提取 (Etag, Size, FileName) + /b/api/file/upload_request 秒传落盘」方案，
         彻底解决 123 云盘 Web 端无 /b/api/share/save 接口导致 HTTP 404 的问题，并返回正片真实 FileId。
+        目录树遍历与子目录创建串行完成，文件秒传由线程池并发执行 (并发数 file_concurrency，缺省取实例配置)。
         :return: (ok: 是否成功, file_id: 云盘文件ID, msg: 说明)
         """
         if not self.is_configured():
@@ -374,8 +436,10 @@ class Pan123TgClient:
             largest_video_size = -1
             last_file_err = ""
 
-            def _transfer_items_recursive(items_list: List[Dict[str, Any]], cur_dir_id: int, depth: int = 0) -> None:
-                nonlocal saved_files_count, primary_file_id, largest_video_size, last_file_err
+            # 阶段 1 (串行)：递归遍历分享目录树，预先创建好全部子目录，仅收集待秒传的文件任务
+            file_tasks: List[Tuple[str, str, int, int]] = []  # (filename, etag, size, dir_id)
+
+            def _collect_items_recursive(items_list: List[Dict[str, Any]], cur_dir_id: int, depth: int = 0) -> None:
                 if depth > 6:
                     return
 
@@ -385,7 +449,7 @@ class Pan123TgClient:
                     iname = str(it.get("FileName") or it.get("fileName") or it.get("filename") or "").strip()
 
                     if itype == 1:
-                        # 子文件夹（如 Season 1 / 字幕 等）：在目标目录创建同名子目录并递归转存
+                        # 子文件夹（如 Season 1 / 字幕 等）：在目标目录创建同名子目录并递归收集
                         sub_target_id = cur_dir_id
                         if iname:
                             ok_sub_mk, created_sub_id, _ = self.mkdir(dirname=iname, parent_file_id=cur_dir_id)
@@ -396,28 +460,47 @@ class Pan123TgClient:
                                 host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=int(ifid)
                             )
                             if ok_ch and ch_items:
-                                _transfer_items_recursive(ch_items, sub_target_id, depth + 1)
+                                _collect_items_recursive(ch_items, sub_target_id, depth + 1)
                     else:
-                        # 文件（视频、字幕、NFO、海报等）：提取 Etag 与 Size 直接发起秒传转存
+                        # 文件（视频、字幕、NFO、海报等）：提取 Etag 与 Size，登记为待秒传任务
                         etag = str(it.get("Etag") or it.get("etag") or it.get("md5") or "").strip()
                         fsize = int(it.get("Size") if it.get("Size") is not None else (it.get("size") or 0))
                         if etag and iname:
-                            ok_fs, saved_fid, msg_fs = self.save_fslink(
-                                filename=iname,
-                                etag=etag,
-                                size=fsize,
-                                target_parent_id=cur_dir_id,
-                                folder_name="",
-                            )
-                            if ok_fs:
-                                saved_files_count += 1
-                                if fsize > largest_video_size and saved_fid:
-                                    largest_video_size = fsize
-                                    primary_file_id = str(saved_fid)
-                            else:
-                                last_file_err = msg_fs
+                            file_tasks.append((iname, etag, fsize, cur_dir_id))
 
-            _transfer_items_recursive(initial_items, base_target_id, depth=0)
+            _collect_items_recursive(initial_items, base_target_id, depth=0)
+
+            # 阶段 2 (并发)：线程池并发秒传全部文件，结果按提交顺序汇总以保持确定性
+            def _save_one(task: Tuple[str, str, int, int]) -> Tuple[bool, Optional[str], str]:
+                t_name, t_etag, t_size, t_dir = task
+                try:
+                    return self.save_fslink(
+                        filename=t_name,
+                        etag=t_etag,
+                        size=t_size,
+                        target_parent_id=t_dir,
+                        folder_name="",
+                    )
+                except Exception as ex:
+                    return False, None, str(ex)
+
+            workers = max(1, min(8, int(file_concurrency or getattr(self, "file_concurrency", 1) or 1)))
+            workers = min(workers, max(1, len(file_tasks)))
+            if workers <= 1 or len(file_tasks) <= 1:
+                results = [_save_one(t) for t in file_tasks]
+            else:
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pan123tg-file") as pool:
+                    results = list(pool.map(_save_one, file_tasks))
+
+            for task, (ok_fs, saved_fid, msg_fs) in zip(file_tasks, results):
+                if ok_fs:
+                    saved_files_count += 1
+                    fsize = task[2]
+                    if fsize > largest_video_size and saved_fid:
+                        largest_video_size = fsize
+                        primary_file_id = str(saved_fid)
+                else:
+                    last_file_err = msg_fs
 
             if saved_files_count > 0:
                 final_fid = primary_file_id or str(base_target_id)
