@@ -13,17 +13,28 @@ from .ranker import calculate_quality_score
 class TgMessageParser:
     """Telegram 消息解析引擎"""
 
-    # 正则规则库 (全面覆盖 123pan.com / 123pan.cn 及 123684/123865/123912/123952/123592 等官方分流域名)
+    # 正则规则库 (全面覆盖 123pan.com / 123pan.cn / *.share.123pan.cn 及 123684/123865/123912/123952/123592 等官方分流域名，兼容 /s/ 与 /123pan/ 路径)
     RE_FS_LINK = re.compile(r"(123FSLink(?:V2)?\$[a-fA-F0-9]{32,40}#\d+#[^\r\n]+)", re.IGNORECASE)
     RE_SHARE_URL = re.compile(
-        r"https?://(?:www\.)?(?:123pan\.(?:com|cn)|123(?:684|685|865|912|952|592|\d{3})\.com)/s/([a-zA-Z0-9_-]+)(?:\?[^ \r\n\"'\)\]]*)?",
+        r"https?://(?:[a-zA-Z0-9-]+\.)*(?:123pan\.(?:com|cn)|123(?:684|685|865|912|952|592|\d{3})\.(?:com|cn))/(?:s|123pan)/([a-zA-Z0-9_-]+)(?:\?[^ \r\n\"'\)\]]*)?",
         re.IGNORECASE,
     )
     RE_EXTRACT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
 
+    RE_SEASON_EP_RANGE = re.compile(
+        r"\bS(\d{1,3})\s*E(\d{1,4})\s*[-~～至]\s*(?:S\d{1,3}\s*)?E?(\d{1,4})\b",
+        re.IGNORECASE,
+    )
     RE_SEASON_EPISODE = re.compile(r"\bS(\d{1,3})(?:E(\d{1,4}))?\b", re.IGNORECASE)
-    RE_EPISODE_ONLY = re.compile(r"\b(?:EP|E|第)\s*(\d{1,4})\s*(?:集|话)?\b", re.IGNORECASE)
-    RE_SEASON_ONLY = re.compile(r"\b(?:Season|S|第)\s*(\d{1,2})\s*(?:季)?\b", re.IGNORECASE)
+    RE_EP_RANGE_ONLY = re.compile(
+        r"(?:\b(?:EP|E)|第)\s*(\d{1,4})\s*[-~～至]\s*(?:EP|E|第)?\s*(\d{1,4})\s*(?:集|话|期|\b)",
+        re.IGNORECASE,
+    )
+    RE_EPISODE_ONLY = re.compile(
+        r"(?:\b(?:EP|E)\s*(\d{1,4})\b|(?:(?:更新至|更至)\s*第?\s*|第\s*)(\d{1,4})\s*(?:集|话|期)?)",
+        re.IGNORECASE,
+    )
+    RE_SEASON_ONLY = re.compile(r"(?:\b(?:Season|S)\s*(\d{1,2})\b|第\s*(\d{1,2})\s*季)", re.IGNORECASE)
 
     RE_TMDB = re.compile(r"themoviedb\.org/(movie|tv)/(\d+)", re.IGNORECASE)
     RE_TMDB_TAG = re.compile(r"\[tmdbid=(\d+)\]|\{tmdb-(\d+)\}|(?:🆔\s*TMDB|TMDB\s*ID)[：:\s]*(\d+)", re.IGNORECASE)
@@ -91,14 +102,20 @@ class TgMessageParser:
         # 4. 识别影视分类 (movie vs tv) 与季集标识
         media_type, season, episode, ep_tag = cls._determine_media_type(text, fs_filename)
 
-        # 5. 提取画质参数与体积
+        # 5. 构建展示用标题：剧集统一附加 SxxExx 标识，便于清单展示与按集区分；title 仍保持纯净剧名供网盘创建总文件夹
+        display_title = title
+        if media_type == "tv" and ep_tag:
+            if ep_tag.upper() not in title.upper():
+                display_title = f"{title} {ep_tag}"
+
+        # 6. 提取画质参数与体积
         resolution, codec, dovi_hdr, file_size_bytes = cls._extract_quality_params(text, fs_size)
 
-        # 6. 计算 TMDB ID 与唯一媒体洗版锚点 (media_key)
+        # 7. 计算 TMDB ID 与唯一媒体洗版锚点 (media_key)
         tmdb_id = cls._extract_tmdb_id(text)
         media_key = cls._build_media_key(title, year, tmdb_id, media_type, ep_tag)
 
-        # 7. 计算综合质量得分
+        # 8. 计算综合质量得分
         score = calculate_quality_score(
             resolution=resolution,
             dovi_hdr=dovi_hdr,
@@ -112,7 +129,8 @@ class TgMessageParser:
             "msg_id": msg_id,
             "media_key": media_key,
             "title": title,
-            "media_title": title,
+            "display_title": display_title,
+            "media_title": display_title,
             "year": year,
             "tmdb_id": tmdb_id,
             "media_type": media_type,
@@ -146,8 +164,8 @@ class TgMessageParser:
 
         skip_keywords = (
             "类型", "分类", "标签", "评分", "简介", "链接", "版本", "提取码", "访问码", "密码",
-            "大小", "体积", "画质", "编码", "字幕", "频道", "群组", "投稿", "注意",
-            "播出日期", "首播", "上映", "http://", "https://", "123FSLink",
+            "大小", "体积", "画质", "编码", "字幕", "音频", "视频", "集数", "状态",
+            "频道", "群组", "投稿", "注意", "播出日期", "首播", "上映", "http://", "https://", "123FSLink",
         )
 
         title_prefix_pattern = (
@@ -158,7 +176,11 @@ class TgMessageParser:
         # 1. 优先扫描前 8 行，寻找带「名称：/片名：/剧集：/电影：」或带年份或首行标题
         for line in lines[:8]:
             # 清理常见 emoji、markdown 加粗星号与话题符号
-            cleaned = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹📅🗂🏷🎞💾📝\s#*]+", "", line).strip()
+            cleaned = re.sub(
+                r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹📅🗂🏷🎞💾📝🖥️🔊📦📼🔄🎭🍅🖥📹💬👤📖\s#*]+",
+                "",
+                line,
+            ).strip()
             cleaned = re.sub(r"\*+", "", cleaned).strip()
             if not cleaned:
                 continue
@@ -213,7 +235,7 @@ class TgMessageParser:
 
         # 若标题尾部跟有明显的更新/集数说明（如 "仙逆 更新至80集" 或 "谷雨 S01E06"），截取主标题
         candidate_title = re.sub(
-            r"\s+(?:更新至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|E\d{1,4}|4K|2160[pP]|1080[pP]).*$",
+            r"\s+(?:更新至|更至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|E\d{1,4}|4K|2160[pP]|1080[pP]).*$",
             "",
             candidate_title,
             flags=re.IGNORECASE,
@@ -245,24 +267,61 @@ class TgMessageParser:
         episode: Optional[int] = None
         ep_tag = ""
 
-        # 1. 季集正则探测 (S05E217 / S01 / E10)
-        m_se = cls.RE_SEASON_EPISODE.search(combined)
-        if m_se:
-            season = int(m_se.group(1))
-            episode = int(m_se.group(2)) if m_se.group(2) else None
-            ep_tag = f"S{season:02d}E{episode:02d}" if episode is not None else f"S{season:02d}"
+        # 预探测显式季号 (如 S02 / Season 2 / 第2季)
+        m_s_only = cls.RE_SEASON_ONLY.search(combined)
+        detected_season = int(m_s_only.group(1) or m_s_only.group(2)) if m_s_only else 1
+
+        # 1. 季+集范围探测 (如 S01E01-E04 / S01E01-04)
+        m_ser = cls.RE_SEASON_EP_RANGE.search(combined)
+        if m_ser:
+            season = int(m_ser.group(1))
+            ep_start = int(m_ser.group(2))
+            ep_end = int(m_ser.group(3))
+            episode = ep_end
+            ep_tag = (
+                f"S{season:02d}E{ep_start:02d}-E{ep_end:02d}"
+                if ep_end != ep_start
+                else f"S{season:02d}E{ep_start:02d}"
+            )
             return "tv", season, episode, ep_tag
 
+        # 2. 标准季+单集正则探测 (如 S05E217 / S01E06)
+        m_se = cls.RE_SEASON_EPISODE.search(combined)
+        if m_se and m_se.group(2):
+            season = int(m_se.group(1))
+            episode = int(m_se.group(2))
+            ep_tag = f"S{season:02d}E{episode:02d}"
+            return "tv", season, episode, ep_tag
+
+        # 3. 纯集数范围探测 (如 📼 集数：E01-E04 / EP01-04 / 第1-4集)
+        m_epr = cls.RE_EP_RANGE_ONLY.search(combined)
+        if m_epr:
+            season = int(m_se.group(1)) if m_se else detected_season
+            ep_start = int(m_epr.group(1))
+            ep_end = int(m_epr.group(2))
+            episode = ep_end
+            ep_tag = (
+                f"S{season:02d}E{ep_start:02d}-E{ep_end:02d}"
+                if ep_end != ep_start
+                else f"S{season:02d}E{ep_start:02d}"
+            )
+            return "tv", season, episode, ep_tag
+
+        # 4. 纯单集探测 (如 E06 / EP12 / 第32集 / 更新至第82集)
         m_ep = cls.RE_EPISODE_ONLY.search(combined)
         if m_ep:
-            episode = int(m_ep.group(1))
-            season = 1
-            ep_tag = f"S01E{episode:02d}"
+            episode = int(m_ep.group(1) or m_ep.group(2))
+            season = int(m_se.group(1)) if m_se else detected_season
+            ep_tag = f"S{season:02d}E{episode:02d}"
             return "tv", season, episode, ep_tag
 
-        m_s = cls.RE_SEASON_ONLY.search(combined)
-        if m_s:
-            season = int(m_s.group(1))
+        # 5. 仅含季号探测 (如 S01 / Season 1 / 第1季)
+        if m_se:
+            season = int(m_se.group(1))
+            ep_tag = f"S{season:02d}"
+            return "tv", season, None, ep_tag
+        if m_s_only:
+            season = detected_season
             ep_tag = f"S{season:02d}"
             return "tv", season, None, ep_tag
 

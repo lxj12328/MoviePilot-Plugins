@@ -86,9 +86,43 @@ class TestPan123TgDatabaseReal(unittest.TestCase):
 
     def test_compute_link_hash(self):
         self.assertEqual(self.m.compute_link_hash("https://www.123pan.com/s/abc-123?pwd=x"), "s:abc-123")
+        self.assertEqual(
+            self.m.compute_link_hash("https://1840976528.share.123pan.cn/123pan/cHCOTd-RLSP"),
+            "s:cHCOTd-RLSP",
+        )
         etag = "82467be2147f26532298438bf7015238"
         self.assertEqual(self.m.compute_link_hash(None, f"123FSLinkV2${etag}#10#a.mkv"), f"f:{etag}")
         self.assertEqual(self.m.compute_link_hash(None, None), "")
+
+    def test_tv_different_episodes_do_not_cross_match(self):
+        """验证同一剧集的不同集数 (如 S01E05 与 S01E06) 不会互相匹配导致误判洗版"""
+        self._add(
+            1,
+            media_key="tv_谷雨_S01E05",
+            media_title="谷雨 S01E05",
+            media_type="tv",
+            quality_score=125,
+        )
+        # 查询 S01E06 时不应命中 S01E05
+        rec_e06 = self.db.get_record_by_media_key(
+            media_key="tv_谷雨_S01E06",
+            title="谷雨",
+            year="2026",
+            media_type="tv",
+            ep_tag="S01E06",
+        )
+        self.assertIsNone(rec_e06)
+
+        # 查询同集 S01E05 时应准确命中
+        rec_e05 = self.db.get_record_by_media_key(
+            media_key="tv_谷雨_S01E05",
+            title="谷雨",
+            year="2026",
+            media_type="tv",
+            ep_tag="S01E05",
+        )
+        self.assertIsNotNone(rec_e05)
+        self.assertEqual(rec_e05["media_title"], "谷雨 S01E05")
 
     def test_pagination_and_count(self):
         for i in range(25):

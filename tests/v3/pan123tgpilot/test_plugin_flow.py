@@ -53,7 +53,7 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.assertEqual(commands[0]["cmd"], "/pan123_tg_run")
 
         apis = self.plugin.get_api()
-        self.assertEqual(len(apis), 4)
+        self.assertEqual(len(apis), 5)
 
     @patch("threading.Thread")
     def test_run_now_on_save(self, mock_thread):
@@ -255,8 +255,36 @@ S05E217 4K WEB-DL H.265
         card = self.plugin.get_page()[1]
         first = card["content"][1]
         self.assertEqual(len(first["content"][1]["content"]), self.plugin.PAGE_SIZE)
-        panels = card["content"][2]["content"]
-        self.assertEqual(len(panels), 2)  # 45 条 / 每页 20 → 共 3 页，其余 2 页折叠
+        # 验证包含顶部筛选工具栏与底部交互式分页导航栏 (共 3 页)
+        footer = card["content"][3]
+        self.assertIn("当前第 1 / 3 页", footer["content"][0]["text"])
+
+    def test_ui_page_switching_and_tv_ep_display(self):
+        self.plugin.init_plugin({"enabled": True})
+        self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 45
+        self.plugin._db.list_records.return_value = [
+            {
+                "media_title": "谷雨",
+                "media_key": "tv_谷雨_S01E06",
+                "media_type": "tv",
+                "status": "saved",
+                "updated_at": "2026-11-07 10:15:10",
+            }
+        ]
+        # 切换至第 2 页
+        res = self.plugin._api_ui_page(page=2, page_size=20)
+        self.assertTrue(res["success"])
+        self.assertEqual(res["data"]["page"], 2)
+        # 切换分类自动重置为第 1 页
+        res2 = self.plugin._api_ui_page(media_type="tv", status="SAVED")
+        self.assertEqual(res2["data"]["page"], 1)
+        self.assertEqual(res2["data"]["media_type"], "tv")
+        self.assertEqual(res2["data"]["status"], "SAVED")
+
+        # 验证历史剧集记录缺少 SxxExx 时在表格渲染自动补齐为 "谷雨 S01E06"
+        row = self.plugin._record_to_row(self.plugin._db.list_records.return_value[0])
+        self.assertEqual(row["title"], "谷雨 S01E06")
 
     def test_api_records_pagination(self):
         self.plugin.init_plugin({"enabled": True})

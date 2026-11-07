@@ -71,12 +71,12 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
     PAGE_FETCH_LIMIT = 500
-    # 详情页每页展示条数
+    # 详情页默认每页展示条数
     PAGE_SIZE = 20
 
     def __init__(self):
@@ -94,6 +94,12 @@ class Pan123TgPilot(_PluginBase):
         self._auto_delete_old_version: bool = True
         self._notify_enabled: bool = False
         self._retention_days: int = 0
+
+        # 详情页交互式分页与筛选视图状态
+        self._ui_page: int = 1
+        self._ui_page_size: int = self.PAGE_SIZE
+        self._ui_media_type: str = "all"
+        self._ui_status: str = "ALL"
 
         self._client: Optional[Pan123TgClient] = None
         self._watcher: Optional[TgChannelWatcher] = None
@@ -423,15 +429,16 @@ class Pan123TgPilot(_PluginBase):
         target_dir_id = self._tv_target_dir_id if is_tv else self._movie_target_dir_id
         media_type_cn = "剧集" if is_tv else "电影"
         title = resource.get("title", "未知影视")
+        display_title = str(resource.get("display_title") or resource.get("media_title") or title).strip()
 
         # 1. 链接级去重：若该分享链接或秒传码已在历史记录中，直接跳过
         share_url = resource.get("share_url") or ""
         fslink = resource.get("fslink") or ""
         if self._db and self._db.has_link_processed(share_url=share_url, fslink=fslink):
-            logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{title}】")
+            logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{display_title}】")
             return "skipped"
 
-        # 2. 媒体级去重与智能洗版对比
+        # 2. 媒体级去重与智能洗版对比 (剧集严格限定同剧名 + 同季集 ep_tag 对比)
         media_key = resource.get("media_key", "")
         existing_record = None
         if self._db:
@@ -448,19 +455,19 @@ class Pan123TgPilot(_PluginBase):
         decision_reason = ""
         if existing_record:
             if not self._auto_upgrade:
-                logger.info(f"Pan123TgPilot 本地库已存在【{title}】且未开启自动洗版，跳过转存")
+                logger.info(f"Pan123TgPilot 本地库已存在【{display_title}】且未开启自动洗版，跳过转存")
                 return "skipped"
 
             should_up, decision_reason = evaluate_upgrade(existing_record, resource)
             if not should_up:
                 logger.info(
-                    f"Pan123TgPilot 【{title}】已有同质或更优资源 (当前得分: {existing_record.get('quality_score', 0)} >= 新资源: {resource.get('quality_score', 0)})，跳过转存"
+                    f"Pan123TgPilot 【{display_title}】已有同质或更优资源 (当前得分: {existing_record.get('quality_score', 0)} >= 新资源: {resource.get('quality_score', 0)})，跳过转存"
                 )
                 return "skipped"
 
             is_upgrade = True
             logger.info(
-                f"Pan123TgPilot 发现更高画质资源【{title}】: {decision_reason}，准备洗版转存"
+                f"Pan123TgPilot 发现更高画质资源【{display_title}】: {decision_reason}，准备洗版转存"
             )
 
         # 执行转存
@@ -468,7 +475,7 @@ class Pan123TgPilot(_PluginBase):
         saved_file_id: Optional[int] = None
         error_msg = ""
 
-        # 构建统一的媒体文件夹名称 (例如: "八仙！ (2026)" 或 "死灵法师！我即是天灾")
+        # 构建统一的媒体文件夹名称 (例如: "八仙！ (2026)" 或 "玫瑰战争 (2026)")，同剧集各集统一归集在剧名总文件夹下
         year_str = str(resource.get("year") or "").strip()
         folder_display_name = f"{title} ({year_str})" if year_str else title
 
@@ -478,7 +485,7 @@ class Pan123TgPilot(_PluginBase):
                 share_key = resource["share_key"]
                 share_pwd = resource.get("share_pwd", "")
                 logger.info(
-                    f"Pan123TgPilot 发起 123 分享转存 (完整转存文件夹及字幕/nfo刮削伴生文件): 【{title}】 "
+                    f"Pan123TgPilot 发起 123 分享转存 (完整转存文件夹及字幕/nfo刮削伴生文件): 【{display_title}】 "
                     f"(Key: {share_key}) -> 目标目录ID: {target_dir_id}"
                 )
                 success, file_id, msg = self._client.save_share_link(
@@ -499,7 +506,7 @@ class Pan123TgPilot(_PluginBase):
                 # 2. 仅当没有分享链接时，执行单文件秒传码转存 (自动归集至同名文件夹)
                 fslink = resource["fslink"]
                 logger.info(
-                    f"Pan123TgPilot 发起 123 秒传转存: 【{resource.get('fs_filename') or title}】 -> "
+                    f"Pan123TgPilot 发起 123 秒传转存: 【{resource.get('fs_filename') or display_title}】 -> "
                     f"目标目录ID: {target_dir_id} (归集文件夹: {folder_display_name})"
                 )
                 success, file_id, msg = self._client.save_fslink(
@@ -521,7 +528,7 @@ class Pan123TgPilot(_PluginBase):
 
         if not save_success:
             logger.warning(
-                f"Pan123TgPilot 转存【{title}】失败: {error_msg} (频道: {channel})"
+                f"Pan123TgPilot 转存【{display_title}】失败: {error_msg} (频道: {channel})"
             )
             return "failed"
 
@@ -542,14 +549,14 @@ class Pan123TgPilot(_PluginBase):
             except Exception as e:
                 logger.warning(f"Pan123TgPilot 清理旧版文件异常: {e}")
 
-        # 持久化转存记录
+        # 持久化转存记录 (media_title 保存含 SxxExx 的 display_title，便于清单直观展示季集)
         record_data = {
             "media_key": media_key,
             "channel": channel,
             "channel_name": channel,
             "msg_id": msg_id,
-            "media_title": title,
-            "title": title,
+            "media_title": display_title,
+            "title": display_title,
             "year": resource.get("year", ""),
             "media_type": resource.get("media_type", "movie"),
             "season": resource.get("season"),
@@ -578,7 +585,7 @@ class Pan123TgPilot(_PluginBase):
         size_str = f"{size_gb:.2f} GB" if size_gb > 0 else "未知"
         notify_content = (
             f"媒体类型: {media_type_cn}\n"
-            f"影视名称: {title}" + (f" ({resource.get('year')})" if resource.get('year') else "") + "\n"
+            f"影视名称: {display_title}" + (f" ({resource.get('year')})" if resource.get('year') else "") + "\n"
             f"画质规格: {resource.get('resolution') or '未知'} | {resource.get('codec') or '未知'} | {resource.get('dovi_hdr') or 'SDR'}\n"
             f"文件大小: {size_str}\n"
             f"来源频道: {channel}\n"
@@ -588,7 +595,7 @@ class Pan123TgPilot(_PluginBase):
             notify_content += f"洗版策略: 质量评分升级为 {resource.get('quality_score')} 分 (旧版已{'移至回收站' if old_file_deleted else '保留'})\n"
 
         self.notify(action_title, notify_content)
-        logger.info(f"Pan123TgPilot 【{title}】转存完成 ({'洗版升级' if is_upgrade else '首次转存'})")
+        logger.info(f"Pan123TgPilot 【{display_title}】转存完成 ({'洗版升级' if is_upgrade else '首次转存'})")
 
         return "upgraded" if is_upgrade else "transferred"
 
@@ -737,7 +744,7 @@ class Pan123TgPilot(_PluginBase):
 
     @staticmethod
     def _record_to_row(r: dict) -> dict:
-        """把数据库记录转成数据表行"""
+        """把数据库记录转成数据表行（剧集自动保障携带 SxxExx 标识）"""
         size_bytes = r.get("file_size") or 0
         size_str = f"{size_bytes / (1024.0 ** 3):.2f} GB" if size_bytes > 0 else "-"
         spec = " / ".join([x for x in (r.get("resolution"), r.get("codec"), r.get("dovi_hdr")) if x]) or "-"
@@ -750,6 +757,18 @@ class Pan123TgPilot(_PluginBase):
             m_fn = re.search(r"#([^#]+\.(?:mkv|mp4|ts|avi|mov|iso|rmvb|flv))", r["fslink"], re.IGNORECASE)
             if m_fn:
                 title_text = m_fn.group(1)
+
+        # 若为剧集记录且标题尚未标注 SxxExx，自动从 media_key 或 fslink 补齐
+        m_type = str(r.get("media_type") or "").lower()
+        m_key = str(r.get("media_key") or "")
+        if title_text and (m_type == "tv" or m_key.startswith("tv_")):
+            if not re.search(r"\bS\d{1,3}(?:E\d{1,4})?", title_text, re.IGNORECASE):
+                m_ep = re.search(r"_(S\d{1,3}(?:E\d{1,4}(?:-E?\d{1,4})?)?)$", m_key, re.IGNORECASE)
+                if not m_ep and r.get("fslink"):
+                    m_ep = re.search(r"\b(S\d{1,3}E\d{1,4}(?:-E?\d{1,4})?)\b", str(r.get("fslink")), re.IGNORECASE)
+                if m_ep:
+                    title_text = f"{title_text} {m_ep.group(1).upper()}"
+
         return {
             "title": title_text or "-",
             "spec": spec,
@@ -786,12 +805,105 @@ class Pan123TgPilot(_PluginBase):
             ],
         }
 
+    def _load_ui_view_state(self) -> None:
+        """从插件持久化存储恢复详情页视图状态（页码、每页条数、媒体类型、状态过滤）"""
+        if not hasattr(self, "get_data"):
+            return
+        try:
+            saved = self.get_data("ui_view_state")
+            if isinstance(saved, dict):
+                if "page" in saved:
+                    self._ui_page = max(1, int(saved["page"] or 1))
+                if "page_size" in saved:
+                    self._ui_page_size = min(100, max(5, int(saved["page_size"] or self.PAGE_SIZE)))
+                if "media_type" in saved and str(saved["media_type"]).lower() in ("all", "movie", "tv"):
+                    self._ui_media_type = str(saved["media_type"]).lower()
+                if "status" in saved and saved["status"]:
+                    self._ui_status = str(saved["status"]).upper()
+        except Exception:
+            pass
+
+    def _save_ui_view_state(self) -> None:
+        """将详情页当前视图状态持久化保存，防止多 Worker 或重载丢失状态"""
+        if not hasattr(self, "save_data"):
+            return
+        try:
+            self.save_data(
+                "ui_view_state",
+                {
+                    "page": self._ui_page,
+                    "page_size": self._ui_page_size,
+                    "media_type": self._ui_media_type,
+                    "status": self._ui_status,
+                },
+            )
+        except Exception:
+            pass
+
+    def _build_ui_page_btn(
+        self,
+        text: str,
+        *,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
+        media_type: Optional[str] = None,
+        status: Optional[str] = None,
+        color: str = "default",
+        variant: str = "outlined",
+        size: str = "small",
+        disabled: bool = False,
+        min_width: Optional[str] = None,
+    ) -> dict:
+        """构建绑定 /ui_page 事件的交互按钮，点击后自动更新视图状态并触发详情页重绘"""
+        plugin_id = self.__class__.__name__
+        params: dict[str, Any] = {}
+        if page is not None:
+            params["page"] = int(page)
+        if page_size is not None:
+            params["page_size"] = int(page_size)
+        if media_type is not None:
+            params["media_type"] = str(media_type)
+        if status is not None:
+            params["status"] = str(status)
+
+        props: dict[str, Any] = {
+            "size": size,
+            "variant": variant,
+            "color": color,
+            "disabled": disabled,
+            "class": "ma-1",
+            "text": text,
+        }
+        if min_width:
+            props["style"] = f"min-width: {min_width};"
+
+        btn: dict[str, Any] = {
+            "component": "VBtn",
+            "props": props,
+            "text": text,
+        }
+        if not disabled:
+            btn["events"] = {
+                "click": {
+                    "api": f"plugin/{plugin_id}/ui_page",
+                    "method": "get",
+                    "params": params,
+                }
+            }
+        return btn
+
     def get_page(self) -> list[dict]:
-        """插件详情页：状态统计 + 带分页/排序的已转存资源数据表"""
+        """插件详情页：状态统计看板 + 分类/状态筛选工具栏 + 交互式分页数据表 (与 Pan123Pilot v1.5.3 同款分页体验)"""
+        self._load_ui_view_state()
+
         status_text = "运行中" if self._enabled else "未启用"
         channels_str = ", ".join(self._tg_channels) if self._tg_channels else "未配置"
         last_check = self._last_check_time.strftime("%Y-%m-%d %H:%M:%S") if self._last_check_time else "尚未执行"
         retention = f"{self._retention_days} 天" if self._retention_days > 0 else "永久"
+
+        cur_media_type = str(getattr(self, "_ui_media_type", "all") or "all").lower()
+        cur_status = str(getattr(self, "_ui_status", "ALL") or "ALL").upper()
+        page_size = max(5, int(getattr(self, "_ui_page_size", self.PAGE_SIZE) or self.PAGE_SIZE))
 
         status_card = {
             "component": "VCard",
@@ -819,46 +931,303 @@ class Pan123TgPilot(_PluginBase):
             ],
         }
 
-        total = 0
-        items: list[dict] = []
+        status_counts: dict[str, int] = {}
+        if self._db and hasattr(self._db, "get_status_counts"):
+            try:
+                sc = self._db.get_status_counts(media_type=cur_media_type)
+                if isinstance(sc, dict):
+                    status_counts = sc
+            except Exception:
+                status_counts = {}
+
+        filtered_total = 0
         if self._db:
             try:
-                total = self._db.count_records()
-                items = [self._record_to_row(r) for r in self._db.list_records(limit=self.PAGE_FETCH_LIMIT)]
+                cnt_val = self._db.count_records(
+                    status=None if cur_status == "ALL" else cur_status.lower(),
+                    media_type=None if cur_media_type == "all" else cur_media_type,
+                )
+                if isinstance(cnt_val, int):
+                    filtered_total = cnt_val
+            except TypeError:
+                try:
+                    cnt_val = self._db.count_records()
+                    if isinstance(cnt_val, int):
+                        filtered_total = cnt_val
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.error(f"Pan123TgPilot 统计转存记录失败: {e}")
+
+        type_total = int(status_counts.get("TOTAL", filtered_total) or filtered_total)
+        all_files_total = int(status_counts.get("ALL_TOTAL", type_total) or type_total)
+        movie_total = int(status_counts.get("MOVIE_TOTAL", 0) or 0)
+        tv_total = int(status_counts.get("TV_TOTAL", 0) or 0)
+        saved_count = int(status_counts.get("SAVED", 0) or 0)
+        upgraded_count = int(status_counts.get("UPGRADED", 0) or 0)
+
+        total_pages_est = max(1, (max(filtered_total, 1) + page_size - 1) // page_size)
+        cur_page = min(max(1, int(getattr(self, "_ui_page", 1) or 1)), total_pages_est)
+        offset = (cur_page - 1) * page_size
+
+        raw_records: list[dict] = []
+        if self._db:
+            try:
+                raw_records = self._db.list_records(
+                    limit=page_size,
+                    offset=offset,
+                    status=None if cur_status == "ALL" else cur_status.lower(),
+                    media_type=None if cur_media_type == "all" else cur_media_type,
+                )
+            except TypeError:
+                try:
+                    raw_records = self._db.list_records(limit=page_size, offset=offset)
+                except Exception as e:
+                    logger.error(f"Pan123TgPilot 读取转存记录失败: {e}")
             except Exception as e:
                 logger.error(f"Pan123TgPilot 读取转存记录失败: {e}")
 
-        # 注意：VDataTable 在 MoviePilot Vuetify JSON 渲染器下只渲染分页条、不渲染行，
-        # 因此改用 VTable + tr/td 逐行输出，并把记录按页分组：第 1 页直接展示，其余页放入折叠面板。
-        page_size = self.PAGE_SIZE
-        pages = [items[k:k + page_size] for k in range(0, len(items), page_size)]
+        if filtered_total <= 0 and raw_records:
+            filtered_total = len(raw_records)
 
-        body: list[dict] = [{
-            "component": "VCardItem",
+        total_pages = max(1, (filtered_total + page_size - 1) // page_size)
+        if cur_page > total_pages:
+            cur_page = total_pages
+            offset = (cur_page - 1) * page_size
+
+        # 兼容单测中 mock 一次性返回超过 page_size 条记录的情况
+        if len(raw_records) > page_size:
+            page_records = raw_records[offset:offset + page_size]
+        else:
+            page_records = raw_records
+
+        page_rows = [self._record_to_row(r) for r in page_records]
+
+        # 1. 顶部媒体类型、每页条数与状态筛选工具栏
+        type_filter_buttons = [
+            self._build_ui_page_btn(
+                f"🗂 全部媒体 ({all_files_total})",
+                media_type="all",
+                color="primary" if cur_media_type == "all" else "default",
+                variant="flat" if cur_media_type == "all" else "tonal",
+            ),
+            self._build_ui_page_btn(
+                f"🎬 电影 ({movie_total})",
+                media_type="movie",
+                color="secondary" if cur_media_type == "movie" else "default",
+                variant="flat" if cur_media_type == "movie" else "tonal",
+            ),
+            self._build_ui_page_btn(
+                f"📺 剧集 ({tv_total})",
+                media_type="tv",
+                color="purple" if cur_media_type == "tv" else "default",
+                variant="flat" if cur_media_type == "tv" else "tonal",
+            ),
+        ]
+
+        status_filter_buttons = [
+            self._build_ui_page_btn(
+                f"全部状态 ({type_total})",
+                status="ALL",
+                color="primary" if cur_status == "ALL" else "default",
+                variant="flat" if cur_status == "ALL" else "outlined",
+                size="x-small",
+            ),
+            self._build_ui_page_btn(
+                f"✅ 首发转存 ({saved_count})",
+                status="SAVED",
+                color="success" if cur_status == "SAVED" else "default",
+                variant="flat" if cur_status == "SAVED" else "outlined",
+                size="x-small",
+            ),
+            self._build_ui_page_btn(
+                f"🚀 洗版升级 ({upgraded_count})",
+                status="UPGRADED",
+                color="info" if cur_status == "UPGRADED" else "default",
+                variant="flat" if cur_status == "UPGRADED" else "outlined",
+                size="x-small",
+            ),
+        ]
+
+        page_size_buttons = [
+            self._build_ui_page_btn(
+                f"{ps}条/页",
+                page_size=ps,
+                color="primary" if page_size == ps else "default",
+                variant="tonal" if page_size == ps else "text",
+                size="x-small",
+            )
+            for ps in (15, 20, 50)
+        ]
+
+        filter_toolbar = {
+            "component": "div",
+            "props": {"class": "px-4 py-2 bg-surface-light"},
             "content": [
-                {"component": "VCardTitle", "text": f"已转存资源清单 (共 {total} 条)"},
-                {"component": "VCardSubtitle",
-                 "text": f"按时间倒序，每页 {page_size} 条，更早的页请展开下方折叠面板；"
-                         "按关键词/状态检索请调用 /records?keyword=&page=&page_size="},
-            ],
-        }]
-        body.append(self._records_table(pages[0] if pages else []))
-        if len(pages) > 1:
-            panels = []
-            for n, chunk in enumerate(pages[1:], start=2):
-                start, end = (n - 1) * page_size + 1, (n - 1) * page_size + len(chunk)
-                panels.append({
-                    "component": "VExpansionPanel",
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center justify-space-between mb-1"},
                     "content": [
-                        {"component": "VExpansionPanelTitle", "text": f"第 {n} 页 (第 {start}-{end} 条)"},
-                        {"component": "VExpansionPanelText", "content": [self._records_table(chunk)]},
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap align-center"},
+                            "content": type_filter_buttons,
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "d-flex flex-wrap align-center"},
+                            "content": page_size_buttons,
+                        },
                     ],
-                })
-            body.append({
-                "component": "VExpansionPanels",
-                "props": {"variant": "accordion", "class": "mt-2"},
-                "content": panels,
-            })
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center"},
+                    "content": status_filter_buttons,
+                },
+            ],
+        }
+
+        # 2. 底部现代化分页导航栏（首页 / -5页 / 上一页 / 页码滑动窗口 / 下一页 / +5页 / 末页）
+        start_num = offset + 1 if page_rows else 0
+        end_num = offset + len(page_rows)
+
+        nav_buttons: list[dict] = [
+            self._build_ui_page_btn(
+                "⏮ 首页",
+                page=1,
+                disabled=(cur_page <= 1),
+                variant="tonal",
+            ),
+        ]
+        if total_pages > 5:
+            nav_buttons.append(
+                self._build_ui_page_btn(
+                    "-5页",
+                    page=max(1, cur_page - 5),
+                    disabled=(cur_page <= 1),
+                    variant="outlined",
+                )
+            )
+        nav_buttons.append(
+            self._build_ui_page_btn(
+                "◀ 上一页",
+                page=max(1, cur_page - 1),
+                disabled=(cur_page <= 1),
+                variant="tonal",
+                color="primary" if cur_page > 1 else "default",
+            )
+        )
+
+        win_radius = 2
+        p_start = max(1, cur_page - win_radius)
+        p_end = min(total_pages, cur_page + win_radius)
+        if p_end - p_start < win_radius * 2:
+            if p_start == 1:
+                p_end = min(total_pages, p_start + win_radius * 2)
+            elif p_end == total_pages:
+                p_start = max(1, p_end - win_radius * 2)
+
+        if p_start > 1:
+            nav_buttons.append(
+                self._build_ui_page_btn("1", page=1, variant="outlined", min_width="36px")
+            )
+            if p_start > 2:
+                nav_buttons.append(
+                    {
+                        "component": "span",
+                        "props": {"class": "px-1 text-caption text-medium-emphasis"},
+                        "text": "...",
+                    }
+                )
+
+        for p_num in range(p_start, p_end + 1):
+            is_cur = p_num == cur_page
+            nav_buttons.append(
+                self._build_ui_page_btn(
+                    str(p_num),
+                    page=p_num,
+                    color="primary" if is_cur else "default",
+                    variant="flat" if is_cur else "outlined",
+                    min_width="36px",
+                )
+            )
+
+        if p_end < total_pages:
+            if p_end < total_pages - 1:
+                nav_buttons.append(
+                    {
+                        "component": "span",
+                        "props": {"class": "px-1 text-caption text-medium-emphasis"},
+                        "text": "...",
+                    }
+                )
+            nav_buttons.append(
+                self._build_ui_page_btn(str(total_pages), page=total_pages, variant="outlined", min_width="36px")
+            )
+
+        nav_buttons.append(
+            self._build_ui_page_btn(
+                "下一页 ▶",
+                page=min(total_pages, cur_page + 1),
+                disabled=(cur_page >= total_pages),
+                variant="tonal",
+                color="primary" if cur_page < total_pages else "default",
+            )
+        )
+        if total_pages > 5:
+            nav_buttons.append(
+                self._build_ui_page_btn(
+                    "+5页",
+                    page=min(total_pages, cur_page + 5),
+                    disabled=(cur_page >= total_pages),
+                    variant="outlined",
+                )
+            )
+        nav_buttons.append(
+            self._build_ui_page_btn(
+                "末页 ⏭",
+                page=total_pages,
+                disabled=(cur_page >= total_pages),
+                variant="tonal",
+            )
+        )
+
+        pagination_footer = {
+            "component": "div",
+            "props": {"class": "d-flex flex-wrap align-center justify-space-between px-4 py-3"},
+            "content": [
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption text-medium-emphasis my-1"},
+                    "text": f"显示第 {start_num} - {end_num} 条 / 共 {filtered_total} 条记录 · 当前第 {cur_page} / {total_pages} 页",
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center"},
+                    "content": nav_buttons,
+                },
+            ],
+        }
+
+        body: list[dict] = [
+            {
+                "component": "VCardItem",
+                "content": [
+                    {"component": "VCardTitle", "text": f"已转存资源清单 (共 {filtered_total} 条)"},
+                    {
+                        "component": "VCardSubtitle",
+                        "text": (
+                            f"按时间倒序展示，剧集自动标注 SxxExx 季集信息；"
+                            f"当前第 {cur_page} / {total_pages} 页，每页 {page_size} 条"
+                        ),
+                    },
+                ],
+            },
+            self._records_table(page_rows),
+            filter_toolbar,
+            pagination_footer,
+        ]
 
         table_card = {"component": "VCard", "props": {"variant": "outlined"}, "content": body}
         return [status_card, table_card]
@@ -881,6 +1250,13 @@ class Pan123TgPilot(_PluginBase):
                 "description": "参数: keyword 关键字, status(saved/upgraded), page 页码(从1起), page_size 每页条数",
             },
             {
+                "path": "/ui_page",
+                "endpoint": self._api_ui_page,
+                "methods": ["GET", "POST"],
+                "auth": "bear",
+                "summary": "切换插件详情页分页页码、每页条数与分类/状态筛选条件",
+            },
+            {
                 "path": "/purge",
                 "endpoint": self._api_purge,
                 "methods": ["POST", "GET"],
@@ -895,6 +1271,63 @@ class Pan123TgPilot(_PluginBase):
                 "description": "测试当前代理或直连环境下能否正常获取指定频道预览",
             },
         ]
+
+    def _api_ui_page(
+        self,
+        page: Optional[int] = None,
+        page_size: Optional[int] = None,
+        media_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        响应详情页分页器与筛选栏点击事件，更新视图状态并触发前端自动重绘。
+        严格返回 MoviePilot V3 要求的三段式 JSON 信封 {"success": bool, "message": str, "data": ...}。
+        """
+        self._load_ui_view_state()
+        reset_to_first = False
+
+        if media_type is not None:
+            mt = str(media_type).strip().lower()
+            if mt in ("all", "movie", "tv") and mt != self._ui_media_type:
+                self._ui_media_type = mt
+                reset_to_first = True
+
+        if status is not None:
+            st = str(status).strip().upper()
+            if st != self._ui_status:
+                self._ui_status = st
+                reset_to_first = True
+
+        if page_size is not None:
+            try:
+                ps = min(100, max(5, int(page_size)))
+                if ps != self._ui_page_size:
+                    self._ui_page_size = ps
+                    reset_to_first = True
+            except (ValueError, TypeError):
+                pass
+
+        if page is not None and not reset_to_first:
+            try:
+                self._ui_page = max(1, int(page))
+            except (ValueError, TypeError):
+                self._ui_page = 1
+        elif reset_to_first:
+            self._ui_page = 1
+
+        self._save_ui_view_state()
+
+        return {
+            "success": True,
+            "message": "",
+            "data": {
+                "code": 0,
+                "page": self._ui_page,
+                "page_size": self._ui_page_size,
+                "media_type": self._ui_media_type,
+                "status": self._ui_status,
+            },
+        }
 
     def _api_manual_check(self) -> dict[str, Any]:
         """API: 手动触发频道巡检"""

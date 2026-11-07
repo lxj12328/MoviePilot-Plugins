@@ -62,11 +62,11 @@ SCHEMA_VERSION = 2
 
 def compute_link_hash(share_url: Optional[str] = None, fslink: Optional[str] = None) -> str:
     """
-    计算链接指纹：优先使用分享链接短码 (s:<key>)，否则使用秒传码文件哈希 (f:<etag>)。
+    计算链接指纹：优先使用分享链接短码 (s:<key>，兼容 /s/ 与 /123pan/ 路径)，否则使用秒传码文件哈希 (f:<etag>)。
     用于带索引的等值查询，替代全表 LIKE 扫描。
     """
     if share_url:
-        m = re.search(r"/s/([a-zA-Z0-9_-]+)", str(share_url))
+        m = re.search(r"/(?:s|123pan)/([a-zA-Z0-9_-]+)", str(share_url))
         if m:
             return f"s:{m.group(1)}"
     if fslink:
@@ -80,7 +80,7 @@ def link_hash_candidates(share_url: Optional[str] = None, fslink: Optional[str] 
     """返回一条消息可能命中的全部链接指纹"""
     out = []
     if share_url:
-        m = re.search(r"/s/([a-zA-Z0-9_-]+)", str(share_url))
+        m = re.search(r"/(?:s|123pan)/([a-zA-Z0-9_-]+)", str(share_url))
         if m:
             out.append(f"s:{m.group(1)}")
     if fslink:
@@ -153,7 +153,7 @@ class Pan123TgDatabase:
 
     @staticmethod
     def _migrate(db: Any) -> None:
-        """可重复执行的迁移：补齐 link_hash 列、索引，并回填历史记录"""
+        """可重复执行的迁移：补齐 link_hash 列、索引，并回填历史记录与剧集 SxxExx 标题"""
         from sqlalchemy import inspect, select, text
 
         table = Pan123TgRecord.__tablename__
@@ -165,10 +165,34 @@ class Pan123TgDatabase:
         db.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_updated_at ON {table} (updated_at)"))
 
         rows = db.execute(
-            select(Pan123TgRecord).where(Pan123TgRecord.link_hash.is_(None))
+            select(Pan123TgRecord).where(
+                or_(Pan123TgRecord.link_hash.is_(None), Pan123TgRecord.link_hash == "")
+            )
         ).scalars().all()
         for rec in rows:
             rec.link_hash = compute_link_hash(rec.share_url, rec.fslink)
+
+        # 自动回填历史剧集记录中缺失的 SxxExx 季集标注
+        tv_rows = db.execute(
+            select(Pan123TgRecord).where(Pan123TgRecord.media_type == "tv")
+        ).scalars().all()
+        for rec in tv_rows:
+            t_val = str(rec.media_title or "").strip()
+            if t_val and not re.search(r"\bS\d{1,3}(?:E\d{1,4})?", t_val, re.IGNORECASE):
+                m_ep = re.search(
+                    r"_(S\d{1,3}(?:E\d{1,4}(?:-E?\d{1,4})?)?)$",
+                    str(rec.media_key or ""),
+                    re.IGNORECASE,
+                )
+                if not m_ep and rec.fslink:
+                    m_ep = re.search(
+                        r"\b(S\d{1,3}E\d{1,4}(?:-E?\d{1,4})?)\b",
+                        str(rec.fslink),
+                        re.IGNORECASE,
+                    )
+                if m_ep:
+                    rec.media_title = f"{t_val} {m_ep.group(1).upper()}"
+
         db.flush()
         try:
             db.commit()
@@ -231,8 +255,8 @@ class Pan123TgDatabase:
     def get_record_by_media_key(self, *args, **kwargs) -> Optional[dict]:
         """
         根据媒体唯一键或标题+年份+季集查找最新记录。
-        同时支持匹配当前 media_key、历史 TMDB 格式 key 及归一化影视标题，
-        确保不同频道以不同格式发布同一资源时能够百分之百命中本地库去重！
+        对于剧集 (tv)，严格限定在同一剧名 + 同一季集 (ep_tag) 下匹配，杜绝不同集数 (如 S01E05 与 S01E06) 互相误触洗版；
+        对于电影 (movie)，支持 media_key、TMDB ID 与归一化片名匹配。
         """
         db = kwargs.get("db")
         media_key = str(kwargs.get("media_key") or "")
@@ -240,7 +264,7 @@ class Pan123TgDatabase:
         year = str(kwargs.get("year") or "")
         tmdb_id = str(kwargs.get("tmdb_id") or "")
         media_type = str(kwargs.get("media_type") or "")
-        ep_tag = str(kwargs.get("ep_tag") or "")
+        ep_tag = str(kwargs.get("ep_tag") or "").strip().upper()
 
         for arg in args:
             if hasattr(arg, "execute"):
@@ -251,24 +275,37 @@ class Pan123TgDatabase:
         if db is None:
             return None
 
+        is_tv = (media_type == "tv" or media_key.startswith("tv_") or bool(ep_tag))
         conditions = []
         if media_key:
             conditions.append(Pan123TgRecord.media_key == media_key)
-        if tmdb_id:
-            conditions.append(Pan123TgRecord.media_key == f"movie_tmdb_{tmdb_id}")
-            if ep_tag:
-                conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}_{ep_tag}")
-            else:
-                conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}")
-        if title:
-            norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", title).lower()
-            if norm_title:
+
+        if is_tv:
+            if tmdb_id:
                 if ep_tag:
-                    conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}_{ep_tag}")
-                elif year:
-                    conditions.append(Pan123TgRecord.media_key == f"movie_{norm_title}_{year}")
-                conditions.append(Pan123TgRecord.media_title == title)
-                conditions.append(Pan123TgRecord.media_title == norm_title)
+                    conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}_{ep_tag}")
+                else:
+                    conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}")
+            if title:
+                # 剥离可能已附带的 SxxExx 后缀再计算 norm_title
+                clean_base = re.sub(r"\s+S\d{1,3}(?:E\d{1,4}(?:-E?\d{1,4})?)?$", "", title, flags=re.IGNORECASE).strip()
+                norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", clean_base).lower()
+                if norm_title:
+                    if ep_tag:
+                        conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}_{ep_tag}")
+                        conditions.append(Pan123TgRecord.media_title == f"{clean_base} {ep_tag}")
+                    else:
+                        conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}")
+        else:
+            if tmdb_id:
+                conditions.append(Pan123TgRecord.media_key == f"movie_tmdb_{tmdb_id}")
+            if title:
+                norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", title).lower()
+                if norm_title:
+                    if year:
+                        conditions.append(Pan123TgRecord.media_key == f"movie_{norm_title}_{year}")
+                    conditions.append(Pan123TgRecord.media_title == title)
+                    conditions.append(Pan123TgRecord.media_title == norm_title)
 
         if not conditions:
             return None
@@ -428,7 +465,7 @@ class Pan123TgDatabase:
             return int(new_rec.id if new_rec.id is not None else 1)
 
     @staticmethod
-    def _build_filter(keyword: Any = None, status: Any = None):
+    def _build_filter(keyword: Any = None, status: Any = None, media_type: Any = None):
         """构造列表/计数共用的过滤条件"""
         stmt_filters = [
             Pan123TgRecord.media_title != "",
@@ -446,18 +483,21 @@ class Pan123TgDatabase:
                     Pan123TgRecord.media_key.like(kw),
                 )
             )
-        if status and str(status).strip():
+        if status and str(status).strip() and str(status).strip().upper() != "ALL":
             stmt_filters.append(Pan123TgRecord.status == str(status).strip().lower())
+        if media_type and str(media_type).strip() and str(media_type).strip().lower() != "all":
+            stmt_filters.append(Pan123TgRecord.media_type == str(media_type).strip().lower())
         return stmt_filters
 
     @db_query
     def list_records(self, *args, **kwargs) -> list[dict]:
-        """分页获取转存记录，支持关键词与状态筛选 (自适应适配 MoviePilot @db_query 注入)"""
+        """分页获取转存记录，支持关键词、媒体分类与状态筛选 (自适应适配 MoviePilot @db_query 注入)"""
         db = kwargs.get("db")
         limit = kwargs.get("limit")
         offset = kwargs.get("offset") or 0
         keyword = kwargs.get("keyword") or kwargs.get("search")
         status = kwargs.get("status")
+        media_type = kwargs.get("media_type")
         for arg in args:
             if hasattr(arg, "execute"):
                 db = arg
@@ -474,7 +514,7 @@ class Pan123TgDatabase:
         if db is None:
             return []
 
-        stmt = select(Pan123TgRecord).where(*self._build_filter(keyword, status))
+        stmt = select(Pan123TgRecord).where(*self._build_filter(keyword, status, media_type))
         records = db.execute(
             stmt.order_by(Pan123TgRecord.updated_at.desc(), Pan123TgRecord.id.desc())
             .offset(offset)
@@ -490,9 +530,69 @@ class Pan123TgDatabase:
             return 0
         from sqlalchemy import func
         stmt = select(func.count(Pan123TgRecord.id)).where(
-            *self._build_filter(kwargs.get("keyword") or kwargs.get("search"), kwargs.get("status"))
+            *self._build_filter(
+                kwargs.get("keyword") or kwargs.get("search"),
+                kwargs.get("status"),
+                kwargs.get("media_type"),
+            )
         )
         return int(db.execute(stmt).scalar() or 0)
+
+    @db_query
+    def get_status_counts(self, *args, **kwargs) -> dict[str, int]:
+        """按媒体类型与转存状态汇总数量，供详情页筛选工具栏展示"""
+        db = self._extract_db(args, kwargs)
+        media_type = str(kwargs.get("media_type") or "all").strip().lower()
+        out = {
+            "TOTAL": 0,
+            "ALL_TOTAL": 0,
+            "MOVIE_TOTAL": 0,
+            "TV_TOTAL": 0,
+            "SAVED": 0,
+            "UPGRADED": 0,
+        }
+        if db is None:
+            return out
+
+        from sqlalchemy import func
+        base_valid = [
+            Pan123TgRecord.media_title != "",
+            Pan123TgRecord.media_title.is_not(None),
+        ]
+        # 1. 按 media_type 汇总
+        type_rows = db.execute(
+            select(Pan123TgRecord.media_type, func.count(Pan123TgRecord.id))
+            .where(*base_valid)
+            .group_by(Pan123TgRecord.media_type)
+        ).all()
+        for mt, cnt in type_rows:
+            mt_norm = str(mt or "movie").lower()
+            c_int = int(cnt or 0)
+            out["ALL_TOTAL"] += c_int
+            if mt_norm == "tv":
+                out["TV_TOTAL"] += c_int
+            else:
+                out["MOVIE_TOTAL"] += c_int
+
+        # 2. 按当前选中的 media_type 统计各 status 数量
+        status_conds = list(base_valid)
+        if media_type in ("movie", "tv"):
+            status_conds.append(Pan123TgRecord.media_type == media_type)
+        st_rows = db.execute(
+            select(Pan123TgRecord.status, func.count(Pan123TgRecord.id))
+            .where(*status_conds)
+            .group_by(Pan123TgRecord.status)
+        ).all()
+        for st, cnt in st_rows:
+            st_norm = str(st or "saved").upper()
+            c_int = int(cnt or 0)
+            out["TOTAL"] += c_int
+            if st_norm == "UPGRADED":
+                out["UPGRADED"] += c_int
+            else:
+                out["SAVED"] += c_int
+
+        return out
 
     @staticmethod
     def _to_dict(rec: Pan123TgRecord) -> dict:

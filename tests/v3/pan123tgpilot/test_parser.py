@@ -123,6 +123,8 @@ S05E217 4K WEB-DL H.265 10bit 25fps [国语][内嵌简中字幕]
         self.assertEqual(parsed["season"], 1)
         self.assertEqual(parsed["episode"], 6)
         self.assertEqual(parsed["ep_tag"], "S01E06")
+        self.assertEqual(parsed["display_title"], "谷雨 S01E06")
+        self.assertEqual(parsed["media_title"], "谷雨 S01E06")
         self.assertEqual(parsed["resolution"], "2160p")
         self.assertEqual(parsed["dovi_hdr"], "DoVi")
         self.assertEqual(parsed["codec"], "H.265")
@@ -138,9 +140,40 @@ S05E217 4K WEB-DL H.265 10bit 25fps [国语][内嵌简中字幕]
         parsed2 = self.parser.parse(msg_zheyueliang, msg_id="102", channel="@regeng123")
         self.assertIsNotNone(parsed2)
         self.assertEqual(parsed2["title"], "折月亮")
+        self.assertEqual(parsed2["display_title"], "折月亮 S01")
         self.assertEqual(parsed2["year"], "2026")
         self.assertEqual(parsed2["media_type"], "tv")
         self.assertEqual(parsed2["share_key"], "Oqtgvd-f2n3h")
+
+    def test_parse_yun123pan_share_domain_and_episode_range(self):
+        """验证 @yun123pan 频道的 *.share.123pan.cn/123pan/<key> 链接格式与 📼 集数：E01-E04 集数范围"""
+        msg_yun = """🎬 名称：玫瑰战争 (2026)
+📁 类型：国产剧集
+🖥️ 画质：2160p
+🎥 视频：WEB-DL.HDR.H.265
+🔊 音频：DDP 5.1
+📦 大小：18.3 GB
+📼 集数：E01-E04
+🔄 状态：更新中
+
+🔗 链接：
+https://1840976528.share.123pan.cn/123pan/cHCOTd-RLSP"""
+        parsed = self.parser.parse(msg_yun, msg_id="201", channel="@yun123pan")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["title"], "玫瑰战争")
+        self.assertEqual(parsed["display_title"], "玫瑰战争 S01E01-E04")
+        self.assertEqual(parsed["media_title"], "玫瑰战争 S01E01-E04")
+        self.assertEqual(parsed["year"], "2026")
+        self.assertEqual(parsed["media_type"], "tv")
+        self.assertEqual(parsed["season"], 1)
+        self.assertEqual(parsed["episode"], 4)
+        self.assertEqual(parsed["ep_tag"], "S01E01-E04")
+        self.assertEqual(parsed["media_key"], "tv_玫瑰战争_S01E01-E04")
+        self.assertEqual(parsed["resolution"], "2160p")
+        self.assertEqual(parsed["codec"], "H.265")
+        self.assertEqual(parsed["dovi_hdr"], "HDR")
+        self.assertEqual(parsed["share_key"], "cHCOTd-RLSP")
+        self.assertEqual(parsed["share_url"], "https://1840976528.share.123pan.cn/123pan/cHCOTd-RLSP")
 
 
 if __name__ == "__main__":
