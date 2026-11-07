@@ -216,6 +216,11 @@
 
 ## 📝 版本历史 (Changelog)
 
+- **v1.5.3** (2026-11-07):
+  - **修复刮削伴生文件与 Symedia Webhook 联动缺失问题**：
+    - 修复 `v1.5.1` 解耦伴生文件时将 `_trigger_symedia_notify` 误放入 `if not is_companion:` 判断块内导致 `.nfo`、`.jpg`、`.png`、`.srt` 等伴生文件上传完成后未向 Symedia 发送 `file_notify` 事件的问题；
+    - 现无论正片视频还是刮削伴生文件，在秒传成功、重试命中或分片真实上传完成后，均 **100% 触发 Symedia Webhook 联动**并输出明确日志，确保 Symedia 即时同步刮削元数据与生成 `.strm`。
+
 - **v1.5.2** (2026-11-07):
   - **修复交互式分页与筛选按钮响应格式**：
     - 将 `/ui_page` 及全部插件 API 响应严格对齐 MoviePilot V3 标准三段式信封契约（`{"success": True, "message": "", "data": {...}}`），移除顶层非标字段，彻底解决点击翻页与筛选按钮时前端弹出「服务器返回了无效响应」的问题；

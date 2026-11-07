@@ -369,6 +369,72 @@ class TestV150Features(unittest.TestCase):
             # 默认 days=0 不清理
             self.assertEqual(db.purge_expired_tasks(db=session, days=0), 0)
 
+    def test_companion_files_trigger_symedia_webhook_on_upload(self):
+        """测试刮削伴生文件 (.nfo, .jpg) 秒传或真实分片上传完成后，100% 触发 Symedia Webhook 通知"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nfo_file = os.path.join(tmpdir, "tvshow.nfo")
+            poster_file = os.path.join(tmpdir, "poster.jpg")
+            with open(nfo_file, "wb") as f:
+                f.write(b"<tvshow><title>Test</title></tvshow>")
+            with open(poster_file, "wb") as f:
+                f.write(b"fake_jpeg_bytes_12345")
+
+            client = MagicMock()
+            client.auth_mode = "web_token"
+            # nfo 命中秒传，poster 走真实分片上传
+            client.sha1_reuse.side_effect = [
+                (True, 90001, "秒传成功"),
+                (False, 0, "秒传未命中"),
+            ]
+            client.upload_file_v2.return_value = (True, 90002, "上传成功")
+
+            qb = MagicMock()
+            qb.is_configured.return_value = True
+
+            db = MagicMock()
+            db.list_tasks_by_status.return_value = [
+                {
+                    "id": 10,
+                    "target_path": nfo_file,
+                    "file_name": "tvshow.nfo",
+                    "file_size": 36,
+                    "torrent_hash": None,
+                    "status": "PENDING",
+                },
+                {
+                    "id": 11,
+                    "target_path": poster_file,
+                    "file_name": "poster.jpg",
+                    "file_size": 21,
+                    "torrent_hash": None,
+                    "status": "PENDING",
+                },
+            ]
+
+            notify_cb = MagicMock()
+            scheduler = TaskScheduler(
+                client=client,
+                qb_helper=qb,
+                db_helper=db,
+                tags_config={"completed": "123_已上传"},
+                notify_callback=notify_cb,
+                notify_config={"enabled": True, "notify_upload": True},
+                symedia_config={"enabled": True, "url": "http://127.0.0.1:8095"},
+            )
+            scheduler._trigger_symedia_notify = MagicMock()
+
+            scheduler.process_pending_tasks(enable_real_upload=True)
+
+            # 两个伴生文件（秒传 + 分片上传）均必须触发 Symedia Webhook 通知
+            self.assertEqual(scheduler._trigger_symedia_notify.call_count, 2)
+            notified_paths = [c.args[0] for c in scheduler._trigger_symedia_notify.call_args_list]
+            self.assertIn(nfo_file, notified_paths)
+            self.assertIn(poster_file, notified_paths)
+
+            # 伴生文件不回写 qB 标签、不发送系统通知刷屏
+            qb.update_tags.assert_not_called()
+            notify_cb.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

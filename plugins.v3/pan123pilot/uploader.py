@@ -103,14 +103,14 @@ class TaskScheduler:
         return root_id
 
     def _trigger_symedia_notify(self, target_path: str, action: str = "create") -> None:
-        """若启用了 Symedia 联动，发送 Webhook 通知即时生成或清理 strm"""
+        """若启用了 Symedia 联动，发送 Webhook 通知即时生成或清理 strm 及同步刮削伴生元数据"""
         if not self.symedia_config or not self.symedia_config.get("enabled"):
             return
         server_url = self.symedia_config.get("url", "")
         if not server_url:
             return
         try:
-            send_symedia_file_notify(
+            ok, msg = send_symedia_file_notify(
                 server_url=server_url,
                 target_path=target_path,
                 local_library_root=self.local_library_root,
@@ -120,8 +120,12 @@ class TaskScheduler:
                 device_name=self.symedia_config.get("device_name", "MoviePilot-Pan123"),
                 user_name=self.symedia_config.get("user_name", "admin"),
             )
-        except Exception:
-            pass
+            if ok:
+                logger.info(f"Pan123Pilot {msg}")
+            else:
+                logger.warning(f"Pan123Pilot {msg}")
+        except Exception as e:
+            logger.warning(f"Pan123Pilot 触发 Symedia Webhook 异常 [{os.path.basename(target_path)}]: {e}")
 
     def _handle_token_expired(self, reason: str = "") -> None:
         """统一处理 123 云盘 Web Token 过期事件，触发回调并不扣减任务重试上限"""
@@ -340,7 +344,7 @@ class TaskScheduler:
                 )
 
             if reuse:
-                # 秒传成功！
+                # 秒传成功！无论正片视频还是刮削伴生文件，均触发 Symedia Webhook 联动
                 logger.info(f"Pan123Pilot 【{filename}】秒传成功！云盘 FileID: {file_id}")
                 self.db.update_task_status(
                     task_id=task_id,
@@ -351,9 +355,9 @@ class TaskScheduler:
                     parent_file_id=parent_id,
                     error_msg="",
                 )
+                self._trigger_symedia_notify(target_path, action="create")
                 if not is_companion:
                     self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"), batch_tag_cache)
-                    self._trigger_symedia_notify(target_path, action="create")
                     self._notify(
                         "upload",
                         "123云盘秒传成功",
@@ -464,9 +468,10 @@ class TaskScheduler:
                 parent_file_id=parent_id,
                 error_msg="分片真实上传完成",
             )
+            # 无论正片视频还是刮削伴生文件，上传完成后均触发 Symedia Webhook 同步
+            self._trigger_symedia_notify(target_path, action="create")
             if not is_companion:
                 self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
-                self._trigger_symedia_notify(target_path, action="create")
                 self._notify(
                     "upload",
                     "123云盘上传成功",
@@ -549,6 +554,7 @@ class TaskScheduler:
                     )
 
                 if reuse:
+                    is_companion = os.path.splitext(filename)[1].lower() in SCRAPED_EXTENSIONS
                     self.db.update_task_status(
                         task_id=task_id,
                         status="COMPLETED",
@@ -556,13 +562,14 @@ class TaskScheduler:
                         parent_file_id=parent_id,
                         error_msg="重试期间成功命中秒传",
                     )
-                    self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
                     self._trigger_symedia_notify(target_path, action="create")
-                    self._notify(
-                        "upload",
-                        "123云盘秒传成功 (重试命中)",
-                        f"媒体文件【{filename}】在重试期间成功命中秒传！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
-                    )
+                    if not is_companion:
+                        self._sync_qb_tag(torrent_hash, self.tags.get("completed", "123_已上传"))
+                        self._notify(
+                            "upload",
+                            "123云盘秒传成功 (重试命中)",
+                            f"媒体文件【{filename}】在重试期间成功命中秒传！\n文件大小: {self.format_size(file_size)}\n云盘文件ID: {file_id}",
+                        )
                 else:
                     if "TOKEN_EXPIRED" in str(msg):
                         logger.error("Pan123Pilot 周期重试中断: 123云盘 Web Token 已过期，暂停重试轮询")
