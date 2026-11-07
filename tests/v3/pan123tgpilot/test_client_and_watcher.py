@@ -63,6 +63,60 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("3 个文件", msg)
 
+    def test_client_save_share_link_via_etag_rapid_upload_without_404(self):
+        """验证真实 123 云盘分享链接通过 /b/api/share/get 提取 Etag + /b/api/file/upload_request 递归秒传转存，无需调用不存在的 /b/api/share/save"""
+        client = Pan123TgClient(token="test_token")
+        uploaded_files = []
+
+        def mock_request(url, method="GET", payload=None, with_auth=True):
+            if "file/list/new" in url:
+                return True, {"code": 0, "data": {"InfoList": []}}, "ok"
+            if "share/get" in url:
+                if "ParentFileId=5001" in url:
+                    return True, {
+                        "code": 0,
+                        "data": {
+                            "InfoList": [
+                                {"FileId": 6001, "FileName": "谷雨.S01E06.2160p.mkv", "Type": 0, "Size": 5680000000, "Etag": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"},
+                                {"FileId": 6002, "FileName": "谷雨.S01E06.nfo", "Type": 0, "Size": 2048, "Etag": "b1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"},
+                            ],
+                            "next": 0,
+                        },
+                    }, "ok"
+                return True, {
+                    "code": 0,
+                    "data": {
+                        "InfoList": [
+                            {"FileId": 5001, "FileName": "Season 1", "Type": 1, "Size": 0, "Etag": ""},
+                            {"FileId": 5002, "FileName": "tvshow.nfo", "Type": 0, "Size": 1024, "Etag": "c1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"},
+                        ],
+                        "next": 0,
+                    },
+                }, "ok"
+            if "upload_request" in url:
+                if payload and payload.get("type") == 1:
+                    return True, {"code": 0, "data": {"Info": {"FileId": 77701}}}, "ok"
+                uploaded_files.append(payload)
+                return True, {"code": 0, "data": {"Reuse": True, "Info": {"FileId": 88899}}}, "ok"
+            if "share/save" in url:
+                return False, {}, "HTTP 404: Not Found"
+            return False, {}, "error"
+
+        client._http_request = MagicMock(side_effect=mock_request)
+        ok, fid, msg = client.save_share_link(
+            share_key="Oqtgvd-d5i3h",
+            share_pwd="YSRG",
+            target_parent_id=42149741,
+            folder_name="谷雨 (2026)",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(fid, "88899")
+        self.assertEqual(len(uploaded_files), 3)
+        filenames = [p["fileName"] for p in uploaded_files]
+        self.assertIn("谷雨.S01E06.2160p.mkv", filenames)
+        self.assertIn("谷雨.S01E06.nfo", filenames)
+        self.assertIn("tvshow.nfo", filenames)
+
     def test_client_save_fslink(self):
         client = Pan123TgClient(token="test_token")
         client._http_request = MagicMock(return_value=(True, {

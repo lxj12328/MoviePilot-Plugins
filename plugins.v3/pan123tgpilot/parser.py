@@ -145,28 +145,27 @@ class TgMessageParser:
         year = ""
 
         skip_keywords = (
-            "类型", "标签", "评分", "简介", "链接", "版本", "提取码", "访问码", "密码",
+            "类型", "分类", "标签", "评分", "简介", "链接", "版本", "提取码", "访问码", "密码",
             "大小", "体积", "画质", "编码", "字幕", "频道", "群组", "投稿", "注意",
-            "http://", "https://", "123FSLink",
+            "播出日期", "首播", "上映", "http://", "https://", "123FSLink",
         )
 
-        # 1. 优先扫描前 8 行，寻找带「名称：/片名：/剧名：」或带年份或首行标题
+        title_prefix_pattern = (
+            r"^(?:(?:影视|资源|影片|剧集|电视剧|电影|动[画漫]|番剧|综艺|短剧|纪录片|节目|中文)?(?:名称|片名|剧名|番名|标题|译名)"
+            r"|(?:剧集|电视剧|电影|动[画漫]|番剧|综艺|短剧|纪录片|资源|影片))[：:\s]+"
+        )
+
+        # 1. 优先扫描前 8 行，寻找带「名称：/片名：/剧集：/电影：」或带年份或首行标题
         for line in lines[:8]:
             # 清理常见 emoji、markdown 加粗星号与话题符号
-            cleaned = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹\s#*]+", "", line).strip()
+            cleaned = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹📅🗂🏷🎞💾📝\s#*]+", "", line).strip()
             cleaned = re.sub(r"\*+", "", cleaned).strip()
             if not cleaned:
                 continue
 
-            # 剥离常见字段前缀，例如 "名称：仙逆 (2023)" / "片名：《夜曲》" / "资源名称: xxx"
-            has_title_prefix = bool(
-                re.match(r"^(?:影视|资源|影片|剧集|动[画漫]|节目|中文)?(?:名称|片名|剧名|番名|标题|译名)[：:\s]+", cleaned)
-            )
-            cleaned = re.sub(
-                r"^(?:影视|资源|影片|剧集|动[画漫]|节目|中文)?(?:名称|片名|剧名|番名|标题|译名)[：:\s]+",
-                "",
-                cleaned,
-            ).strip()
+            # 剥离常见字段前缀，例如 "名称：仙逆 (2023)" / "剧集：谷雨 (2026) S01E06" / "剧集：折月亮" / "电影：xxx"
+            has_title_prefix = bool(re.match(title_prefix_pattern, cleaned, flags=re.IGNORECASE))
+            cleaned = re.sub(title_prefix_pattern, "", cleaned, flags=re.IGNORECASE).strip()
 
             # 移除 Markdown 链接包裹 [标题](https://...) -> 标题
             cleaned = re.sub(r"\[([^\]]+)\]\(https?://[^\)]+\)", r"\1", cleaned).strip()
@@ -184,7 +183,7 @@ class TgMessageParser:
                 year = m_year.group(2) or m_year.group(3) or ""
                 break
 
-            # 若显式带有「名称：/片名：」前缀，直接采纳
+            # 若显式带有「名称：/片名：/剧集：/电影：」前缀，直接采纳
             if has_title_prefix and cleaned:
                 candidate_title = cleaned
                 break
@@ -203,6 +202,7 @@ class TgMessageParser:
 
         # 剥离外层书名号《》或【】以及尾随的季集/更新说明
         candidate_title = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨\s]+", "", candidate_title).strip()
+        candidate_title = re.sub(title_prefix_pattern, "", candidate_title, flags=re.IGNORECASE).strip()
         m_book = re.match(r"^《([^》]+)》", candidate_title)
         if m_book:
             candidate_title = m_book.group(1).strip()
@@ -211,13 +211,26 @@ class TgMessageParser:
             if m_bracket:
                 candidate_title = m_bracket.group(1).strip()
 
-        # 若标题尾部跟有明显的更新/集数说明（如 "仙逆 更新至80集" 或 "仙逆 S01E05"），截取主标题
-        candidate_title = re.sub(r"\s+(?:更新至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|4K|2160[pP]|1080[pP]).*$", "", candidate_title).strip()
+        # 若标题尾部跟有明显的更新/集数说明（如 "仙逆 更新至80集" 或 "谷雨 S01E06"），截取主标题
+        candidate_title = re.sub(
+            r"\s+(?:更新至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|E\d{1,4}|4K|2160[pP]|1080[pP]).*$",
+            "",
+            candidate_title,
+            flags=re.IGNORECASE,
+        ).strip()
 
         if not year:
             m_any_yr = re.search(r"[（\(\[](\d{4})[）\)\]]", text)
             if m_any_yr:
                 year = m_any_yr.group(1)
+            else:
+                # 尝试从「播出日期：2026-11-06」「首播：2026-07-10」「上映日期：2026」提取年份
+                m_date_yr = re.search(
+                    r"(?:播出日期|首播日期|首播|上映日期|上映|发行日期|日期|年份)[：:\s]*((?:19|20)\d{2})\b",
+                    text,
+                )
+                if m_date_yr:
+                    year = m_date_yr.group(1)
 
         return candidate_title or "未知影视", year
 
@@ -262,14 +275,20 @@ class TgMessageParser:
             elif t == "movie":
                 return "movie", None, None, ""
 
-        # 3. 文本类型关键字匹配
-        if re.search(r"类型[：:\s]*(?:剧集|电视剧|美剧|日剧|韩剧|国剧|泰剧|连续剧)", combined):
+        # 3. 文本类型与分类关键字匹配（兼容「📺 剧集：xxx」「🗂 分类：国产剧集」「类型：剧集」等）
+        if re.search(r"(?:^|\n)\s*[🎬📺🎥🏷️📌📢🔥✨\s#*]*(?:剧集|电视剧|短剧|番剧)[：:\s]", combined):
             return "tv", 1, None, "S01"
 
-        if re.search(r"类型[：:\s]*(?:电影|网络电影|动画电影|纪录片电影)", combined):
+        if re.search(r"(?:^|\n)\s*[🎬📺🎥🏷️📌📢🔥✨\s#*]*(?:电影)[：:\s]", combined):
             return "movie", None, None, ""
 
-        if re.search(r"类型[：:\s]*(?:动漫|国漫)", combined):
+        if re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:剧集|电视剧|美剧|日剧|韩剧|国剧|国产剧|泰剧|连续剧|短剧|番剧)", combined):
+            return "tv", 1, None, "S01"
+
+        if re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:电影|网络电影|动画电影|纪录片电影)", combined):
+            return "movie", None, None, ""
+
+        if re.search(r"(?:类型|分类)[：:\s]*[^\r\n]*(?:动漫|国漫)", combined):
             return "movie", None, None, ""
 
         # 默认归为电影

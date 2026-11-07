@@ -101,6 +101,47 @@ S05E217 4K WEB-DL H.265 10bit 25fps [国语][内嵌简中字幕]
             self.assertEqual(parsed["share_key"], "AbCdEf-1234")
             self.assertEqual(parsed["share_pwd"], "abcd")
 
+    def test_parse_regeng123_guyu_and_zheyueliang(self):
+        """验证 @regeng123 频道格式：📺 剧集：谷雨 (2026) S01E06 及无括号年份但含 📅 播出日期 的剧集：折月亮"""
+        msg_guyu = """📺 剧集：谷雨 (2026) S01E06
+📝 简介：
+鹏州市一著名集团公司的财务人员，在电梯井“意外”坠亡了。她生前的最后联人——服装企业老板闫平安对此感到了极度恐慌。刑警出身的闫平安凭借直觉和经验，认定这场意外是该集团总裁何东平，对其二人展开灭口的信号……面对如困兽般的绝境，闫平安九死一生地逃到北京，寻找时任国税总局稽查处处长的旧识欧阳旭，希望...
+⭐️ TMDB评分：[9.0/10](https://www.themoviedb.org/tv/279155)
+📅 播出日期：2026-11-06
+🗂 分类：国产剧集
+🏷 类型：#谷雨 #剧情
+🎞 版本：2160p Dolby Vision HQ WEB-DL H.265 AAC
+💾 体积：5.29 GB
+🔗 链接：[点击保存到123云盘](https://www.123865.com/s/Oqtgvd-d5i3h?pwd=YSRG)"""
+
+        parsed = self.parser.parse(msg_guyu, msg_id="101", channel="@regeng123")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["title"], "谷雨")
+        self.assertEqual(parsed["year"], "2026")
+        self.assertEqual(parsed["tmdb_id"], "279155")
+        self.assertEqual(parsed["media_type"], "tv")
+        self.assertEqual(parsed["season"], 1)
+        self.assertEqual(parsed["episode"], 6)
+        self.assertEqual(parsed["ep_tag"], "S01E06")
+        self.assertEqual(parsed["resolution"], "2160p")
+        self.assertEqual(parsed["dovi_hdr"], "DoVi")
+        self.assertEqual(parsed["codec"], "H.265")
+        self.assertEqual(parsed["share_key"], "Oqtgvd-d5i3h")
+        self.assertEqual(parsed["share_pwd"], "YSRG")
+
+        # 测试首行无括号年份（📺 剧集：折月亮），通过 📅 播出日期：2026-11-06 提取年份并剥离「剧集：」前缀
+        msg_zheyueliang = """📺 剧集：折月亮
+📅 播出日期：2026-11-06
+🗂 分类：国产剧集
+🎞 版本：2160p WEB-DL H.265
+🔗 链接：[点击保存到123云盘](https://www.123865.com/s/Oqtgvd-f2n3h?pwd=YSRG)"""
+        parsed2 = self.parser.parse(msg_zheyueliang, msg_id="102", channel="@regeng123")
+        self.assertIsNotNone(parsed2)
+        self.assertEqual(parsed2["title"], "折月亮")
+        self.assertEqual(parsed2["year"], "2026")
+        self.assertEqual(parsed2["media_type"], "tv")
+        self.assertEqual(parsed2["share_key"], "Oqtgvd-f2n3h")
+
 
 if __name__ == "__main__":
     unittest.main()
