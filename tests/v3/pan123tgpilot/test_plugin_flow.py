@@ -53,7 +53,8 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.assertEqual(commands[0]["cmd"], "/pan123_tg_run")
 
         apis = self.plugin.get_api()
-        self.assertEqual(len(apis), 5)
+        self.assertEqual(len(apis), 6)
+        self.assertIn("/pan1me_checkin", [a["path"] for a in apis])
 
     @patch("threading.Thread")
     def test_run_now_on_save(self, mock_thread):

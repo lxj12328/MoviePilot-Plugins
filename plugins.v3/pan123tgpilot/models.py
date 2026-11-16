@@ -381,6 +381,21 @@ class Pan123TgDatabase:
         rec = db.execute(stmt).scalar_one_or_none()
         return self._to_dict(rec) if rec else None
 
+    @db_query
+    def has_msg_id_processed(self, *args, **kwargs) -> bool:
+        """检查指定消息/帖子 ID (如 pan1me_12345) 是否已在本地库转存过"""
+        db = kwargs.get("db")
+        msg_id = str(kwargs.get("msg_id") or "")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, str) and not msg_id:
+                msg_id = arg
+        if db is None or not msg_id:
+            return False
+        stmt = select(Pan123TgRecord.id).where(Pan123TgRecord.msg_id == msg_id).limit(1)
+        return db.execute(stmt).first() is not None
+
     @db_update
     def save_or_update_record(self, *args, **kwargs) -> int:
         """

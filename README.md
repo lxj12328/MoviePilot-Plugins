@@ -11,7 +11,7 @@
 | 插件名称 (Plugin Name) | 目录位置 (Directory) | 版本 (Version) | 功能简介 (Description) | 状态 (Status) |
 | :--- | :--- | :--- | :--- | :--- |
 | **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.5.3` | 123云盘助手：Web原生秒传与直填Token、单飞并发互斥锁与C级file_digest极速单哈希计算、正片优先调度与Web S3伴生小文件分片上传、正片与刮削伴生文件全量Symedia Webhook实时联动、伴生文件与qB任务解耦隔离、交互式分页看板(首页/上下页/页码直跳/正片与伴生分类筛选)与/records检索、影视多级目录级联同步、精准做种达标判定、qB状态标签联动与紧急空间腾退机制 | 活跃 (Active) |
-| **123云盘TG转存助手 (Pan123TgPilot)** | [`plugins.v3/pan123tgpilot/`](./plugins.v3/pan123tgpilot/README.md) | `1.2.2` | 123云盘 Telegram 频道智能转存与画质洗版助手：剧集合集区间(SXXEXX-EXX)精准计算与同链接追更增量补全(E01-E17->E01-E20不漏更不删旧集)、TMDB与显式类型排他电影权威判定、TG网页回复引用块彻底剔除、三级并发极速转存架构(多频道并发抓取+消息并发转存+单分享内文件并发秒传，内置全局QPS节流与429退避防风控)、全兼容全系分流域名与秒传码、Web V3标准回收站清理旧版、置顶筛选与交互式分页看板 | 活跃 (Active) |
+| **123云盘TG转存助手 (Pan123TgPilot)** | [`plugins.v3/pan123tgpilot/`](./plugins.v3/pan123tgpilot/README.md) | `1.3.0` | 123云盘 Telegram 频道与论坛智能转存及画质洗版助手：支持 TG 频道与 pan1.me (Xiuno BBS 4.0.4) 电影/剧集/动漫/综艺板块协同巡检(含账号/Cookie认证、回复可见按轮限流解锁与每日自动签到)、剧集合集区间(SXXEXX-EXX)精准计算与同链接追更补全、TMDB与显式类型排他电影权威判定、三级并发极速转存架构与全局QPS防风控、Web V3标准回收站清理旧版、置顶筛选与交互式分页看板 | 活跃 (Active) |
 
 > 💡 **提示**：每当新增或更新插件工具时，请同步更新此表格，确保项目工具目录与功能状态清晰可查。
 

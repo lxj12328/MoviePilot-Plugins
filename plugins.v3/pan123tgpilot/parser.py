@@ -230,8 +230,19 @@ class TgMessageParser:
             else:
                 candidate_title = re.sub(r"-\s*\d{3,4}p.*", "", fallback_filename).strip()
 
-        # 剥离外层书名号《》或【】以及尾随的季集/更新说明
+        # 剥离前导论坛分类标签 (例如 "[电影] [123云盘] 《流浪地球3》" / "【4K】片名")，但保留单独完整片名【片名】
         candidate_title = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨\s]+", "", candidate_title).strip()
+        while True:
+            m_tag_prefix = re.match(
+                r"^(?:\[(?:电影|剧集|电视剧|国漫|动漫|综艺|短剧|纪录片|123云?盘|4K|2160[pP]|1080[pP]|HDR|DoVi|资源|分享|\d{4})\]"
+                r"|【(?:电影|剧集|电视剧|国漫|动漫|综艺|短剧|纪录片|123云?盘|4K|2160[pP]|1080[pP]|HDR|DoVi|资源|分享|\d{4})】)\s*(.+)$",
+                candidate_title,
+                flags=re.IGNORECASE,
+            )
+            if not m_tag_prefix:
+                break
+            candidate_title = m_tag_prefix.group(1).strip()
+
         candidate_title = re.sub(title_prefix_pattern, "", candidate_title, flags=re.IGNORECASE).strip()
         m_book = re.match(r"^《([^》]+)》", candidate_title)
         if m_book:
@@ -241,9 +252,9 @@ class TgMessageParser:
             if m_bracket:
                 candidate_title = m_bracket.group(1).strip()
 
-        # 若标题尾部跟有明显的更新/集数说明（如 "仙逆 更新至80集" 或 "谷雨 S01E06"），截取主标题
+        # 若标题尾部跟有明显的更新/集数/规格标签（如 "仙逆 更新至80集"、"谷雨 S01E06"、"片名 [2160p]"），截取主标题
         candidate_title = re.sub(
-            r"\s+(?:更新至|更至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|E\d{1,4}|4K|2160[pP]|1080[pP]).*$",
+            r"\s+(?:更新至|更至|全\d+|第\s*\d+\s*[集季话期]|S\d{1,2}(?:E\d{1,4})?|E\d{1,4}|4K|2160[pP]|1080[pP]|\[(?:2160[pP]|1080[pP]|4K|123云?盘).*$).*$",
             "",
             candidate_title,
             flags=re.IGNORECASE,

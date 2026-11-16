@@ -57,6 +57,7 @@ except ImportError:
     CronTrigger = None
 
 from .client import Pan123TgClient
+from .forum_watcher import XiunoForumWatcher
 from .models import Pan123TgDatabase
 from .parser import TgMessageParser
 from .ranker import calculate_quality_score, evaluate_upgrade
@@ -72,7 +73,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.0"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -110,7 +111,22 @@ class Pan123TgPilot(_PluginBase):
 
         self._client: Optional[Pan123TgClient] = None
         self._watcher: Optional[TgChannelWatcher] = None
+        self._forum_watcher: Optional[XiunoForumWatcher] = None
         self._db: Optional[Pan123TgDatabase] = None
+
+        # pan1.me (Xiuno BBS) 论坛资源与每日签到配置
+        self._pan1me_enabled: bool = False
+        self._pan1me_url: str = "https://pan1.me"
+        self._pan1me_username: str = ""
+        self._pan1me_password: str = ""
+        self._pan1me_cookie: str = ""
+        self._pan1me_forum_ids: str = "2,48,37,52"
+        self._pan1me_auto_reply: bool = True
+        self._pan1me_max_reply: int = 3
+        self._pan1me_auto_checkin: bool = True
+        self._pan1me_keywords: str = ""
+        self._pan1me_last_checkin_date: str = ""
+        self._pan1me_last_checkin_msg: str = "未执行"
 
         self._lock = threading.Lock()
         self._is_checking: bool = False
@@ -232,6 +248,44 @@ class Pan123TgPilot(_PluginBase):
             bot_token=self._tg_bot_token if self._tg_bot_token else "",
         )
 
+        # 初始化 pan1.me (Xiuno BBS) 论坛监听器与签到器
+        self._pan1me_enabled = bool(config.get("pan1me_enabled", False))
+        self._pan1me_url = str(config.get("pan1me_url") or "https://pan1.me").strip()
+        self._pan1me_username = str(config.get("pan1me_username") or "").strip()
+        self._pan1me_password = str(config.get("pan1me_password") or "")
+        self._pan1me_cookie = str(config.get("pan1me_cookie") or "").strip()
+        self._pan1me_forum_ids = str(config.get("pan1me_forum_ids") or "2,48,37,52").strip()
+        self._pan1me_auto_reply = bool(config.get("pan1me_auto_reply", True))
+        try:
+            mr = int(config.get("pan1me_max_reply_per_run") if config.get("pan1me_max_reply_per_run") is not None else 3)
+            self._pan1me_max_reply = max(0, min(20, mr))
+        except (ValueError, TypeError):
+            self._pan1me_max_reply = 3
+        self._pan1me_auto_checkin = bool(config.get("pan1me_auto_checkin", True))
+        self._pan1me_keywords = str(config.get("pan1me_keywords") or "").strip()
+
+        if hasattr(self, "get_data"):
+            try:
+                ck_state = self.get_data("pan1me_checkin_state")
+                if isinstance(ck_state, dict):
+                    self._pan1me_last_checkin_date = str(ck_state.get("date") or "")
+                    self._pan1me_last_checkin_msg = str(ck_state.get("msg") or "未执行")
+            except Exception:
+                pass
+
+        if self._pan1me_enabled:
+            self._forum_watcher = XiunoForumWatcher(
+                base_url=self._pan1me_url,
+                username=self._pan1me_username,
+                password=self._pan1me_password,
+                cookie=self._pan1me_cookie,
+                auto_reply=self._pan1me_auto_reply,
+                max_reply_per_run=self._pan1me_max_reply,
+                keywords=self._pan1me_keywords,
+            )
+        else:
+            self._forum_watcher = None
+
         global _plugin_instance
         _plugin_instance = self
         proxy_display = f"已配置 ({self._tg_proxy})" if self._tg_proxy else "未配置 (直连模式)"
@@ -348,16 +402,43 @@ class Pan123TgPilot(_PluginBase):
             self._last_check_time = datetime.now()
             self._lock.release()
 
+    def _maybe_run_pan1me_checkin(self, force: bool = False) -> tuple[bool, str]:
+        """如启用 pan1.me 自动签到且今日尚未签到，执行每日签到并持久化日期"""
+        if not self._pan1me_enabled or not self._forum_watcher:
+            return False, "论坛数据源未启用"
+        if not force and not self._pan1me_auto_checkin:
+            return False, "每日自动签到已关闭"
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if not force and self._pan1me_last_checkin_date == today_str:
+            return True, self._pan1me_last_checkin_msg or "今日已签到"
+
+        ok, msg = self._forum_watcher.daily_checkin()
+        self._pan1me_last_checkin_msg = msg
+        if ok:
+            self._pan1me_last_checkin_date = today_str
+            logger.info(f"Pan123TgPilot pan1.me 每日签到结果: {msg}")
+            if hasattr(self, "save_data"):
+                try:
+                    self.save_data("pan1me_checkin_state", {"date": today_str, "msg": msg})
+                except Exception:
+                    pass
+        else:
+            logger.warning(f"Pan123TgPilot pan1.me 每日签到未成功: {msg}")
+        return ok, msg
+
     def execute_check_all_channels(self) -> dict[str, Any]:
-        """执行全量监控频道扫描与转存"""
+        """执行全量监控频道 (含 pan1.me 论坛板块与每日签到) 扫描与转存"""
         if not self._client or not self._watcher or not self._db:
             return {"success": False, "msg": "插件未完成初始化或缺少配置"}
 
-        if not self._tg_channels:
-            logger.info("Pan123TgPilot 未配置任何 TG 频道，无需执行抓取")
+        forum_enabled = bool(self._pan1me_enabled and self._forum_watcher and self._pan1me_forum_ids)
+        if not self._tg_channels and not forum_enabled:
+            logger.info("Pan123TgPilot 未配置任何 TG 频道或论坛板块，无需执行抓取")
             return {"success": True, "msg": "未配置监控频道"}
 
-        logger.info(f"Pan123TgPilot 开始巡检 {len(self._tg_channels)} 个 TG 频道...")
+        if self._tg_channels:
+            logger.info(f"Pan123TgPilot 开始巡检 {len(self._tg_channels)} 个 TG 频道...")
         stats = {
             "channels_checked": 0,
             "messages_checked": 0,
@@ -367,7 +448,7 @@ class Pan123TgPilot(_PluginBase):
             "failed": 0,
         }
 
-        # 阶段 0：并发抓取各频道最新消息 (纯网络 I/O)
+        # 阶段 0：并发抓取各 TG 频道最新消息 (纯网络 I/O)
         def _fetch(ch: str) -> tuple[str, Optional[list]]:
             try:
                 msgs = self._watcher.fetch_channel_messages(ch, limit=30)
@@ -377,12 +458,42 @@ class Pan123TgPilot(_PluginBase):
                 logger.error(f"Pan123TgPilot 抓取频道 {ch} 消息失败: {e}")
                 return ch, None
 
-        fetch_workers = max(1, min(4, len(self._tg_channels)))
-        if fetch_workers > 1:
-            with ThreadPoolExecutor(max_workers=fetch_workers, thread_name_prefix="pan123tg-fetch") as pool:
-                fetch_results = list(pool.map(_fetch, self._tg_channels))
-        else:
-            fetch_results = [_fetch(c) for c in self._tg_channels]
+        fetch_results: list[tuple[str, Optional[list]]] = []
+        if self._tg_channels:
+            fetch_workers = max(1, min(4, len(self._tg_channels)))
+            if fetch_workers > 1:
+                with ThreadPoolExecutor(max_workers=fetch_workers, thread_name_prefix="pan123tg-fetch") as pool:
+                    fetch_results = list(pool.map(_fetch, self._tg_channels))
+            else:
+                fetch_results = [_fetch(c) for c in self._tg_channels]
+
+        # 阶段 0.5：若启用了 pan1.me 论坛源，顺带执行每日签到并抓取各板块新帖
+        if forum_enabled and self._forum_watcher:
+            self._maybe_run_pan1me_checkin(force=False)
+
+            def _skip_processed_tid(msg_id_key: str) -> bool:
+                if self._db and hasattr(self._db, "has_msg_id_processed"):
+                    try:
+                        res_chk = self._db.has_msg_id_processed(msg_id=msg_id_key)
+                        return isinstance(res_chk, bool) and res_chk
+                    except Exception:
+                        return False
+                return False
+
+            try:
+                forum_posts = self._forum_watcher.fetch_forum_messages(
+                    forum_ids_raw=self._pan1me_forum_ids,
+                    limit_per_forum=20,
+                    skip_tid_fn=_skip_processed_tid,
+                    stop_event=self._stop_event,
+                )
+                grouped_forum: dict[str, list[tuple[str, str]]] = {}
+                for f_label, m_id, f_text in forum_posts:
+                    grouped_forum.setdefault(f_label, []).append((m_id, f_text))
+                for f_label, items in grouped_forum.items():
+                    fetch_results.append((f_label, items))
+            except Exception as e:
+                logger.error(f"Pan123TgPilot 抓取 pan1.me 论坛资源异常: {e}")
 
         # 阶段 A：串行完成解析、链接去重与洗版判定 (纯本地、毫秒级)，收集待转存任务
         batch_links: set = set()
@@ -950,6 +1061,50 @@ class Pan123TgPilot(_PluginBase):
             ]},
         ])
 
+        forum = self._section("论坛资源 (pan1.me)", "mdi-forum", [
+            {"component": "VRow", "content": [
+                col([sw("pan1me_enabled", "启用 pan1.me 监控", "同步抓取 pan1.me 影视板块的 123 分享链接")], md=4),
+                col([sw("pan1me_auto_checkin", "每日自动签到", "每天首次巡检自动完成论坛签到赚取积分/金币")], md=4),
+                col([sw("pan1me_auto_reply", "自动回复解锁隐藏贴", "遇到回复可见的未转存新帖时自动礼貌回复解锁 (按轮限流防封)")], md=4),
+                col([fld(
+                    "pan1me_url", "论坛地址", "默认 https://pan1.me",
+                    placeholder="https://pan1.me",
+                )]),
+                col([fld(
+                    "pan1me_forum_ids", "监控板块 ID / 链接",
+                    "支持填数字 ID 或完整版块 URL，默认 2(电影),48(电视剧),37(动漫),52(综艺)",
+                    placeholder="2,48,37,52",
+                )]),
+                col([fld(
+                    "pan1me_username", "论坛账号 / 邮箱", "用于自动登录、签到及回复解锁",
+                    placeholder="用户名或邮箱",
+                )]),
+                col([fld(
+                    "pan1me_password", "论坛密码", "留空或触发验证码时可改填下方 Cookie",
+                    type="password", placeholder="论坛登录密码",
+                )]),
+                col([fld(
+                    "pan1me_cookie", "备用登录 Cookie (可选)",
+                    "当论坛开启验证码无法自动登录时，可从浏览器 F12 复制 Cookie 填入",
+                    type="password", placeholder="bbs_sid=...; bbs_token=...",
+                )], md=12),
+                col([fld(
+                    "pan1me_max_reply_per_run", "单轮最多自动回复贴数",
+                    "防止短时间刷帖触发论坛防灌水封号，默认 3 贴/轮",
+                    type="number", placeholder="3",
+                )]),
+                col([{
+                    "component": "VTextarea",
+                    "props": {
+                        "model": "pan1me_keywords", "label": "关键词过滤 (可选)", "variant": "outlined",
+                        "rows": 2, "auto-grow": True,
+                        "placeholder": "留空则抓取所选板块全部新帖；填写关键词 (逗号分隔) 则仅处理命中片名",
+                        "hint": "如只想自动解锁/转存特定剧集可在此填写，降低回帖频次", "persistent-hint": True,
+                    },
+                }]),
+            ]},
+        ])
+
         upgrade = self._section("洗版与数据", "mdi-database", [
             {"component": "VRow", "content": [
                 col([sw("auto_upgrade", "智能画质洗版", "同一影视出现更高评分版本时自动转存")]),
@@ -974,10 +1129,10 @@ class Pan123TgPilot(_PluginBase):
                 "component": "VAlert",
                 "props": {
                     "type": "info", "variant": "tonal", "density": "compact", "class": "mb-3",
-                    "text": "实时监控 Telegram 频道，按画质评分自动转存/洗版到 123 云盘，支持分享链接与 123FSLinkV2 秒传码。",
+                    "text": "实时监控 Telegram 频道及 pan1.me 论坛板块，按画质评分自动转存/洗版到 123 云盘，支持每日签到、分享链接与 123FSLinkV2 秒传码。",
                 },
             },
-            basic, pan, tg, upgrade,
+            basic, pan, tg, forum, upgrade,
         ]
 
         model = {
@@ -990,6 +1145,16 @@ class Pan123TgPilot(_PluginBase):
             "check_interval": 10,
             "tg_proxy": "",
             "tg_bot_token": "",
+            "pan1me_enabled": False,
+            "pan1me_url": "https://pan1.me",
+            "pan1me_username": "",
+            "pan1me_password": "",
+            "pan1me_cookie": "",
+            "pan1me_forum_ids": "2,48,37,52",
+            "pan1me_auto_reply": True,
+            "pan1me_max_reply_per_run": 3,
+            "pan1me_auto_checkin": True,
+            "pan1me_keywords": "",
             "auto_upgrade": True,
             "auto_delete_old_version": True,
             "notify_enabled": False,
@@ -1199,6 +1364,12 @@ class Pan123TgPilot(_PluginBase):
                     ]},
                     {"component": "p", "props": {"class": "text-caption text-grey mt-2"},
                      "text": f"频道: {channels_str}"},
+                    {"component": "p", "props": {"class": "text-caption text-grey"},
+                     "text": (
+                         f"pan1.me 论坛: {'已启用 (板块 ' + (self._pan1me_forum_ids or '-') + ')' if self._pan1me_enabled else '未启用'}"
+                         + (f" · 今日签到 ({self._pan1me_last_checkin_date}): {self._pan1me_last_checkin_msg}"
+                            if self._pan1me_enabled and self._pan1me_last_checkin_date else "")
+                     )},
                     {"component": "p", "props": {"class": "text-caption text-grey"},
                      "text": (f"电影目录ID {self._movie_target_dir_id} · 剧集目录ID {self._tv_target_dir_id} · "
                               f"洗版 {'开' if self._auto_upgrade else '关'} · "
@@ -1548,6 +1719,13 @@ class Pan123TgPilot(_PluginBase):
                 "summary": "测试 Telegram 网络连通性",
                 "description": "测试当前代理或直连环境下能否正常获取指定频道预览",
             },
+            {
+                "path": "/pan1me_checkin",
+                "endpoint": self._api_pan1me_checkin,
+                "methods": ["POST", "GET"],
+                "summary": "立即执行一次 pan1.me 论坛每日签到",
+                "description": "使用已配置的账号密码或 Cookie 立即请求论坛签到并返回结果",
+            },
         ]
 
     def _api_ui_page(
@@ -1661,6 +1839,13 @@ class Pan123TgPilot(_PluginBase):
             }
         except Exception as e:
             return {"success": False, "code": 500, "message": f"连接 Telegram 失败: {e}", "data": None}
+
+    def _api_pan1me_checkin(self) -> dict[str, Any]:
+        """API: 立即执行一次 pan1.me 论坛每日签到"""
+        if not self._pan1me_enabled or not self._forum_watcher:
+            return {"success": False, "code": 400, "message": "请先在配置中启用 pan1.me 论坛并填入账号或 Cookie", "data": None}
+        ok, msg = self._maybe_run_pan1me_checkin(force=True)
+        return {"success": ok, "code": 200 if ok else 500, "message": msg, "data": {"date": self._pan1me_last_checkin_date, "msg": msg}}
 
 
 @eventmanager.register(EventType.PluginAction)
