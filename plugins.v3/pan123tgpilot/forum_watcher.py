@@ -63,13 +63,15 @@ class XiunoForumWatcher:
     )
     RE_LOGIN_OK_HTML = re.compile(r"(?:user-logout|退出登录|个人中心|my\.htm)", re.IGNORECASE)
     RE_REPLY_HIDE_HINT = re.compile(
-        r"(?:回复后(?:即可|才能)?查看|回复可见|隐藏内容.*回复|本帖隐藏的内容|tt-hide|reply_hide|登录后回复)",
+        r"(?:请?回复后(?:即可|才能|再)?查看|回复可见|本帖(?:含有|包含)?(?:特定|隐藏)内容|隐藏内容.*回复|本帖隐藏的内容|tt-hide|reply_hide|hide_content|登录后回复)",
         re.IGNORECASE,
     )
     RE_HAS_123_LINK = re.compile(
         r"(?:123FSLink(?:V2)?\$|https?://(?:[a-zA-Z0-9-]+\.)*(?:123pan\.(?:com|cn)|123(?:684|685|865|912|952|592|\d{3})\.(?:com|cn))/(?:s|123pan)/)",
         re.IGNORECASE,
     )
+    RE_SHARE_WITH_PWD = re.compile(r"[?&]pwd=[a-zA-Z0-9]{4,6}\b", re.IGNORECASE)
+    RE_TEXT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*(?:是|为)?\s*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
     RE_ALREADY_CHECKED_IN = re.compile(
         r"(?:今日已签|已连续签到|已经签到|今天已经签过|已签到\s*\d+\s*天)",
         re.IGNORECASE,
@@ -421,8 +423,9 @@ class XiunoForumWatcher:
             )
 
         body_html = m_msg.group(1) if m_msg else html
-        # 注意仅检测首楼区域的隐藏回复提示，避免评论区文字干扰
-        has_hide_hint = bool(cls.RE_REPLY_HIDE_HINT.search(body_html))
+        # 优先检测首楼正文及其紧随插件块（限制在主帖区，避免误扫评论区；当 html 本身不含 postlist 时直接扫描整段）
+        main_post_area = html.split('class="card card-postlist"', 1)[0] if 'card-postlist' in html else html
+        has_hide_hint = bool(cls.RE_REPLY_HIDE_HINT.search(body_html) or cls.RE_REPLY_HIDE_HINT.search(main_post_area))
 
         def _replace_anchor(match: re.Match) -> str:
             href = unescape(match.group(1).strip())
@@ -571,32 +574,38 @@ class XiunoForumWatcher:
                 body_text, has_hide, page_title = self._extract_thread_body(th_html)
                 final_title = subject or page_title
                 has_link = bool(self.RE_HAS_123_LINK.search(body_text))
+                has_fslink = "123FSLink" in body_text
+                has_pwd = bool(self.RE_SHARE_WITH_PWD.search(body_text) or self.RE_TEXT_PWD.search(body_text))
 
-                # 若帖子需要回复解锁、尚未看到 123 链接，且在安全配额内，执行一次礼貌回帖后再重抓
-                if (
-                    not has_link
-                    and has_hide
-                    and self.auto_reply
-                    and not reply_blocked
-                    and replies_used < self.max_reply_per_run
-                    and tid not in self._replied_tids
-                ):
-                    self._replied_tids.add(tid)
-                    ok_unlock = self._reply_to_unlock(tid=tid, thread_url=thread_url, stop_event=stop_event)
-                    if ok_unlock:
-                        replies_used += 1
-                        try:
-                            st_th2, th_html2 = self._request(thread_url, method="GET")
-                            if st_th2 < 400 and th_html2:
-                                body_text2, _, _ = self._extract_thread_body(th_html2)
-                                if body_text2:
-                                    body_text = body_text2
-                                    has_link = bool(self.RE_HAS_123_LINK.search(body_text))
-                        except Exception:
-                            pass
-                    else:
-                        # 一旦触发验证码或回帖被拒，停掉本轮剩余自动回帖以防风控
-                        reply_blocked = True
+                # 两种场景均需自动回复解锁：
+                # 1) 整个 123 链接在隐藏区 (not has_link)；
+                # 2) 链接已公开但未带提取码 (not has_fslink and not has_pwd)，提取码被作者锁在「请回复后再查看」隐藏区！
+                need_unlock = (not has_link) or (has_link and not has_fslink and not has_pwd)
+
+                # 若帖子需要回复解锁、且处于安全配额内，执行一次礼貌回帖后再重抓
+                unlocked_this_turn = False
+                if need_unlock and has_hide and self.auto_reply:
+                    if not reply_blocked and replies_used < self.max_reply_per_run and tid not in self._replied_tids:
+                        self._replied_tids.add(tid)
+                        ok_unlock = self._reply_to_unlock(tid=tid, thread_url=thread_url, stop_event=stop_event)
+                        if ok_unlock:
+                            replies_used += 1
+                            unlocked_this_turn = True
+                            try:
+                                st_th2, th_html2 = self._request(thread_url, method="GET")
+                                if st_th2 < 400 and th_html2:
+                                    body_text2, _, _ = self._extract_thread_body(th_html2)
+                                    if body_text2:
+                                        body_text = body_text2
+                                        has_link = bool(self.RE_HAS_123_LINK.search(body_text))
+                            except Exception:
+                                pass
+                        else:
+                            # 一旦触发验证码或回帖被拒，停掉本轮剩余自动回帖以防风控
+                            reply_blocked = True
+                    elif replies_used >= self.max_reply_per_run and not has_pwd and not has_fslink:
+                        # 仅因达到单轮回复限额暂未解锁提取码时，留给下一轮再解锁，不拿残缺链接试错
+                        continue
 
                 if not has_link:
                     continue

@@ -107,6 +107,63 @@ class TestXiunoForumWatcher(unittest.TestCase):
         self.assertEqual(p2["ep_tag"], "S01E01-E10")
         self.assertEqual(p2["share_key"], "UnLock-101")
 
+    def test_public_link_with_hidden_pwd_triggers_reply_unlock(self):
+        """
+        验证真实案例：帖子公开了 123 链接 (https://www.123865.com/s/h0CtTd-OPZgv)，
+        但提示「您好，本帖含有特定内容，请回复后再查看。」将提取码锁在隐藏区时，
+        能够正确触发自动回帖并拿到提取码。
+        """
+        watcher = XiunoForumWatcher(
+            username="u", password="p", auto_reply=True, max_reply_per_run=3, reply_cooldown=0.0
+        )
+        watcher._logged_in = True
+
+        forum_html = """
+        <ul class="threadlist">
+          <li class="media thread" data-tid="501">
+            <a href="?thread-501.htm">爸爸去哪儿1-6季+2部大电影.Dad.Where.Are.We.Going.2013-2019.S1-S6+Movie</a>
+          </li>
+        </ul>
+        """
+        before_html = """
+        <div class="message break-all" isfirst="1">
+          真人秀节目《爸爸！我们去哪儿？》
+          https://www.123865.com/s/h0CtTd-OPZgv
+        </div>
+        <div class="plugin-reply-hide">您好，本帖含有特定内容，请回复后再查看。</div>
+        """
+        after_html = """
+        <div class="message break-all" isfirst="1">
+          真人秀节目《爸爸！我们去哪儿？》
+          https://www.123865.com/s/h0CtTd-OPZgv
+          提取码：9a8b
+        </div>
+        """
+        state = {"unlocked": False}
+
+        def mock_request(url, method="GET", data=None, extra_headers=None, timeout=18):
+            if "thread-501" in url:
+                return 200, (after_html if state["unlocked"] else before_html)
+            return 404, ""
+
+        def mock_route(route, method="GET", data=None, extra_headers=None):
+            if "forum-52.htm" in route:
+                return 200, forum_html, "https://pan1.me/?forum-52.htm"
+            if "post-create-501-1.htm" in route and method == "POST":
+                state["unlocked"] = True
+                return 200, json.dumps({"code": 0, "message": "回帖成功"}), "https://pan1.me/?post-create-501-1.htm"
+            return 404, "", ""
+
+        watcher._request = mock_request
+        watcher._request_route = mock_route
+
+        msgs = watcher.fetch_forum_messages("52")
+        self.assertTrue(state["unlocked"])
+        self.assertEqual(len(msgs), 1)
+        parsed = TgMessageParser.parse_message(msgs[0][2])
+        self.assertEqual(parsed["share_key"], "h0CtTd-OPZgv")
+        self.assertEqual(parsed["share_pwd"], "9a8b")
+
     def test_daily_checkin_sniffs_route_and_handles_already_signed(self):
         watcher = XiunoForumWatcher(username="u", password="p")
         watcher._logged_in = True

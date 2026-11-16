@@ -19,7 +19,7 @@ class TgMessageParser:
         r"https?://(?:[a-zA-Z0-9-]+\.)*(?:123pan\.(?:com|cn)|123(?:684|685|865|912|952|592|\d{3})\.(?:com|cn))/(?:s|123pan)/([a-zA-Z0-9_-]+)(?:\?[^ \r\n\"'\)\]]*)?",
         re.IGNORECASE,
     )
-    RE_EXTRACT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
+    RE_EXTRACT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*(?:是|为)?\s*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
 
     RE_SEASON_EP_RANGE = re.compile(
         r"\bS(\d{1,3})\s*E(\d{1,4})\s*[-~～至]\s*(?:S(\d{1,3})\s*)?E?(\d{1,4})\b",
