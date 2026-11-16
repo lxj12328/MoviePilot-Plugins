@@ -72,7 +72,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -408,7 +408,7 @@ class Pan123TgPilot(_PluginBase):
                     self._check_stats["total_checked"] += 1
                 try:
                     status, job = self._prepare_message(
-                        channel=channel, msg_id=m_id, raw_text=m_text, batch_links=batch_links
+                        channel=channel, msg_id=m_id, raw_text=m_text
                     )
                 except Exception as e:
                     logger.error(f"Pan123TgPilot 处理消息异常 ({channel}): {e}")
@@ -440,26 +440,67 @@ class Pan123TgPilot(_PluginBase):
                     f"Pan123TgPilot 频道 {channel} 解析完成: 有效 123 资源消息 {ch_valid} 条, 普通无链接消息 {ch_no_link} 条"
                 )
 
-        # 批内合并：同一资源 (相同 media_key) 只转存评分最高的一条，避免先转低画质再洗版的重复转存
+        # 批内合并：同一资源 (或同一剧集同季的追更合集/同一分享链接) 只保留集数最全且评分最高的一条
+        def _batch_merge_key(job: dict, idx: int) -> str:
+            res = job.get("resource") or {}
+            if res.get("media_type") == "tv" and res.get("is_ep_range") and res.get("season"):
+                norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", str(job.get("title") or "")).lower()
+                if norm_title:
+                    return f"tv_{norm_title}_S{int(res['season']):02d}_range"
+            return job.get("media_key") or f"__job_{idx}"
+
+        def _is_better_batch_job(new_job: dict, cur_job: dict) -> bool:
+            new_res = new_job.get("resource") or {}
+            cur_res = cur_job.get("resource") or {}
+            new_ep_end = new_res.get("ep_end") or 0
+            cur_ep_end = cur_res.get("ep_end") or 0
+            if new_res.get("media_type") == "tv" and cur_res.get("media_type") == "tv":
+                if new_ep_end != cur_ep_end:
+                    return new_ep_end > cur_ep_end
+            new_score = new_res.get("quality_score") or 0
+            cur_score = cur_res.get("quality_score") or 0
+            if new_score != cur_score:
+                return new_score > cur_score
+            return (new_res.get("file_size") or 0) > (cur_res.get("file_size") or 0)
+
         best_jobs: dict[str, dict] = {}
         job_order: list[str] = []
         merged_skipped = 0
         for idx, job in enumerate(jobs):
-            key = job["media_key"] or f"__job_{idx}"
+            key = _batch_merge_key(job, idx)
             cur = best_jobs.get(key)
             if cur is None:
                 best_jobs[key] = job
                 job_order.append(key)
                 continue
             merged_skipped += 1
-            if (job["resource"].get("quality_score") or 0) > (cur["resource"].get("quality_score") or 0):
+            if _is_better_batch_job(job, cur):
                 best_jobs[key] = job
-        merged_jobs = [best_jobs[k] for k in job_order]
+
+        # 二次按相同分享链接/秒传哈希去重 (避免同一永久链接在本轮内被重复提交多次)
+        dedup_jobs: list[dict] = []
+        link_best: dict[str, int] = {}
+        for job in (best_jobs[k] for k in job_order):
+            res = job.get("resource") or {}
+            lt = str(res.get("share_key") or res.get("fs_etag") or "").strip()
+            if not lt:
+                dedup_jobs.append(job)
+                continue
+            pos = link_best.get(lt)
+            if pos is None:
+                link_best[lt] = len(dedup_jobs)
+                dedup_jobs.append(job)
+            else:
+                merged_skipped += 1
+                if _is_better_batch_job(job, dedup_jobs[pos]):
+                    dedup_jobs[pos] = job
+
+        merged_jobs = dedup_jobs
         if merged_skipped:
             stats["skipped"] += merged_skipped
             with self._stats_lock:
                 self._check_stats["skipped_count"] += merged_skipped
-            logger.info(f"Pan123TgPilot 批内合并同一资源的多条消息，仅保留评分最高者，合并跳过 {merged_skipped} 条")
+            logger.info(f"Pan123TgPilot 批内合并同一资源的多条消息，仅保留集数最全/评分最高者，合并跳过 {merged_skipped} 条")
 
         # 阶段 B：线程池并发执行转存 (失败的任务不写入记录，下一轮巡检自动重试)
         def _run(job: dict) -> tuple[dict, str]:
@@ -527,23 +568,67 @@ class Pan123TgPilot(_PluginBase):
         title = resource.get("title", "未知影视")
         display_title = str(resource.get("display_title") or resource.get("media_title") or title).strip()
 
-        # 1. 链接级去重：若该分享链接或秒传码已在历史记录中，直接跳过
+        # 1. 链接级去重与剧集追更扩充识别
         share_url = resource.get("share_url") or ""
         fslink = resource.get("fslink") or ""
-        if self._db and self._db.has_link_processed(share_url=share_url, fslink=fslink):
-            logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{display_title}】")
-            return "skipped", None
-
-        # 同一批次内相同分享链接/秒传码只处理一次
-        link_token = str(resource.get("share_key") or resource.get("fs_etag") or "")
-        if batch_links is not None and link_token and link_token in batch_links:
-            return "skipped", None
-
-        # 2. 媒体级去重与智能洗版对比 (剧集严格限定同剧名 + 同季集 ep_tag 对比)
-        media_key = resource.get("media_key", "")
+        new_season, _, new_ep_end, new_is_range = TgMessageParser.parse_ep_range(resource.get("ep_tag", ""))
         existing_record = None
+        is_episode_expansion = False
+        expansion_note = ""
+
+        def _check_ep_expansion(old_rec: dict) -> tuple[bool, bool, str]:
+            """
+            对比已有记录与当前资源的集数范围，返回 (is_expansion, is_subset_or_older, note)。
+            仅对剧集合集区间 (如 S01E01-E17 -> S01E01-E20) 生效。
+            """
+            if not is_tv or new_ep_end is None or not new_is_range:
+                return False, False, ""
+            old_title_or_key = str(old_rec.get("media_title") or old_rec.get("media_key") or "")
+            old_season, _, old_ep_end, _ = TgMessageParser.parse_ep_range(old_title_or_key)
+            if old_ep_end is None and old_rec.get("episode"):
+                try:
+                    old_ep_end = int(old_rec["episode"])
+                except (ValueError, TypeError):
+                    old_ep_end = None
+            if old_season is not None and new_season is not None and old_season != new_season:
+                return False, False, ""
+            if old_ep_end is not None:
+                if new_ep_end > old_ep_end:
+                    old_tag = f"S{old_season or new_season or 1:02d}E01-E{old_ep_end:02d}"
+                    return True, False, f"剧集追更补全 ({old_tag} -> {resource.get('ep_tag')})"
+                if new_ep_end < old_ep_end:
+                    return False, True, f"本地已包含更多集数 (至第 {old_ep_end} 集 >= 新 {new_ep_end} 集)"
+            return False, False, ""
+
         if self._db:
-            existing_record = self._db.get_record_by_media_key(
+            rec_by_link = None
+            if hasattr(self._db, "get_record_by_link"):
+                cand = self._db.get_record_by_link(share_url=share_url, fslink=fslink)
+                if isinstance(cand, dict):
+                    rec_by_link = cand
+            if rec_by_link:
+                exp_ok, _, exp_note = _check_ep_expansion(rec_by_link)
+                if exp_ok:
+                    is_episode_expansion = True
+                    existing_record = rec_by_link
+                    expansion_note = exp_note
+                    logger.info(f"Pan123TgPilot 检测到永久分享链接追更扩充，放行增量补全: 【{display_title}】 ({exp_note})")
+                else:
+                    logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{display_title}】")
+                    return "skipped", None
+            elif self._db.has_link_processed(share_url=share_url, fslink=fslink):
+                logger.info(f"Pan123TgPilot 检测到资源链接/秒传码已在本地库中转存过，直接跳过: 【{display_title}】")
+                return "skipped", None
+
+        # 同一批次内相同分享链接/秒传码去重 (保留调用方显式传入 batch_links 的兼容)
+        link_token = str(resource.get("share_key") or resource.get("fs_etag") or "")
+        if batch_links is not None and link_token and link_token in batch_links and not is_episode_expansion:
+            return "skipped", None
+
+        # 2. 媒体级去重与智能洗版对比 (剧集严格限定同剧名 + 同季集 ep_tag 对比；合集区间支持追更升级)
+        media_key = resource.get("media_key", "")
+        if self._db and existing_record is None:
+            cand_media = self._db.get_record_by_media_key(
                 media_key=media_key,
                 title=title,
                 year=resource.get("year", ""),
@@ -551,25 +636,42 @@ class Pan123TgPilot(_PluginBase):
                 media_type=resource.get("media_type", "movie"),
                 ep_tag=resource.get("ep_tag", ""),
             )
+            if isinstance(cand_media, dict):
+                existing_record = cand_media
 
         is_upgrade = False
-        decision_reason = ""
+        decision_reason = expansion_note
         if existing_record:
-            if not self._auto_upgrade:
-                logger.info(f"Pan123TgPilot 本地库已存在【{display_title}】且未开启自动洗版，跳过转存")
-                return "skipped", None
+            if not is_episode_expansion:
+                exp_ok, is_older_subset, exp_note = _check_ep_expansion(existing_record)
+                if exp_ok:
+                    is_episode_expansion = True
+                    expansion_note = exp_note
+                    decision_reason = exp_note
+                    logger.info(f"Pan123TgPilot 检测到剧集合集追更扩充: 【{display_title}】 ({exp_note})")
+                elif is_older_subset:
+                    logger.info(f"Pan123TgPilot 【{display_title}】{exp_note}，跳过转存")
+                    return "skipped", None
 
-            should_up, decision_reason = evaluate_upgrade(existing_record, resource)
-            if not should_up:
+            should_up, up_reason = evaluate_upgrade(existing_record, resource)
+            if is_episode_expansion:
+                if should_up:
+                    is_upgrade = True
+                    decision_reason = f"{expansion_note}; {up_reason}"
+            else:
+                if not self._auto_upgrade:
+                    logger.info(f"Pan123TgPilot 本地库已存在【{display_title}】且未开启自动洗版，跳过转存")
+                    return "skipped", None
+                if not should_up:
+                    logger.info(
+                        f"Pan123TgPilot 【{display_title}】已有同质或更优资源 (当前得分: {existing_record.get('quality_score', 0)} >= 新资源: {resource.get('quality_score', 0)})，跳过转存"
+                    )
+                    return "skipped", None
+                is_upgrade = True
+                decision_reason = up_reason
                 logger.info(
-                    f"Pan123TgPilot 【{display_title}】已有同质或更优资源 (当前得分: {existing_record.get('quality_score', 0)} >= 新资源: {resource.get('quality_score', 0)})，跳过转存"
+                    f"Pan123TgPilot 发现更高画质资源【{display_title}】: {decision_reason}，准备洗版转存"
                 )
-                return "skipped", None
-
-            is_upgrade = True
-            logger.info(
-                f"Pan123TgPilot 发现更高画质资源【{display_title}】: {decision_reason}，准备洗版转存"
-            )
 
         if batch_links is not None and link_token:
             batch_links.add(link_token)
@@ -585,6 +687,7 @@ class Pan123TgPilot(_PluginBase):
             "media_key": media_key,
             "existing_record": existing_record,
             "is_upgrade": is_upgrade,
+            "is_episode_expansion": is_episode_expansion,
             "decision_reason": decision_reason,
         }
         return "pending", job
@@ -614,6 +717,7 @@ class Pan123TgPilot(_PluginBase):
         media_key = job["media_key"]
         existing_record = job["existing_record"]
         is_upgrade = job["is_upgrade"]
+        is_episode_expansion = bool(job.get("is_episode_expansion"))
         decision_reason = job["decision_reason"]
 
         # 执行转存
@@ -678,9 +782,15 @@ class Pan123TgPilot(_PluginBase):
             )
             return "failed"
 
-        # 若是洗版升级且开启了旧版本自动删除
+        # 若是纯画质洗版升级且开启了旧版本自动删除 (追更补全集数时保留已有旧集，不删旧文件)
         old_file_deleted = False
-        if is_upgrade and self._auto_delete_old_version and existing_record and existing_record.get("pan_file_id"):
+        if (
+            is_upgrade
+            and not is_episode_expansion
+            and self._auto_delete_old_version
+            and existing_record
+            and existing_record.get("pan_file_id")
+        ):
             try:
                 old_fid = int(existing_record["pan_file_id"])
                 logger.info(
@@ -719,15 +829,21 @@ class Pan123TgPilot(_PluginBase):
             "cloud_file_id": str(saved_file_id) if saved_file_id else None,
             "pan_file_id": saved_file_id,
             "status": "upgraded" if is_upgrade else "saved",
-            "error_msg": decision_reason if is_upgrade else "首发转存",
-            "remark": decision_reason if is_upgrade else "首发转存",
+            "error_msg": decision_reason if (is_upgrade or is_episode_expansion) else "首发转存",
+            "remark": decision_reason if (is_upgrade or is_episode_expansion) else "首发转存",
         }
+        if is_episode_expansion and existing_record and existing_record.get("id"):
+            record_data["replace_record_id"] = existing_record["id"]
         if self._db:
             with self._db_lock:
                 self._db.save_or_update_record(**record_data)
 
         # 发送 MoviePilot 系统通知
-        action_title = "123云盘画质洗版成功" if is_upgrade else "123云盘TG转存成功"
+        action_title = (
+            "123云盘画质洗版成功"
+            if is_upgrade
+            else ("123云盘剧集追更成功" if is_episode_expansion else "123云盘TG转存成功")
+        )
         size_gb = (resource.get("file_size") or 0) / (1024.0 ** 3)
         size_str = f"{size_gb:.2f} GB" if size_gb > 0 else "未知"
         notify_content = (
@@ -740,9 +856,12 @@ class Pan123TgPilot(_PluginBase):
         )
         if is_upgrade:
             notify_content += f"洗版策略: 质量评分升级为 {resource.get('quality_score')} 分 (旧版已{'移至回收站' if old_file_deleted else '保留'})\n"
+        elif is_episode_expansion and decision_reason:
+            notify_content += f"追更进度: {decision_reason}\n"
 
         self.notify(action_title, notify_content)
-        logger.info(f"Pan123TgPilot 【{display_title}】转存完成 ({'洗版升级' if is_upgrade else '首次转存'})")
+        result_label = "洗版升级" if is_upgrade else ("追更补全" if is_episode_expansion else "首次转存")
+        logger.info(f"Pan123TgPilot 【{display_title}】转存完成 ({result_label})")
 
         return "upgraded" if is_upgrade else "transferred"
 

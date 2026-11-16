@@ -470,7 +470,40 @@ class Pan123TgClient:
 
             _collect_items_recursive(initial_items, base_target_id, depth=0)
 
-            # 阶段 2 (并发)：线程池并发秒传全部文件，结果按提交顺序汇总以保持确定性
+            # 增量预检：对于追更扩充场景，跳过目标目录中已存在且校验一致的集数文件，仅秒传新增集数
+            pending_tasks: List[Tuple[str, str, int, int]] = []
+            dir_existing_map: Dict[int, Dict[str, Dict[str, Any]]] = {}
+            for t_name, t_etag, t_size, t_dir in file_tasks:
+                if t_dir not in dir_existing_map:
+                    existing_in_dir: Dict[str, Dict[str, Any]] = {}
+                    ok_ls, ls_items, _ = self.list_files(parent_file_id=t_dir)
+                    if ok_ls and ls_items:
+                        for ex_it in ls_items:
+                            ex_type = int(ex_it.get("Type") if ex_it.get("Type") is not None else (ex_it.get("type") or 0))
+                            if ex_type == 1:
+                                continue
+                            ex_name = str(ex_it.get("FileName") or ex_it.get("fileName") or "").strip()
+                            if ex_name:
+                                existing_in_dir[ex_name] = {
+                                    "fid": ex_it.get("FileId") or ex_it.get("fileId"),
+                                    "etag": str(ex_it.get("Etag") or ex_it.get("etag") or "").strip().lower(),
+                                    "size": int(ex_it.get("Size") if ex_it.get("Size") is not None else (ex_it.get("size") or 0)),
+                                }
+                    dir_existing_map[t_dir] = existing_in_dir
+
+                ex_info = dir_existing_map[t_dir].get(t_name)
+                if ex_info and (
+                    (ex_info["etag"] and ex_info["etag"] == t_etag.lower())
+                    or (t_size > 0 and ex_info["size"] == t_size)
+                ):
+                    saved_files_count += 1
+                    if t_size > largest_video_size and ex_info["fid"]:
+                        largest_video_size = t_size
+                        primary_file_id = str(ex_info["fid"])
+                    continue
+                pending_tasks.append((t_name, t_etag, t_size, t_dir))
+
+            # 阶段 2 (并发)：线程池并发秒传待同步文件，结果按提交顺序汇总以保持确定性
             def _save_one(task: Tuple[str, str, int, int]) -> Tuple[bool, Optional[str], str]:
                 t_name, t_etag, t_size, t_dir = task
                 try:
@@ -484,23 +517,24 @@ class Pan123TgClient:
                 except Exception as ex:
                     return False, None, str(ex)
 
-            workers = max(1, min(8, int(file_concurrency or getattr(self, "file_concurrency", 1) or 1)))
-            workers = min(workers, max(1, len(file_tasks)))
-            if workers <= 1 or len(file_tasks) <= 1:
-                results = [_save_one(t) for t in file_tasks]
-            else:
-                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pan123tg-file") as pool:
-                    results = list(pool.map(_save_one, file_tasks))
-
-            for task, (ok_fs, saved_fid, msg_fs) in zip(file_tasks, results):
-                if ok_fs:
-                    saved_files_count += 1
-                    fsize = task[2]
-                    if fsize > largest_video_size and saved_fid:
-                        largest_video_size = fsize
-                        primary_file_id = str(saved_fid)
+            if pending_tasks:
+                workers = max(1, min(8, int(file_concurrency or getattr(self, "file_concurrency", 1) or 1)))
+                workers = min(workers, len(pending_tasks))
+                if workers <= 1 or len(pending_tasks) <= 1:
+                    results = [_save_one(t) for t in pending_tasks]
                 else:
-                    last_file_err = msg_fs
+                    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="pan123tg-file") as pool:
+                        results = list(pool.map(_save_one, pending_tasks))
+
+                for task, (ok_fs, saved_fid, msg_fs) in zip(pending_tasks, results):
+                    if ok_fs:
+                        saved_files_count += 1
+                        fsize = task[2]
+                        if fsize > largest_video_size and saved_fid:
+                            largest_video_size = fsize
+                            primary_file_id = str(saved_fid)
+                    else:
+                        last_file_err = msg_fs
 
             if saved_files_count > 0:
                 final_fid = primary_file_id or str(base_target_id)

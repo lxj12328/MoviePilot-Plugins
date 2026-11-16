@@ -216,6 +216,54 @@ https://1840976528.share.123pan.cn/123pan/cHCOTd-RLSP"""
         self.assertEqual(parsed["display_title"], "奥德赛")
         self.assertEqual(parsed["ep_tag"], "")
 
+    def test_parse_ep_range_variants_and_boundaries(self):
+        """验证 SXXEXX-EXX 各种格式、ep_start/ep_end 计算及异常区间边界校验"""
+        # 1. 用户真实反馈样本：今天是太阳雨 E01-E20
+        msg_sun = """🎬 名称：今天是太阳雨 (2026)
+📁 类型：国产剧集
+🖥️ 画质：2160p
+🎥 视频：WEB-DL.H.264
+🔊 音频：AAC
+📦 大小：95.8 GB
+📼 集数：E01-E20
+🔄 状态：更新中
+
+🔗 链接：
+https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP"""
+        p1 = self.parser.parse(msg_sun, msg_id="401", channel="@yun123pan")
+        self.assertIsNotNone(p1)
+        self.assertEqual(p1["media_type"], "tv")
+        self.assertEqual(p1["display_title"], "今天是太阳雨 S01E01-E20")
+        self.assertEqual(p1["season"], 1)
+        self.assertEqual(p1["ep_start"], 1)
+        self.assertEqual(p1["ep_end"], 20)
+        self.assertEqual(p1["episode"], 20)
+        self.assertTrue(p1["is_ep_range"])
+        self.assertEqual(p1["ep_tag"], "S01E01-E20")
+
+        # 2. 多种 SXXEXX-EXX 格式 (S02E01-S02E12 / S01E01-20 / 1-20集)
+        for ep_str, exp_tag, exp_s, exp_e2 in [
+            ("S02E01-S02E12", "S02E01-E12", 2, 12),
+            ("S01E01-20", "S01E01-E20", 1, 20),
+            ("S03 E05 - E18", "S03E05-E18", 3, 18),
+            ("1-20集", "S01E01-E20", 1, 20),
+        ]:
+            m = f"名称：测试剧集 (2026)\n类型：剧集\n{ep_str}\n链接：https://www.123pan.com/s/AbCd-1234"
+            res = self.parser.parse(m)
+            self.assertEqual(res["ep_tag"], exp_tag, ep_str)
+            self.assertEqual(res["season"], exp_s, ep_str)
+            self.assertEqual(res["ep_end"], exp_e2, ep_str)
+
+        # 3. 跨季 S01E01-S02E10 不应被错误合并为 S01E01-E10
+        m_cross = "名称：跨季剧 (2026)\n类型：剧集\nS01E01-S02E10\n链接：https://www.123pan.com/s/AbCd-1235"
+        res_cross = self.parser.parse(m_cross)
+        self.assertEqual(res_cross["ep_tag"], "S01E01")
+
+        # 4. parse_ep_range 辅助函数校验
+        self.assertEqual(self.parser.parse_ep_range("今天是太阳雨 S01E01-E17"), (1, 1, 17, True))
+        self.assertEqual(self.parser.parse_ep_range("S01E05"), (1, 5, 5, False))
+        self.assertEqual(self.parser.parse_ep_range("S02"), (2, None, None, False))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -124,6 +124,50 @@ class TestPan123TgDatabaseReal(unittest.TestCase):
         self.assertIsNotNone(rec_e05)
         self.assertEqual(rec_e05["media_title"], "谷雨 S01E05")
 
+    def test_tv_range_expansion_lookup_and_replace(self):
+        """验证合集区间 (如 S01E01-E17 -> S01E01-E20) 支持同链接查询及同季合集记录原地更新"""
+        rid = self._add(
+            10,
+            media_key="tv_今天是太阳雨_S01E01-E17",
+            media_title="今天是太阳雨 S01E01-E17",
+            media_type="tv",
+            share_url="https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP",
+            quality_score=120,
+        )
+        by_link = self.db.get_record_by_link(
+            share_url="https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP"
+        )
+        self.assertIsNotNone(by_link)
+        self.assertEqual(by_link["id"], rid)
+        self.assertEqual(by_link["media_title"], "今天是太阳雨 S01E01-E17")
+
+        # 以 S01E01-E20 查询同剧同季时应能命中已有合集记录
+        by_media = self.db.get_record_by_media_key(
+            media_key="tv_今天是太阳雨_S01E01-E20",
+            title="今天是太阳雨",
+            media_type="tv",
+            ep_tag="S01E01-E20",
+        )
+        self.assertIsNotNone(by_media)
+        self.assertEqual(by_media["id"], rid)
+
+        # 使用 replace_record_id 原地升级为 S01E01-E20，不产生多余垃圾行
+        self.db.save_or_update_record(
+            replace_record_id=rid,
+            media_key="tv_今天是太阳雨_S01E01-E20",
+            media_title="今天是太阳雨 S01E01-E20",
+            media_type="tv",
+            share_url="https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP",
+            quality_score=120,
+            status="saved",
+        )
+        self.assertEqual(self.db.count_records(), 1)
+        updated = self.db.get_record_by_link(
+            share_url="https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP"
+        )
+        self.assertEqual(updated["media_title"], "今天是太阳雨 S01E01-E20")
+        self.assertEqual(updated["media_key"], "tv_今天是太阳雨_S01E01-E20")
+
     def test_pagination_and_count(self):
         for i in range(25):
             self._add(i)

@@ -22,12 +22,12 @@ class TgMessageParser:
     RE_EXTRACT_PWD = re.compile(r"(?:提取码|密码|访问码|pwd)[：:\s=]*([a-zA-Z0-9]{4,6})", re.IGNORECASE)
 
     RE_SEASON_EP_RANGE = re.compile(
-        r"\bS(\d{1,3})\s*E(\d{1,4})\s*[-~～至]\s*(?:S\d{1,3}\s*)?E?(\d{1,4})\b",
+        r"\bS(\d{1,3})\s*E(\d{1,4})\s*[-~～至]\s*(?:S(\d{1,3})\s*)?E?(\d{1,4})\b",
         re.IGNORECASE,
     )
     RE_SEASON_EPISODE = re.compile(r"\bS(\d{1,3})(?:E(\d{1,4}))?\b", re.IGNORECASE)
     RE_EP_RANGE_ONLY = re.compile(
-        r"(?:\b(?:EP|E)|第)\s*(\d{1,4})\s*[-~～至]\s*(?:EP|E|第)?\s*(\d{1,4})\s*(?:集|话|期|\b)",
+        r"(?:(?:\b(?:EP|E)|第|(?:集数|全集)[：:\s]*)\s*(\d{1,4})\s*[-~～至]\s*(?:EP|E|第)?\s*(\d{1,4})\s*(?:集|话|期|\b)|\b(\d{1,4})\s*[-~～至]\s*(\d{1,4})\s*(?:集|话|期))",
         re.IGNORECASE,
     )
     # 严格匹配集数：必须带有集/话/期，或明确写有 EPxx/Exx/更新至第xx集，杜绝将「第5部/第2场」等非集数数字误判为集数
@@ -102,6 +102,10 @@ class TgMessageParser:
 
         # 4. 识别影视分类 (movie vs tv) 与季集标识
         media_type, season, episode, ep_tag = cls._determine_media_type(text, fs_filename)
+        _, ep_start, ep_end, is_ep_range = cls.parse_ep_range(ep_tag)
+        if ep_end is None and episode is not None:
+            ep_start = episode
+            ep_end = episode
 
         # 5. 构建展示用标题：剧集统一附加 SxxExx 标识，便于清单展示与按集区分；title 仍保持纯净剧名供网盘创建总文件夹
         display_title = title
@@ -137,6 +141,9 @@ class TgMessageParser:
             "media_type": media_type,
             "season": season,
             "episode": episode,
+            "ep_start": ep_start,
+            "ep_end": ep_end,
+            "is_ep_range": is_ep_range,
             "ep_tag": ep_tag,
             "resolution": resolution,
             "codec": codec,
@@ -300,19 +307,20 @@ class TgMessageParser:
         # ---------------------------------------------------------
         # 3. 季集特征探测 (仅在未判定为电影的前提下执行)
         # ---------------------------------------------------------
-        # 3.1 季+集范围探测 (如 S01E01-E04 / S01E01-04)
-        m_ser = cls.RE_SEASON_EP_RANGE.search(combined)
-        if m_ser:
+        # 3.1 季+集范围探测 (如 S01E01-E04 / S01E01-04 / S01E01-S01E20)
+        for m_ser in cls.RE_SEASON_EP_RANGE.finditer(combined):
             season = int(m_ser.group(1))
+            end_season = int(m_ser.group(3)) if m_ser.group(3) else season
             ep_start = int(m_ser.group(2))
-            ep_end = int(m_ser.group(3))
-            episode = ep_end
-            ep_tag = (
-                f"S{season:02d}E{ep_start:02d}-E{ep_end:02d}"
-                if ep_end != ep_start
-                else f"S{season:02d}E{ep_start:02d}"
-            )
-            return "tv", season, episode, ep_tag
+            ep_end = int(m_ser.group(4))
+            if end_season == season and ep_start <= ep_end:
+                episode = ep_end
+                ep_tag = (
+                    f"S{season:02d}E{ep_start:02d}-E{ep_end:02d}"
+                    if ep_end != ep_start
+                    else f"S{season:02d}E{ep_start:02d}"
+                )
+                return "tv", season, episode, ep_tag
 
         # 3.2 标准季+单集正则探测 (如 S05E217 / S01E06)
         m_se = cls.RE_SEASON_EPISODE.search(combined)
@@ -322,19 +330,23 @@ class TgMessageParser:
             ep_tag = f"S{season:02d}E{episode:02d}"
             return "tv", season, episode, ep_tag
 
-        # 3.3 纯集数范围探测 (如 📼 集数：E01-E04 / EP01-04 / 第1-4集)
-        m_epr = cls.RE_EP_RANGE_ONLY.search(combined)
-        if m_epr:
-            season = int(m_se.group(1)) if m_se else detected_season
-            ep_start = int(m_epr.group(1))
-            ep_end = int(m_epr.group(2))
-            episode = ep_end
-            ep_tag = (
-                f"S{season:02d}E{ep_start:02d}-E{ep_end:02d}"
-                if ep_end != ep_start
-                else f"S{season:02d}E{ep_start:02d}"
-            )
-            return "tv", season, episode, ep_tag
+        # 3.3 纯集数范围探测 (如 📼 集数：E01-E04 / EP01-04 / 第1-4集 / 1-20集)
+        for m_epr in cls.RE_EP_RANGE_ONLY.finditer(combined):
+            s_raw = m_epr.group(1) or m_epr.group(3)
+            e_raw = m_epr.group(2) or m_epr.group(4)
+            if not s_raw or not e_raw:
+                continue
+            ep_start = int(s_raw)
+            ep_end = int(e_raw)
+            if ep_start <= ep_end:
+                season = int(m_se.group(1)) if m_se else detected_season
+                episode = ep_end
+                ep_tag = (
+                    f"S{season:02d}E{ep_start:02d}-E{ep_end:02d}"
+                    if ep_end != ep_start
+                    else f"S{season:02d}E{ep_start:02d}"
+                )
+                return "tv", season, episode, ep_tag
 
         # 3.4 纯单集探测 (如 E06 / EP12 / 第32集 / 更新至第82集)
         m_ep = cls.RE_EPISODE_ONLY.search(combined)
@@ -452,3 +464,37 @@ class TgMessageParser:
         else:
             yr_str = f"_{year}" if year else ""
             return f"movie_{norm_title}{yr_str}"
+
+    @staticmethod
+    def parse_ep_range(ep_tag_or_text: str) -> Tuple[Optional[int], Optional[int], Optional[int], bool]:
+        """
+        从标准化 ep_tag 或标题中提取 (season, ep_start, ep_end, is_ep_range)。
+        例如:
+          "S01E01-E20" -> (1, 1, 20, True)
+          "今天是太阳雨 S01E01-E17" -> (1, 1, 17, True)
+          "S01E05" -> (1, 5, 5, False)
+          "S02" -> (2, None, None, False)
+        """
+        text = str(ep_tag_or_text or "").strip()
+        if not text:
+            return None, None, None, False
+        m_rng = re.search(
+            r"\bS(\d{1,3})E(\d{1,4})\s*[-~～至]\s*E?(\d{1,4})\b",
+            text,
+            re.IGNORECASE,
+        )
+        if m_rng:
+            s = int(m_rng.group(1))
+            e1 = int(m_rng.group(2))
+            e2 = int(m_rng.group(3))
+            if e1 <= e2:
+                return s, e1, e2, (e2 > e1)
+        m_one = re.search(r"\bS(\d{1,3})E(\d{1,4})\b", text, re.IGNORECASE)
+        if m_one:
+            s = int(m_one.group(1))
+            ep = int(m_one.group(2))
+            return s, ep, ep, False
+        m_s = re.search(r"\bS(\d{1,3})\b", text, re.IGNORECASE)
+        if m_s:
+            return int(m_s.group(1)), None, None, False
+        return None, None, None, False

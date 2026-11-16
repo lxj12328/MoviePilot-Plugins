@@ -294,6 +294,11 @@ class Pan123TgDatabase:
                     if ep_tag:
                         conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}_{ep_tag}")
                         conditions.append(Pan123TgRecord.media_title == f"{clean_base} {ep_tag}")
+                        # 若当前为合集区间 (如 S01E01-E20)，同步检索同剧同季的已有合集区间记录 (如 S01E01-E17)，便于识别追更扩充
+                        m_rng = re.match(r"^S(\d{1,3})E\d{1,4}-E?\d{1,4}$", ep_tag, re.IGNORECASE)
+                        if m_rng:
+                            s_num = int(m_rng.group(1))
+                            conditions.append(Pan123TgRecord.media_key.like(f"tv_{norm_title}_S{s_num:02d}E%-E%"))
                     else:
                         conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}")
         else:
@@ -344,6 +349,37 @@ class Pan123TgDatabase:
         # 走 link_hash 索引的等值/IN 查询，避免 LIKE 全表扫描
         stmt = select(Pan123TgRecord.id).where(Pan123TgRecord.link_hash.in_(tokens)).limit(1)
         return db.execute(stmt).first() is not None
+
+    @db_query
+    def get_record_by_link(self, *args, **kwargs) -> Optional[dict]:
+        """根据分享链接或秒传哈希码查询最新的已转存记录 (用于判断同一永久分享链接是否追更扩充了集数)"""
+        db = kwargs.get("db")
+        share_url = str(kwargs.get("share_url") or "")
+        fslink = str(kwargs.get("fslink") or "")
+        for arg in args:
+            if hasattr(arg, "execute"):
+                db = arg
+            elif isinstance(arg, str):
+                if not share_url:
+                    share_url = arg
+                elif not fslink:
+                    fslink = arg
+
+        if db is None:
+            return None
+
+        tokens = link_hash_candidates(share_url, fslink)
+        if not tokens:
+            return None
+
+        stmt = (
+            select(Pan123TgRecord)
+            .where(Pan123TgRecord.link_hash.in_(tokens))
+            .order_by(Pan123TgRecord.id.desc())
+            .limit(1)
+        )
+        rec = db.execute(stmt).scalar_one_or_none()
+        return self._to_dict(rec) if rec else None
 
     @db_update
     def save_or_update_record(self, *args, **kwargs) -> int:
@@ -401,11 +437,20 @@ class Pan123TgDatabase:
             return 0
 
         existing = None
-        if media_key:
+        replace_record_id = merged.get("replace_record_id")
+        if replace_record_id:
+            try:
+                stmt_id = select(Pan123TgRecord).where(Pan123TgRecord.id == int(replace_record_id)).limit(1)
+                existing = db.execute(stmt_id).scalar_one_or_none()
+            except Exception:
+                existing = None
+        if not existing and media_key:
             stmt = select(Pan123TgRecord).where(Pan123TgRecord.media_key == media_key).order_by(Pan123TgRecord.id.desc()).limit(1)
             existing = db.execute(stmt).scalar_one_or_none()
 
         if existing:
+            if media_key:
+                existing.media_key = media_key
             existing.channel = channel
             existing.msg_id = msg_id
             existing.media_title = media_title
@@ -462,7 +507,7 @@ class Pan123TgDatabase:
                 db.commit()
             except Exception:
                 pass
-            return int(new_rec.id if new_rec.id is not None else 1)
+            return int(new_rec.id) if isinstance(new_rec.id, int) else 1
 
     @staticmethod
     def _build_filter(keyword: Any = None, status: Any = None, media_type: Any = None):

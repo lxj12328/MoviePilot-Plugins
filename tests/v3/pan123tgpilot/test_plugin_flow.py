@@ -353,6 +353,86 @@ S05E217 4K WEB-DL H.265
         self.plugin.init_plugin({"enabled": True, "retention_days": -5})
         self.assertEqual(self.plugin._retention_days, 0)
 
+    def test_episode_range_expansion_with_same_share_link(self):
+        """
+        验证同一剧集使用同一永久分享链接追更 (S01E01-E17 -> S01E01-E19 -> S01E01-E20) 时：
+        1. 若同批次拉取到多个版本，批内合并保留集数最全的 S01E01-E20，不提前被旧消息阻断；
+        2. 若本地库已存至 S01E01-E17，同链接更新到 S01E01-E20 时放行增量补全，不删旧集并刷新记录；
+        3. 若本地库已存至 S01E01-E20，再次遇到 S01E01-E17 或 S01E01-E20 时正常跳过。
+        """
+        def _mk_msg(ep_range: str) -> str:
+            return (
+                f"🎬 名称：今天是太阳雨 (2026)\n"
+                f"📁 类型：国产剧集\n"
+                f"🖥️ 画质：2160p\n"
+                f"🎥 视频：WEB-DL.H.264\n"
+                f"📦 大小：95.8 GB\n"
+                f"📼 集数：{ep_range}\n"
+                f"🔗 链接：\n"
+                f"https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP"
+            )
+
+        self.plugin.init_plugin({
+            "enabled": True,
+            "pan123_token": "token_abc",
+            "movie_target_dir_id": "1001",
+            "tv_target_dir_id": "1002",
+            "tg_channels": "@yun123pan",
+        })
+        self.plugin._client = MagicMock()
+        self.plugin._client.save_share_link.return_value = (True, "88888", "ok")
+        self.plugin._db = MagicMock()
+        self.plugin._watcher = MagicMock()
+
+        # 场景 A：本地库已有 S01E01-E17 (同分享链接)，同批次同时出现 E01-E19 和 E01-E20
+        self.plugin._db.get_record_by_link.return_value = {
+            "id": 77,
+            "media_key": "tv_今天是太阳雨_S01E01-E17",
+            "media_title": "今天是太阳雨 S01E01-E17",
+            "media_type": "tv",
+            "quality_score": 120,
+            "pan_file_id": "66666",
+        }
+        self.plugin._db.get_record_by_media_key.return_value = None
+        self.plugin._db.has_link_processed.return_value = True
+
+        self.plugin._watcher.fetch_channel_messages.return_value = [
+            ("101", _mk_msg("E01-E17")),
+            ("102", _mk_msg("E01-E19")),
+            ("103", _mk_msg("E01-E20")),
+        ]
+        res = self.plugin.execute_check_all_channels()
+        self.assertTrue(res["success"])
+        self.assertEqual(res["stats"]["transferred"], 1)
+        # 仅保留并转存了最全的 S01E01-E20，且不触发 trash_files 删除旧集
+        self.plugin._client.save_share_link.assert_called_once()
+        self.plugin._client.trash_files.assert_not_called()
+        saved_kwargs = self.plugin._client.save_share_link.call_args.kwargs
+        self.assertEqual(saved_kwargs["share_key"], "cHCOTd-jKjP")
+        db_kwargs = self.plugin._db.save_or_update_record.call_args.kwargs
+        self.assertEqual(db_kwargs["media_key"], "tv_今天是太阳雨_S01E01-E20")
+        self.assertEqual(db_kwargs["media_title"], "今天是太阳雨 S01E01-E20")
+        self.assertEqual(db_kwargs["replace_record_id"], 77)
+
+        # 场景 B：本地库已存至 S01E01-E20，再遇到 E01-E17 或 E01-E20 应正常跳过
+        self.plugin._client.save_share_link.reset_mock()
+        self.plugin._db.get_record_by_link.return_value = {
+            "id": 77,
+            "media_key": "tv_今天是太阳雨_S01E01-E20",
+            "media_title": "今天是太阳雨 S01E01-E20",
+            "media_type": "tv",
+            "quality_score": 120,
+            "pan_file_id": "88888",
+        }
+        self.plugin._watcher.fetch_channel_messages.return_value = [
+            ("101", _mk_msg("E01-E17")),
+            ("103", _mk_msg("E01-E20")),
+        ]
+        res2 = self.plugin.execute_check_all_channels()
+        self.assertEqual(res2["stats"]["transferred"], 0)
+        self.assertEqual(res2["stats"]["skipped"], 2)
+        self.plugin._client.save_share_link.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
