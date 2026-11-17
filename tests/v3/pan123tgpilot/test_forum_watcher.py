@@ -232,6 +232,71 @@ class TestXiunoForumWatcher(unittest.TestCase):
         plugin.execute_check_all_channels()
         plugin._forum_watcher.daily_checkin.assert_called_once()
 
+    def test_daily_reply_limit_circuit_breaker_and_persistence(self):
+        """
+        验证：
+        1. 站方返回「您的用户今日回帖数达到上限」时立即熔断当日剩余自动回帖，并持久化状态；
+        2. 当日后续巡检不再发起任何回帖请求，但仍可正常抓取公开 123 链接；
+        3. 本地配置的 daily_reply_limit (如 2 贴/天) 达标后自动拦截当日继续回帖，跨天状态自动恢复。
+        """
+        watcher = XiunoForumWatcher(
+            username="u", password="p", auto_reply=True,
+            max_reply_per_run=5, daily_reply_limit=2, reply_cooldown=0.0,
+        )
+        watcher._logged_in = True
+
+        forum_html = """
+        <ul class="threadlist">
+          <li class="media thread" data-tid="70083"><a href="?thread-70083.htm">隐藏帖A (2026)</a></li>
+          <li class="media thread" data-tid="70084"><a href="?thread-70084.htm">隐藏帖B (2026)</a></li>
+          <li class="media thread" data-tid="70085"><a href="?thread-70085.htm">公开帖C (2026)</a></li>
+        </ul>
+        """
+        hidden_html = '<div class="message break-all" isfirst="1">https://www.123865.com/s/Abc-123<br>请回复后再查看</div>'
+        public_html = '<div class="message break-all" isfirst="1">https://www.123865.com/s/Pub-999?pwd=aaaa</div>'
+
+        post_calls = []
+
+        def mock_request(url, method="GET", data=None, extra_headers=None, timeout=18):
+            if "thread-70085" in url:
+                return 200, public_html
+            return 200, hidden_html
+
+        def mock_route(route, method="GET", data=None, extra_headers=None):
+            if "forum-2.htm" in route:
+                return 200, forum_html, "https://pan1.me/?forum-2.htm"
+            if "post-create-" in route and method == "POST":
+                post_calls.append(route)
+                return 200, json.dumps({"code": -1, "message": "您的用户今日回帖数达到上限。"}), route
+            return 404, "", ""
+
+        watcher._request = mock_request
+        watcher._request_route = mock_route
+
+        # 第一次巡检：70083 触及站方今日上限后立即熔断，70084 不再尝试发 POST；70085 公开帖照常抓取；70083 未入 _replied_tids
+        msgs1 = watcher.fetch_forum_messages("2")
+        self.assertEqual(len(post_calls), 1)
+        self.assertTrue(watcher.is_daily_reply_exhausted())
+        self.assertNotIn("70083", watcher._replied_tids)
+        self.assertEqual([m[1] for m in msgs1], ["pan1me_70085"])
+
+        # 第二次巡检（同一天）：直接跳过回帖请求（post_calls 依然为 1）
+        msgs2 = watcher.fetch_forum_messages("2")
+        self.assertEqual(len(post_calls), 1)
+        self.assertEqual([m[1] for m in msgs2], ["pan1me_70085"])
+
+        # 持久化导出 -> 模拟昨日状态恢复时应自动清零恢复
+        state = watcher.get_reply_quota_state()
+        self.assertTrue(state["limit_reached"])
+
+        w_new = XiunoForumWatcher(daily_reply_limit=2, reply_cooldown=0.0)
+        w_new.load_reply_quota_state(state)
+        self.assertTrue(w_new.is_daily_reply_exhausted())
+
+        w_tomorrow = XiunoForumWatcher(daily_reply_limit=2, reply_cooldown=0.0)
+        w_tomorrow.load_reply_quota_state({"date": "2000-01-01", "count": 2, "limit_reached": True})
+        self.assertFalse(w_tomorrow.is_daily_reply_exhausted())
+
 
 if __name__ == "__main__":
     unittest.main()

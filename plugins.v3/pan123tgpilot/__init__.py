@@ -73,7 +73,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -123,6 +123,7 @@ class Pan123TgPilot(_PluginBase):
         self._pan1me_forum_ids: str = "2,48,37,52"
         self._pan1me_auto_reply: bool = True
         self._pan1me_max_reply: int = 3
+        self._pan1me_daily_reply_limit: int = 10
         self._pan1me_auto_checkin: bool = True
         self._pan1me_keywords: str = ""
         self._pan1me_last_checkin_date: str = ""
@@ -261,6 +262,11 @@ class Pan123TgPilot(_PluginBase):
             self._pan1me_max_reply = max(0, min(20, mr))
         except (ValueError, TypeError):
             self._pan1me_max_reply = 3
+        try:
+            dl = int(config.get("pan1me_daily_reply_limit") if config.get("pan1me_daily_reply_limit") is not None else 10)
+            self._pan1me_daily_reply_limit = max(0, min(100, dl))
+        except (ValueError, TypeError):
+            self._pan1me_daily_reply_limit = 10
         self._pan1me_auto_checkin = bool(config.get("pan1me_auto_checkin", True))
         self._pan1me_keywords = str(config.get("pan1me_keywords") or "").strip()
 
@@ -281,8 +287,16 @@ class Pan123TgPilot(_PluginBase):
                 cookie=self._pan1me_cookie,
                 auto_reply=self._pan1me_auto_reply,
                 max_reply_per_run=self._pan1me_max_reply,
+                daily_reply_limit=self._pan1me_daily_reply_limit,
                 keywords=self._pan1me_keywords,
             )
+            if hasattr(self, "get_data"):
+                try:
+                    rp_state = self.get_data("pan1me_reply_state")
+                    if isinstance(rp_state, dict):
+                        self._forum_watcher.load_reply_quota_state(rp_state)
+                except Exception:
+                    pass
         else:
             self._forum_watcher = None
 
@@ -492,6 +506,13 @@ class Pan123TgPilot(_PluginBase):
                     grouped_forum.setdefault(f_label, []).append((m_id, f_text))
                 for f_label, items in grouped_forum.items():
                     fetch_results.append((f_label, items))
+                if hasattr(self, "save_data") and hasattr(self._forum_watcher, "get_reply_quota_state"):
+                    try:
+                        q_state = self._forum_watcher.get_reply_quota_state()
+                        if isinstance(q_state, dict):
+                            self.save_data("pan1me_reply_state", q_state)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"Pan123TgPilot 抓取 pan1.me 论坛资源异常: {e}")
 
@@ -1090,8 +1111,13 @@ class Pan123TgPilot(_PluginBase):
                 )], md=12),
                 col([fld(
                     "pan1me_max_reply_per_run", "单轮最多自动回复贴数",
-                    "防止短时间刷帖触发论坛防灌水封号，默认 3 贴/轮",
+                    "限制单次巡检最多回复多少贴 (范围 0-20，默认 3)",
                     type="number", placeholder="3",
+                )]),
+                col([fld(
+                    "pan1me_daily_reply_limit", "每日最多自动回复贴数",
+                    "防止触及账号每日回帖封顶 (范围 0-100，默认 10；0 为不另设上限；若站方提示已达上限也会当日自动熔断并在次日恢复)",
+                    type="number", placeholder="10",
                 )]),
                 col([{
                     "component": "VTextarea",
@@ -1101,7 +1127,7 @@ class Pan123TgPilot(_PluginBase):
                         "placeholder": "留空则抓取所选板块全部新帖；填写关键词 (逗号分隔) 则仅处理命中片名",
                         "hint": "如只想自动解锁/转存特定剧集可在此填写，降低回帖频次", "persistent-hint": True,
                     },
-                }]),
+                }], md=12),
             ]},
         ])
 
@@ -1153,6 +1179,7 @@ class Pan123TgPilot(_PluginBase):
             "pan1me_forum_ids": "2,48,37,52",
             "pan1me_auto_reply": True,
             "pan1me_max_reply_per_run": 3,
+            "pan1me_daily_reply_limit": 10,
             "pan1me_auto_checkin": True,
             "pan1me_keywords": "",
             "auto_upgrade": True,
@@ -1369,6 +1396,14 @@ class Pan123TgPilot(_PluginBase):
                          f"pan1.me 论坛: {'已启用 (板块 ' + (self._pan1me_forum_ids or '-') + ')' if self._pan1me_enabled else '未启用'}"
                          + (f" · 今日签到 ({self._pan1me_last_checkin_date}): {self._pan1me_last_checkin_msg}"
                             if self._pan1me_enabled and self._pan1me_last_checkin_date else "")
+                         + (
+                             " · 今日回帖: "
+                             + ("已达上限 (次日恢复)" if self._forum_watcher.is_daily_reply_exhausted() else (
+                                 f"{self._forum_watcher.get_reply_quota_state().get('count', 0)}"
+                                 + (f"/{self._pan1me_daily_reply_limit}" if self._pan1me_daily_reply_limit > 0 else "")
+                             ))
+                             if self._pan1me_enabled and self._forum_watcher else ""
+                         )
                      )},
                     {"component": "p", "props": {"class": "text-caption text-grey"},
                      "text": (f"电影目录ID {self._movie_target_dir_id} · 剧集目录ID {self._tv_target_dir_id} · "

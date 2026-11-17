@@ -4,6 +4,7 @@ Pan123TgPilot 论坛站点适配器 (专用于 pan1.me / Xiuno BBS 4.0.4)
 """
 
 import hashlib
+from datetime import datetime
 from html import unescape
 import http.cookiejar
 import json
@@ -80,6 +81,10 @@ class XiunoForumWatcher:
         r"(?:签到成功|恭喜|获得|积分|金币|经验|已签|重复签到|已经签过)",
         re.IGNORECASE,
     )
+    RE_DAILY_REPLY_LIMIT = re.compile(
+        r"(?:今日回帖数|每日回帖|回帖.*上限|回复.*上限|达到上限|今日.*次数.*上限|明天再来)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -90,6 +95,7 @@ class XiunoForumWatcher:
         proxy: str = "",
         auto_reply: bool = True,
         max_reply_per_run: int = 3,
+        daily_reply_limit: int = 10,
         reply_cooldown: float = 5.0,
         keywords: str = "",
     ):
@@ -104,6 +110,11 @@ class XiunoForumWatcher:
             self.max_reply_per_run = max(0, min(20, mr))
         except (ValueError, TypeError):
             self.max_reply_per_run = 3
+        try:
+            dl = int(daily_reply_limit if daily_reply_limit is not None else 10)
+            self.daily_reply_limit = max(0, min(100, dl))
+        except (ValueError, TypeError):
+            self.daily_reply_limit = 10
         self.reply_cooldown = max(0.0, float(reply_cooldown if reply_cooldown is not None else 5.0))
         self.keywords = self._parse_keywords(keywords)
 
@@ -111,10 +122,60 @@ class XiunoForumWatcher:
         self._session_lock = threading.Lock()
         self._logged_in: bool = False
         self._last_reply_ts: float = 0.0
-        # 缓存已尝试解锁过或判定无法自动解锁的 tid，避免同一运行期内反复重试回帖
+        # 缓存已成功回复解锁的 tid，避免同一运行期内反复回帖
         self._replied_tids: set[str] = set()
+        # 每日回帖配额跟踪 (跨日自动重置)
+        self._daily_reply_date: str = ""
+        self._daily_reply_count: int = 0
+        self._daily_limit_reached_date: str = ""
         # 标记是否支持 ?route.htm 风格（pan1.me 默认使用 ?forum-2.htm 查询参数风格）
         self._use_query_route: bool = True
+
+    @staticmethod
+    def _today_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _roll_daily_reply_counter(self) -> str:
+        """跨日自动清零每日回帖计数器与站方上限熔断标记"""
+        today = self._today_str()
+        if self._daily_reply_date != today:
+            self._daily_reply_date = today
+            self._daily_reply_count = 0
+        if self._daily_limit_reached_date and self._daily_limit_reached_date != today:
+            self._daily_limit_reached_date = ""
+        return today
+
+    def is_daily_reply_exhausted(self) -> bool:
+        """检查今日是否已触及每日回帖上限 (本地配置上限或站方提示今日上限)"""
+        today = self._roll_daily_reply_counter()
+        if self._daily_limit_reached_date == today:
+            return True
+        if self.daily_reply_limit > 0 and self._daily_reply_count >= self.daily_reply_limit:
+            return True
+        return False
+
+    def get_reply_quota_state(self) -> Dict[str, object]:
+        """导出每日回帖状态供宿主插件持久化"""
+        today = self._roll_daily_reply_counter()
+        return {
+            "date": today,
+            "count": int(self._daily_reply_count),
+            "limit_reached": (self._daily_limit_reached_date == today),
+        }
+
+    def load_reply_quota_state(self, state: Optional[dict]) -> None:
+        """从持久化存储恢复每日回帖配额 (非今日记录自动忽略清零)"""
+        if not isinstance(state, dict):
+            return
+        today = self._today_str()
+        if str(state.get("date") or "") != today:
+            return
+        self._daily_reply_date = today
+        try:
+            self._daily_reply_count = max(0, int(state.get("count") or 0))
+        except (ValueError, TypeError):
+            self._daily_reply_count = 0
+        self._daily_limit_reached_date = today if state.get("limit_reached") else ""
 
     @staticmethod
     def _normalize_base_url(url: str) -> str:
@@ -490,8 +551,25 @@ class XiunoForumWatcher:
 
         ok_reply, msg_reply = self._parse_xiuno_json_result(st_post, resp_text)
         if ok_reply:
-            logger.info(f"Pan123TgPilot 已自动回复论坛帖 [tid={tid}] 解锁隐藏资源")
+            today = self._roll_daily_reply_counter()
+            self._daily_reply_date = today
+            self._daily_reply_count += 1
+            logger.info(
+                f"Pan123TgPilot 已自动回复论坛帖 [tid={tid}] 解锁隐藏资源 "
+                f"(今日已回复 {self._daily_reply_count}"
+                + (f"/{self.daily_reply_limit}" if self.daily_reply_limit > 0 else "")
+                + " 贴)"
+            )
             return True
+
+        combined_err = f"{msg_reply} {resp_text or ''}"
+        if self.RE_DAILY_REPLY_LIMIT.search(combined_err):
+            today = self._roll_daily_reply_counter()
+            self._daily_limit_reached_date = today
+            logger.info(
+                f"Pan123TgPilot 论坛今日回帖数已达上限 ({msg_reply})，今日自动暂停回帖解锁（次日自动恢复），仅继续转存无需回帖的公开资源"
+            )
+            return False
 
         logger.warning(f"Pan123TgPilot 自动回复论坛帖 [tid={tid}] 未成功: {msg_reply}")
         return False
@@ -525,6 +603,13 @@ class XiunoForumWatcher:
         collected: List[Tuple[str, str, str]] = []
         replies_used = 0
         reply_blocked = False
+        if self.auto_reply and self.is_daily_reply_exhausted():
+            reply_blocked = True
+            logger.info(
+                f"Pan123TgPilot 今日论坛自动回帖额度已用尽 ({self._daily_reply_count}"
+                + (f"/{self.daily_reply_limit}" if self.daily_reply_limit > 0 else "")
+                + ")，本次仅抓取公开 123 资源，次日自动恢复回帖解锁"
+            )
 
         for fid in fids:
             if stop_event and stop_event.is_set():
@@ -583,14 +668,18 @@ class XiunoForumWatcher:
                 need_unlock = (not has_link) or (has_link and not has_fslink and not has_pwd)
 
                 # 若帖子需要回复解锁、且处于安全配额内，执行一次礼貌回帖后再重抓
-                unlocked_this_turn = False
                 if need_unlock and has_hide and self.auto_reply:
-                    if not reply_blocked and replies_used < self.max_reply_per_run and tid not in self._replied_tids:
-                        self._replied_tids.add(tid)
+                    can_reply_more = (
+                        not reply_blocked
+                        and not self.is_daily_reply_exhausted()
+                        and replies_used < self.max_reply_per_run
+                        and tid not in self._replied_tids
+                    )
+                    if can_reply_more:
                         ok_unlock = self._reply_to_unlock(tid=tid, thread_url=thread_url, stop_event=stop_event)
                         if ok_unlock:
+                            self._replied_tids.add(tid)
                             replies_used += 1
-                            unlocked_this_turn = True
                             try:
                                 st_th2, th_html2 = self._request(thread_url, method="GET")
                                 if st_th2 < 400 and th_html2:
@@ -601,10 +690,12 @@ class XiunoForumWatcher:
                             except Exception:
                                 pass
                         else:
-                            # 一旦触发验证码或回帖被拒，停掉本轮剩余自动回帖以防风控
+                            # 一旦触发验证码、今日上限或回帖被拒，停掉本轮剩余自动回帖以防风控
                             reply_blocked = True
-                    elif replies_used >= self.max_reply_per_run and not has_pwd and not has_fslink:
-                        # 仅因达到单轮回复限额暂未解锁提取码时，留给下一轮再解锁，不拿残缺链接试错
+                            if not has_pwd and not has_fslink:
+                                continue
+                    elif not has_pwd and not has_fslink:
+                        # 因达到单轮或每日回复限额暂未解锁提取码时，留给下次/次日再解锁，不拿残缺链接试错
                         continue
 
                 if not has_link:
