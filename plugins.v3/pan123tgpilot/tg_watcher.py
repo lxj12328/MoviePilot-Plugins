@@ -67,14 +67,16 @@ class TgChannelWatcher:
         since_msg_id: int = 0,
         max_pages: int = 5,
         stop_event: Any = None,
+        force_backfill: bool = False,
     ) -> List[Tuple[str, str]]:
         """
-        抓取指定频道消息列表（支持按 since_msg_id 游标使用 ?before= 向后自动翻页补齐爆发消息）
+        抓取指定频道消息列表（支持按 since_msg_id 游标使用 ?before= 向后自动翻页补齐爆发消息，或 force_backfill 强制历史回溯 N 页）
         :param channel: 频道用户名（可带 @）
         :param limit: 无游标首次/测试抓取时最多返回的最近消息条数
         :param since_msg_id: 已处理的最大消息 ID 游标；>0 时将翻页回溯直到衔接或达到 max_pages，并返回全部新消息
         :param max_pages: 单轮最大翻页数（每页约 20 条）
         :param stop_event: 可选停止信号，用于中断翻页等待
+        :param force_backfill: 为 True 时忽略游标早停条件，强制向后翻满 max_pages 页进行历史回溯补漏
         :return: [(msg_id, message_text), ...] 按消息 ID 升序排列
         """
         chan_name = channel.strip().lstrip("@").strip()
@@ -89,17 +91,18 @@ class TgChannelWatcher:
             since_msg_id=since_id,
             max_pages=max_pages,
             stop_event=stop_event,
+            force_backfill=force_backfill,
         )
         if messages:
-            if since_id > 0:
+            if since_id > 0 or force_backfill:
                 return messages
             return messages[-limit:] if limit > 0 else messages
 
         # 备选通过 Bot Token 抓取
         if self.bot_token:
-            messages_bot = self._fetch_via_bot(chan_name, since_msg_id=since_id)
+            messages_bot = self._fetch_via_bot(chan_name, since_msg_id=0 if force_backfill else since_id)
             if messages_bot:
-                if since_id > 0:
+                if since_id > 0 or force_backfill:
                     return messages_bot
                 return messages_bot[-limit:] if limit > 0 else messages_bot
 
@@ -156,34 +159,41 @@ class TgChannelWatcher:
         max_pages: int = 5,
         stop_event: Any = None,
         page_delay: float = 0.5,
+        force_backfill: bool = False,
     ) -> List[Tuple[str, str]]:
         """
         通过 https://t.me/s/{username} 抓取公开消息；
-        当指定 since_msg_id > 0 且首页最旧消息 ID 仍大于游标时，自动通过 ?before=<min_id> 向后翻页补齐（最多 max_pages 页）。
-        首次无游标时仅抓首页 1 页以建立基线，避免回溯陈年历史消息。
+        当指定 since_msg_id > 0 或开启 force_backfill 时，自动通过 ?before=<min_id> 向后翻页补齐（最多 max_pages 页）。
+        常规首次无游标时仅抓首页 1 页以建立基线，避免回溯陈年历史消息。
         """
         since_id = max(0, int(since_msg_id or 0))
         cap_pages = max(1, min(20, int(max_pages or 1)))
-        effective_pages = cap_pages if since_id > 0 else 1
+        effective_pages = cap_pages if (since_id > 0 or force_backfill) else 1
 
         collected: dict[str, tuple[int, str]] = {}
         order_counter = 0
         before_id: Optional[int] = None
+        pages_fetched = 0
 
         for page_idx in range(effective_pages):
             if stop_event is not None and hasattr(stop_event, "is_set") and stop_event.is_set():
                 break
 
-            if page_idx > 0 and page_delay > 0:
-                if stop_event is not None and hasattr(stop_event, "wait"):
-                    if stop_event.wait(page_delay):
-                        break
-                else:
-                    time.sleep(page_delay)
+            if page_idx > 0:
+                logger.info(
+                    f"Pan123TgPilot 频道 @{channel_username} 正在向后翻页补漏第 {page_idx + 1}/{effective_pages} 页 (?before={before_id})..."
+                )
+                if page_delay > 0:
+                    if stop_event is not None and hasattr(stop_event, "wait"):
+                        if stop_event.wait(page_delay):
+                            break
+                    else:
+                        time.sleep(page_delay)
 
             page_msgs = self._fetch_web_preview_page(channel_username, before_id=before_id)
             if not page_msgs:
                 break
+            pages_fetched += 1
 
             page_ids: List[int] = []
             for raw_id, raw_text in page_msgs:
@@ -198,7 +208,7 @@ class TgChannelWatcher:
                 break
 
             page_min_id = min(page_ids)
-            if since_id > 0 and page_min_id <= since_id:
+            if not force_backfill and since_id > 0 and page_min_id <= since_id:
                 break
             if before_id is not None and page_min_id >= before_id:
                 # 站点返回未向更早 ID 推进时主动中止，防止死循环
@@ -213,7 +223,7 @@ class TgChannelWatcher:
         for mid, (ord_idx, raw_text) in collected.items():
             if mid.isdigit():
                 mid_int = int(mid)
-                if since_id > 0 and mid_int <= since_id:
+                if not force_backfill and since_id > 0 and mid_int <= since_id:
                     continue
                 numeric_ids.append(mid_int)
                 filtered_items.append(((0, mid_int), mid, raw_text))
@@ -224,6 +234,12 @@ class TgChannelWatcher:
             self._last_msg_ids[channel_username.lower()] = max(
                 int(self._last_msg_ids.get(channel_username.lower(), 0) or 0),
                 max(numeric_ids),
+            )
+
+        if pages_fetched > 1 or force_backfill:
+            logger.info(
+                f"Pan123TgPilot 频道 @{channel_username} 翻页补漏完成: 共抓取 {pages_fetched} 页，汇总 {len(filtered_items)} 条消息"
+                + (" (历史回溯模式)" if force_backfill else f" (游标 since>{since_id})")
             )
 
         filtered_items.sort(key=lambda item: item[0])

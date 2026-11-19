@@ -64,6 +64,7 @@
 | **监控 TG 频道列表** | `tg_channels` | 文本 (Textarea) | `@Pan123Movie, @regeng123, @yun123pan` | 多个频道用英文逗号或换行分隔，支持 `@频道名` 或纯频道名 |
 | **抓取检查周期 (分钟)** | `check_interval` | 整数 (Number) | `10` | 周期性巡检频道的频率，推荐 5 ~ 30 分钟 |
 | **单轮最大补漏翻页数** | `tg_max_pages_per_run` | 整数 (Number) | `5` | 配合持久化消息游标使用 `?before=` 向后翻页，每页约 20 条，默认 5 页可无缝补齐单轮 ~100 条爆发消息（范围 `1~20`，填 `1` 仅抓首页） |
+| **保存后立即回溯补漏** | `backfill_on_save` | 布尔值 (Switch) | `false` | 临时忽略游标向后翻满 `tg_max_pages_per_run` 页补抓遗漏的历史消息（已存资源自动跳过），触发后自动复位关闭 |
 | **TG 网络代理** | `tg_proxy` | 字符串 | `空` | HTTP / SOCKS5 代理地址，如 `http://127.0.0.1:7890`（国内服务器必填） |
 | **开启智能画质洗版** | `auto_upgrade` | 布尔值 (Switch) | `true` | 当检测到同一影视且画质评分更高时，自动转存新资源 |
 | **洗版成功后清理旧版** | `auto_delete_old_version` | 布尔值 (Switch) | `true` | 洗版成功后，自动将网盘中旧版文件移至回收站 |
@@ -144,12 +145,18 @@ flowchart LR
 - 升级到 v1.1.0 时自动执行可重复运行的迁移：补齐 `link_hash` 列与索引并回填历史数据。
 - 详情页清单：采用与 123云盘助手同款的现代化交互式分页导航栏（支持首页/上一页/页码直跳/下一页/末页/快进快退 5 页、每页 15/20/50 条切换）及顶部媒体分类/状态筛选工具栏。
 - 完整检索与翻页使用 API：`GET /api/v1/plugin/Pan123TgPilot/records?keyword=八仙&status=saved&page=1&page_size=20`，返回 `total` / `pages` / `data`。
-- **网页端可视化记录清理与重扫**（仅删除插件历史记录表数据，**绝不删除 123 云盘文件**）：
-  - 在插件详情页顶部操作栏可点击 **`🗑 清理 <频道名>`**、**`🗑 清空全部记录`** 或每行右侧 **`删除`** 按钮精准删掉脏数据，点击 **`🔄 立即巡检重扫`** 重新抓取校准；
-  - 也可通过 API 触发：`GET /api/v1/plugin/Pan123TgPilot/clear_records?channel=@xx123pan&rerun=true`（支持 `record_id`、`channel`、`keyword`、`clear_all=true`、`rerun=true`）。
+- **网页端可视化记录清理、回溯与重扫**（仅删除插件历史记录表数据，**绝不删除 123 云盘文件**）：
+  - 在插件详情页顶部操作栏可点击 **`🗑 清理 <频道名>`**、**`🗑 清空全部记录`** 或每行右侧 **`删除`** 按钮精准删掉脏数据；点击 **`🔄 立即巡检重扫`** 立即执行增量巡检，点击 **`⏪ 回溯补抓最近 N 页`** 可临时忽略游标强制向后翻页补回遗漏的历史消息；
+  - 也可通过 API 触发：`GET /api/v1/plugin/Pan123TgPilot/clear_records?channel=@xx123pan&rerun=true`（支持 `record_id`、`channel`、`keyword`、`clear_all=true`、`rerun=true`）或 `GET /api/v1/plugin/Pan123TgPilot/manual_check?backfill_pages=5`。
 - 手动按天清理：`/purge`（保留天数为 0 时不会删除任何数据）。
 
 ## 6. 版本历史 (Changelog)
+
+### v1.5.1
+- **新增一键历史回溯补漏与直观翻页进度日志**：
+  - 详情页顶部数据维护栏新增 **`⏪ 回溯补抓最近 N 页`** 交互按钮，配合 `/api/v1/plugin/Pan123TgPilot/manual_check?backfill_pages=N`，可临时忽略游标强制向后连续翻满 N 页（已存资源由 `link_hash` 自动跳过），快速补回此前已掉出首页的遗漏资源。
+  - 配置页「Telegram 监控」分组新增保存触发后自动复位的 **`保存后立即回溯补漏 (backfill_on_save)`** 开关。
+  - `TgChannelWatcher` 与调度日志新增清晰的逐页 `?before=` 补漏过程日志与历史回溯模式标识，便于实时观测补漏进度。
 
 ### v1.5.0
 - **Zero-Miss 零遗漏 TG 分页补漏与持久化游标机制**：

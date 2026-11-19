@@ -364,6 +364,34 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertEqual(len(calls_cap), 2)
         self.assertEqual(len(msgs_cap), 20)
 
+    @patch("pan123tgpilot.tg_watcher.time.sleep")
+    def test_tg_watcher_force_backfill_fetches_all_pages_ignoring_cursor(self, _mock_sleep):
+        """验证 force_backfill=True 忽略 since_msg_id 早停，强制向后翻满 max_pages 页且不被 limit 截断"""
+        watcher = TgChannelWatcher()
+        called_before = []
+
+        def fake_page(channel_username, before_id=None):
+            called_before.append(before_id)
+            if before_id is None:
+                return [(str(i), f"post {i}") for i in range(1041, 1061)]
+            if before_id == 1041:
+                return [(str(i), f"post {i}") for i in range(1021, 1041)]
+            if before_id == 1021:
+                return [(str(i), f"post {i}") for i in range(1001, 1021)]
+            return []
+
+        watcher._fetch_web_preview_page = fake_page
+        msgs = watcher.fetch_channel_messages(
+            "@xx123pan",
+            limit=20,
+            since_msg_id=1050,
+            max_pages=3,
+            force_backfill=True,
+        )
+        self.assertEqual(called_before, [None, 1041, 1021])
+        self.assertEqual(len(msgs), 60)
+        self.assertEqual([int(m[0]) for m in msgs], list(range(1001, 1061)))
+
 
 if __name__ == "__main__":
     unittest.main()

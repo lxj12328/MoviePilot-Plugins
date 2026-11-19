@@ -11,7 +11,7 @@
 | 插件名称 (Plugin Name) | 目录位置 (Directory) | 版本 (Version) | 功能简介 (Description) | 状态 (Status) |
 | :--- | :--- | :--- | :--- | :--- |
 | **123云盘助手 (Pan123Pilot)** | [`plugins.v3/pan123pilot/`](./plugins.v3/pan123pilot/README.md) | `1.5.3` | 123云盘助手：Web原生秒传与直填Token、单飞并发互斥锁与C级file_digest极速单哈希计算、正片优先调度与Web S3伴生小文件分片上传、正片与刮削伴生文件全量Symedia Webhook实时联动、伴生文件与qB任务解耦隔离、交互式分页看板(首页/上下页/页码直跳/正片与伴生分类筛选)与/records检索、影视多级目录级联同步、精准做种达标判定、qB状态标签联动与紧急空间腾退机制 | 活跃 (Active) |
-| **123云盘TG转存助手 (Pan123TgPilot)** | [`plugins.v3/pan123tgpilot/`](./plugins.v3/pan123tgpilot/README.md) | `1.5.0` | 123云盘 Telegram 频道与论坛智能转存及画质洗版助手：持久化游标 + `?before=` 自动翻页补漏(Zero-Miss 防高频刷屏漏消息与失败自动重抓)、两层通用解析与校准架构(Tier 1 文本去噪 + MoviePilot `MetaInfo` 择优，Tier 2 分享文件树预扫 + `MetaInfoPath` 精准校准 `SxxExx`/多季 `S01-S06`/正片体积并复用目录树零重复探测)、校准后跨频道去重、网页端逐行/按频道/全量记录清理与重扫、pan1.me (Xiuno BBS 4.0.4) 板块监控(含每日限额熔断解锁与签到)与三级并发防风控转存 | 活跃 (Active) |
+| **123云盘TG转存助手 (Pan123TgPilot)** | [`plugins.v3/pan123tgpilot/`](./plugins.v3/pan123tgpilot/README.md) | `1.5.1` | 123云盘 Telegram 频道与论坛智能转存及画质洗版助手：持久化游标 + `?before=` 自动翻页补漏 + 一键历史回溯补抓 N 页(Zero-Miss 防刷屏漏消息与失败重抓)、两层通用解析与校准架构(Tier 1 文本去噪 + MoviePilot `MetaInfo` 择优，Tier 2 分享文件树预扫 + `MetaInfoPath` 精准校准 `SxxExx`/多季 `S01-S06`/正片体积并复用目录树零重复探测)、校准后跨频道去重、网页端逐行/按频道/全量记录清理与重扫、pan1.me 板块监控与三级并发防风控转存 | 活跃 (Active) |
 
 > 💡 **提示**：每当新增或更新插件工具时，请同步更新此表格，确保项目工具目录与功能状态清晰可查。
 

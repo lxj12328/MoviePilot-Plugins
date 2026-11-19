@@ -614,6 +614,70 @@ S05E217 4K WEB-DL H.265
         self.plugin.execute_check_all_channels()
         self.assertEqual(self.plugin._watcher.fetch_channel_messages.call_args.kwargs["since_msg_id"], 0)
 
+    def test_manual_check_backfill_and_web_ui_backfill_button(self):
+        """验证网页端历史回溯补漏按钮、/manual_check?backfill_pages=N 及 backfill_on_save 自动复位"""
+        self.plugin.init_plugin(
+            {
+                "enabled": True,
+                "pan123_token": "tok",
+                "tg_channels": "@xx123pan",
+                "tg_max_pages_per_run": 5,
+            }
+        )
+        self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 0
+        self.plugin._db.list_records.return_value = []
+        self.plugin._db.list_channels.return_value = ["@xx123pan"]
+
+        # 1. 验证详情页包含 ⏪ 回溯补抓最近 5 页 按钮及 manual_check backfill_pages=5 事件
+        page = self.plugin.get_page()
+        page_str = str(page)
+        self.assertIn("⏪ 回溯补抓最近 5 页", page_str)
+        self.assertIn("'backfill_pages': 5", page_str)
+
+        # 2. 验证 _api_manual_check(backfill_pages=5) 严格返回 3 键信封且传入 kwargs
+        with patch("pan123tgpilot.threading.Thread") as mock_thread:
+            mock_inst = MagicMock()
+            mock_thread.return_value = mock_inst
+            res = self.plugin._api_manual_check(backfill_pages=5)
+            self.assertTrue(res["success"])
+            self.assertEqual(set(res.keys()), {"success", "message", "data"})
+            self.assertEqual(res["data"]["backfill_pages"], 5)
+            mock_thread.assert_called_once()
+            self.assertEqual(mock_thread.call_args.kwargs["kwargs"], {"backfill_pages": 5})
+            mock_inst.start.assert_called_once()
+
+        # 3. 验证 execute_check_all_channels(backfill_pages=4) 调用 force_backfill=True, max_pages=4, since_msg_id=0
+        self.plugin._watcher = MagicMock()
+        self.plugin._watcher.fetch_channel_messages.return_value = []
+        self.plugin._client = MagicMock()
+        self.plugin.execute_check_all_channels(backfill_pages=4)
+        self.plugin._watcher.fetch_channel_messages.assert_called_once_with(
+            "@xx123pan",
+            limit=100,
+            since_msg_id=0,
+            max_pages=4,
+            stop_event=self.plugin._stop_event,
+            force_backfill=True,
+        )
+
+        # 4. 验证 backfill_on_save=True 保存触发后自动复位为 False 并启动回溯线程
+        self.plugin.update_config = MagicMock()
+        with patch("pan123tgpilot.threading.Thread") as mock_thread2:
+            mock_inst2 = MagicMock()
+            mock_thread2.return_value = mock_inst2
+            cfg = {
+                "enabled": True,
+                "pan123_token": "tok",
+                "tg_max_pages_per_run": 6,
+                "backfill_on_save": True,
+            }
+            self.plugin.init_plugin(cfg)
+            self.assertFalse(cfg["backfill_on_save"])
+            self.plugin.update_config.assert_called_once()
+            self.assertEqual(mock_thread2.call_args.kwargs["kwargs"], {"backfill_pages": 6})
+            mock_inst2.start.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

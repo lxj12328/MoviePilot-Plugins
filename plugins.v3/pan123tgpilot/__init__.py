@@ -73,7 +73,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.5.0"
+    plugin_version = "1.5.1"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -341,8 +341,30 @@ class Pan123TgPilot(_PluginBase):
                 f"Pan123TgPilot 已按配置清理转存记录 ({'全部记录' if is_all else clear_target}): "
                 f"共清理 {deleted_cnt} 条 (123 云盘文件不受影响)"
             )
-            if self._enabled and not config.get("run_now_on_save"):
+            if self._enabled and not config.get("run_now_on_save") and not config.get("backfill_on_save"):
                 threading.Thread(target=self._service_check_channels, daemon=True).start()
+
+        # 保存后立即执行一次历史回溯补漏：自动复位开关并忽略游标向后翻 N 页补抓旧遗漏
+        started_backfill = False
+        if config.get("backfill_on_save"):
+            config["backfill_on_save"] = False
+            if config.get("run_now_on_save"):
+                config["run_now_on_save"] = False
+            if hasattr(self, "update_config"):
+                try:
+                    self.update_config(dict(config))
+                except Exception as e:
+                    logger.warning(f"Pan123TgPilot 自动复位 backfill_on_save 开关异常: {e}")
+            if self._enabled:
+                started_backfill = True
+                logger.info(
+                    f"Pan123TgPilot 检测到勾选「保存后立即回溯补漏」，已自动复位开关并在后台启动历史回溯（每频道 {self._tg_max_pages_per_run} 页）..."
+                )
+                threading.Thread(
+                    target=self._service_check_channels,
+                    kwargs={"backfill_pages": self._tg_max_pages_per_run},
+                    daemon=True,
+                ).start()
 
         # 立即运行一次触发逻辑：触发后立即自动将「保存后立即运行一次」开关复位为关闭状态，无需人工再手动关一次
         if config.get("run_now_on_save"):
@@ -352,7 +374,7 @@ class Pan123TgPilot(_PluginBase):
                     self.update_config(dict(config))
                 except Exception as e:
                     logger.warning(f"Pan123TgPilot 自动复位 run_now_on_save 开关异常: {e}")
-            if self._enabled:
+            if self._enabled and not started_backfill:
                 logger.info("Pan123TgPilot 检测到勾选「保存后立即运行一次」，已自动复位开关并在后台启动全量巡检...")
                 threading.Thread(target=self._service_check_channels, daemon=True).start()
 
@@ -430,7 +452,7 @@ class Pan123TgPilot(_PluginBase):
             logger.error(f"Pan123TgPilot 清理过期记录异常: {e}")
             return 0
 
-    def _service_check_channels(self) -> None:
+    def _service_check_channels(self, backfill_pages: int = 0) -> None:
         """周期执行 TG 频道抓取与转存调度"""
         if not self._enabled:
             return
@@ -441,7 +463,11 @@ class Pan123TgPilot(_PluginBase):
 
         try:
             self._is_checking = True
-            self.execute_check_all_channels()
+            bp = max(0, min(20, int(backfill_pages or 0)))
+            if bp > 0:
+                self.execute_check_all_channels(backfill_pages=bp)
+            else:
+                self.execute_check_all_channels()
         except Exception as e:
             logger.error(f"Pan123TgPilot 检查频道过程发生异常: {e}", exc_info=True)
         finally:
@@ -530,7 +556,7 @@ class Pan123TgPilot(_PluginBase):
         if changed:
             self._save_tg_cursors()
 
-    def execute_check_all_channels(self) -> dict[str, Any]:
+    def execute_check_all_channels(self, backfill_pages: int = 0) -> dict[str, Any]:
         """执行全量监控频道 (含 pan1.me 论坛板块与每日签到) 扫描与转存"""
         if not self._client or not self._watcher or not self._db:
             return {"success": False, "msg": "插件未完成初始化或缺少配置"}
@@ -547,8 +573,20 @@ class Pan123TgPilot(_PluginBase):
             if self._normalize_channel_key(c)
         }
 
+        do_backfill = int(backfill_pages or 0) > 0
+        run_max_pages = (
+            max(1, min(20, int(backfill_pages)))
+            if do_backfill
+            else max(1, min(20, int(getattr(self, "_tg_max_pages_per_run", 5) or 5)))
+        )
+
         if self._tg_channels:
-            logger.info(f"Pan123TgPilot 开始巡检 {len(self._tg_channels)} 个 TG 频道...")
+            if do_backfill:
+                logger.info(
+                    f"Pan123TgPilot 开始历史回溯补漏 {len(self._tg_channels)} 个 TG 频道 (每频道最多向后翻 {run_max_pages} 页)..."
+                )
+            else:
+                logger.info(f"Pan123TgPilot 开始巡检 {len(self._tg_channels)} 个 TG 频道...")
         stats = {
             "channels_checked": 0,
             "messages_checked": 0,
@@ -558,25 +596,39 @@ class Pan123TgPilot(_PluginBase):
             "failed": 0,
         }
 
-        # 阶段 0：并发抓取各 TG 频道新消息 (携带持久化游标与 ?before= 自动向后翻页补漏)
+        # 阶段 0：并发抓取各 TG 频道新消息 (携带持久化游标与 ?before= 自动向后翻页补漏，或历史回溯 N 页)
         def _fetch(ch: str) -> tuple[str, Optional[list]]:
             try:
                 ch_k = self._normalize_channel_key(ch)
                 since_id = int(self._tg_channel_cursors.get(ch_k, 0) or 0)
-                max_pages = max(1, min(20, int(getattr(self, "_tg_max_pages_per_run", 5) or 5)))
                 try:
-                    msgs = self._watcher.fetch_channel_messages(
-                        ch,
-                        limit=30,
-                        since_msg_id=since_id,
-                        max_pages=max_pages,
-                        stop_event=self._stop_event,
-                    )
+                    if do_backfill:
+                        msgs = self._watcher.fetch_channel_messages(
+                            ch,
+                            limit=run_max_pages * 25,
+                            since_msg_id=0,
+                            max_pages=run_max_pages,
+                            stop_event=self._stop_event,
+                            force_backfill=True,
+                        )
+                    else:
+                        msgs = self._watcher.fetch_channel_messages(
+                            ch,
+                            limit=30,
+                            since_msg_id=since_id,
+                            max_pages=run_max_pages,
+                            stop_event=self._stop_event,
+                        )
                 except TypeError:
                     msgs = self._watcher.fetch_channel_messages(ch, limit=30)
+                if do_backfill:
+                    mode_note = f" (历史回溯 {run_max_pages} 页)"
+                elif since_id > 0:
+                    mode_note = f" (游标 since>{since_id})"
+                else:
+                    mode_note = " (首次基线抓取)"
                 logger.info(
-                    f"Pan123TgPilot 成功获取频道 {ch} 的 {len(msgs)} 条新消息"
-                    + (f" (游标 since>{since_id})" if since_id > 0 else " (首次基线抓取)")
+                    f"Pan123TgPilot 成功获取频道 {ch} 的 {len(msgs)} 条新消息{mode_note}"
                 )
                 return ch, msgs
             except Exception as e:
@@ -1331,6 +1383,11 @@ class Pan123TgPilot(_PluginBase):
                     "tg_bot_token", "Bot Token (可选)", "留空使用 t.me/s/ 公开预览，无需 Bot",
                     type="password", placeholder="123456789:ABCdef...",
                 )], md=12),
+                col([sw(
+                    "backfill_on_save",
+                    "保存后立即回溯补漏",
+                    "临时忽略游标向后翻满「单轮最大补漏翻页数」补抓遗漏的历史消息（已转存自动跳过），触发后自动复位关闭",
+                )], md=12),
             ]},
         ])
 
@@ -1429,6 +1486,7 @@ class Pan123TgPilot(_PluginBase):
             "tg_channels": "@Pan123Movie, @regeng123, @yun123pan",
             "check_interval": 10,
             "tg_max_pages_per_run": 5,
+            "backfill_on_save": False,
             "tg_proxy": "",
             "tg_bot_token": "",
             "pan1me_enabled": False,
@@ -1922,6 +1980,27 @@ class Pan123TgPilot(_PluginBase):
                 },
             }
         )
+        max_bf_pages = max(1, min(20, int(getattr(self, "_tg_max_pages_per_run", 5) or 5)))
+        cleanup_buttons.append(
+            {
+                "component": "VBtn",
+                "props": {
+                    "size": "x-small",
+                    "variant": "tonal",
+                    "color": "secondary",
+                    "class": "ma-1",
+                    "text": f"⏪ 回溯补抓最近 {max_bf_pages} 页",
+                },
+                "text": f"⏪ 回溯补抓最近 {max_bf_pages} 页",
+                "events": {
+                    "click": {
+                        "api": f"plugin/{plugin_id}/manual_check",
+                        "method": "get",
+                        "params": {"backfill_pages": max_bf_pages},
+                    }
+                },
+            }
+        )
 
         filter_toolbar = {
             "component": "div",
@@ -2254,13 +2333,34 @@ class Pan123TgPilot(_PluginBase):
             logger.error(f"Pan123TgPilot 清理记录异常: {e}")
             return 0
 
-    def _api_manual_check(self) -> dict[str, Any]:
-        """API: 手动触发频道巡检（遵循 MoviePilot V3 三段式信封格式）"""
-        threading.Thread(target=self._service_check_channels, daemon=True).start()
+    def _api_manual_check(self, backfill_pages: Optional[int] = None) -> dict[str, Any]:
+        """API: 手动触发频道巡检或历史回溯补漏（遵循 MoviePilot V3 三段式信封格式）"""
+        bp = 0
+        if backfill_pages is not None and str(backfill_pages).strip() != "":
+            raw_bp = str(backfill_pages).strip().lower()
+            if raw_bp == "true":
+                bp = max(1, min(20, int(getattr(self, "_tg_max_pages_per_run", 5) or 5)))
+            else:
+                try:
+                    bp = max(0, min(20, int(backfill_pages)))
+                except (ValueError, TypeError):
+                    bp = 0
+
+        if bp > 0:
+            threading.Thread(
+                target=self._service_check_channels,
+                kwargs={"backfill_pages": bp},
+                daemon=True,
+            ).start()
+            msg = f"已在后台启动历史回溯补漏巡检（每频道向后翻 {bp} 页，已存资源自动跳过）"
+        else:
+            threading.Thread(target=self._service_check_channels, daemon=True).start()
+            msg = "已在后台启动 TG 频道巡检与转存任务"
+
         return {
             "success": True,
-            "message": "已在后台启动 TG 频道巡检与转存任务",
-            "data": {"triggered": True},
+            "message": msg,
+            "data": {"triggered": True, "backfill_pages": bp},
         }
 
     def _api_clear_records(

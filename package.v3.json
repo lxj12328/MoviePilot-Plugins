@@ -21,12 +21,13 @@
     "name": "123云盘TG转存助手",
     "description": "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。实时监控指定 TG 频道影视更新，智能识别电影/剧集并分类转存，支持标准分享链接与秒传链接解析，支持画质评分与自动洗版升级。",
     "labels": "网盘,Telegram,TG转存,秒传,洗版,123云盘",
-    "version": "1.5.0",
+    "version": "1.5.1",
     "icon": "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png",
     "author": "lxj12328",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.5.1": "新增一键历史回溯补漏功能与清晰翻页日志：1. 网页详情页数据维护栏新增「⏪ 回溯补抓最近 N 页」按钮，支持临时忽略游标向后连续翻满指定页数（API /manual_check?backfill_pages=N），自动跳过已存记录并补抓此前被顶出首页的遗漏资源；2. 配置页 Telegram 分组新增保存后自动复位的一次性开关「保存后立即回溯补漏」(backfill_on_save)；3. 增强 tg_watcher 与巡检调度日志输出，清晰展示每一页 ?before= 向后翻页补漏进度与历史回溯模式标识。",
       "v1.5.0": "Zero-Miss 零遗漏分页游标机制上线：1. 新增持久化 TG 频道消息游标 (tg_channel_cursors) 与 t.me/s/{channel}?before={min_id} 自动向后翻页补漏能力，当频道在巡检周期内集中爆发 60~100 条以上资源时不再被首页约 20 条上限挤出漏抓（首次无游标仅抓首页 1 页建立基线，绝不回溯历史陈年消息）；2. 新增「单轮最大补漏翻页数」(tg_max_pages_per_run，默认 5 页，范围 1-20) 与 Bot API limit=100/offset 游标支持，并具备防死循环保护；3. 实现 At-Least-Once 游标安全推进，当某消息转存失败/取消时游标自动停留在最小失败 ID 前一位、下轮自动补抓重试，且清理频道记录时同步重置游标不拦截重扫。"
     }
   }
