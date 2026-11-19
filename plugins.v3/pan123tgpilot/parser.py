@@ -225,11 +225,14 @@ class TgMessageParser:
         candidate_title = ""
         year = ""
 
-        skip_keywords = (
-            "类型", "分类", "标签", "评分", "简介", "链接", "版本", "提取码", "访问码", "密码",
-            "大小", "体积", "画质", "编码", "字幕", "音频", "视频", "集数", "状态",
-            "频道", "群组", "投稿", "注意", "播出日期", "首播", "上映", "http://", "https://", "123FSLink",
+        meta_only_icon_re = re.compile(r"^[🆔🏷⭐🍅📅🗓💾📦🖥📹💬👤📖📝🔗🖼🔊📼🔄🎭🗂]")
+        meta_field_re = re.compile(
+            r"^(?:(?:TMDB|豆瓣|IMDB)\s*(?:ID|评分)?|类型|分类|标签|评分|简介|剧情简介|内容简介|分享链接|链接|版本"
+            r"|提取码|访问码|密码|大小|体积|画质|编码|字幕|音频|视频|集数|全集|状态|频道|群组|投稿|注意|提示|声明|免责"
+            r"|播出日期|首播日期|首播|上映日期|上映|年份|分享|地区|国家|语言|导演|主演|演员|更新|Size)\s*[：:]",
+            re.IGNORECASE,
         )
+        promo_prefix_re = re.compile(r"^(?:频道|群组|投稿|注意|提示|声明|免责|关注)\s*(?:[：:]|\s|@)", re.IGNORECASE)
 
         title_prefix_pattern = (
             r"^(?:(?:影视|资源|影片|剧集|电视剧|电影|动[画漫]|番剧|综艺|短剧|纪录片|节目|中文)?(?:名称|片名|剧名|番名|标题|译名)"
@@ -240,7 +243,7 @@ class TgMessageParser:
         for line in lines[:8]:
             # 清理常见 emoji、markdown 加粗星号与话题符号
             cleaned = re.sub(
-                r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹📅🗂🏷🎞💾📝🖥️🔊📦📼🔄🎭🍅🖥📹💬👤📖\s#*]+",
+                r"^[🎬📺🎥🏷️📌📢🔥✨🌟⭐️💥🎉🔗📁📂▶️✅🔸🔹📅🗂🏷🎞💾📝🖥️🔊📦📼🔄🎭🍅🖥📹💬👤📖🆔🖼\ufe0f\s#*]+",
                 "",
                 line,
             ).strip()
@@ -258,7 +261,12 @@ class TgMessageParser:
             if not cleaned:
                 continue
 
-            if not has_title_prefix and any(cleaned.lower().startswith(k.lower()) or k in cleaned for k in skip_keywords):
+            if not has_title_prefix and (
+                meta_only_icon_re.match(line.lstrip())
+                or meta_field_re.match(cleaned)
+                or promo_prefix_re.match(cleaned)
+                or any(tok in cleaned.lower() for tok in ("http://", "https://", "123fslink"))
+            ):
                 continue
 
             # 匹配 标题 (2026) 格式
@@ -283,7 +291,12 @@ class TgMessageParser:
                 candidate_title = m_fn.group(1).strip()
                 year = m_fn.group(2) or m_fn.group(3) or ""
             else:
-                candidate_title = re.sub(r"-\s*\d{3,4}p.*", "", fallback_filename).strip()
+                m_dot_yr = re.search(r"^(.*?)[.\s]+((?:19|20)\d{2})(?:[.\s]|$)", fallback_filename)
+                if m_dot_yr and m_dot_yr.group(1).strip():
+                    candidate_title = m_dot_yr.group(1).strip()
+                    year = m_dot_yr.group(2)
+                else:
+                    candidate_title = re.sub(r"-\s*\d{3,4}p.*", "", fallback_filename).strip()
 
         # 剥离前导论坛分类标签 (例如 "[电影] [123云盘] 《流浪地球3》" / "【4K】片名")，但保留单独完整片名【片名】
         candidate_title = re.sub(r"^[🎬📺🎥🏷️📌📢🔥✨\s]+", "", candidate_title).strip()

@@ -363,6 +363,42 @@ S01 2160p H.265
             self.assertEqual(parsed["ep_tag"], "S01", label)
             self.assertIsNone(parsed["episode"], label)
 
+    def test_title_containing_meta_words_and_never_picks_tmdb_line(self):
+        """验证片名包含「大小/密码/状态」等字段词时不会被误跳过，且 🆔TMDB 行永远不会沦为主标题"""
+        msg = """弱气MAX的大小姐、居然接受了铁腕未婚夫的赌约 (2026) S01 E07
+🏷️标签 : #弱气MAX的大小姐居然接受了铁腕未婚夫的赌约 #动画 #喜剧 #Sci-Fi & Fantasy
+📺类型 : 日漫
+📅首播 : 2026-10-04
+⭐评分 : 暂无评分
+🆔TMDB : [303060](https://www.themoviedb.org/tv/303060)
+📝简介 : 一个平凡的研究生，转生成了乙女游戏里的路人恶役千金——皮娅。
+🖼️版本 : 1080p.Baha.WEB-DL.H.264.SDR.8bit.24fps.AAC 2.0
+💾体积 : 0.33 GB
+🔗分享链接 : 123FSLinkV2$7d64ef2e8ce2ce83d36d027231eb2d0a#353215672#弱气MAX的大小姐、居然接受了铁腕未婚夫的赌约.2026.S01E07.第7集.1080p.Baha.WEB-DL.SDR.H.264.8-bit.24fps.AAC 2.0 {tmdb-303060}.mp4"""
+        parsed = self.parser.parse(msg, msg_id="501", channel="@Pan123Movie")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["title"], "弱气MAX的大小姐、居然接受了铁腕未婚夫的赌约")
+        self.assertEqual(parsed["year"], "2026")
+        self.assertEqual(parsed["media_type"], "tv")
+        self.assertEqual(parsed["ep_tag"], "S01E07")
+        self.assertEqual(parsed["display_title"], "弱气MAX的大小姐、居然接受了铁腕未婚夫的赌约 S01E07")
+        self.assertEqual(parsed["tmdb_id"], "303060")
+
+        # 含 "密码"、"状态" 字样片名验证
+        for kw_title, yr in [("达芬奇密码", "2006"), ("无敌状态", "2025")]:
+            p_kw = self.parser.parse(f"{kw_title} ({yr})\n🎭 类型：电影\n🔗 https://www.123pan.com/s/test-kw01")
+            self.assertIsNotNone(p_kw)
+            self.assertEqual(p_kw["title"], kw_title)
+            self.assertEqual(p_kw["year"], yr)
+
+        # 无标题行仅有 TMDB 行 + 点分隔秒传文件名：必须走 fallback_filename，绝不采纳 🆔TMDB 行
+        msg_no_title = """🆔TMDB : [303060](https://www.themoviedb.org/tv/303060)
+🔗分享链接 : 123FSLinkV2$7d64ef2e8ce2ce83d36d027231eb2d0a#353215672#弱气MAX的大小姐.2026.S01E07.1080p.mp4"""
+        p_fb = self.parser.parse(msg_no_title)
+        self.assertIsNotNone(p_fb)
+        self.assertEqual(p_fb["title"], "弱气MAX的大小姐")
+        self.assertEqual(p_fb["year"], "2026")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -150,11 +150,8 @@ flowchart LR
 
 ## 6. 版本历史 (Changelog)
 
-### v1.4.1
-- **彻底修复 Telegram 相对标签 URL `%E4/%E5/%E6` 误判为 `S01E05 / S01E06` 的底层问题**：
-  - `TgChannelWatcher._parse_tg_web_html` 不再将 `?q=%23%E5...` 相对标签链接及 `t.me/` 频道自身链接作为 Markdown URL 输出（仅保留纯文本标签名），且内联外链扫描排除 `t.me/` 避免误扫频道链接。
-  - `TgMessageParser` 在 `_strip_noise_for_meta` 中剥离全部 Markdown 链接目标与 `%XX` 百分号编码，并对 `RE_EPISODE_ONLY` / `RE_EP_RANGE_ONLY` 加入 `(?<!%)` 负向断言双重防护。
-- **新增网页端记录清理与一键重扫闭环**（仅清库，不删 123 云盘文件）：
-  - 详情页表格每行右侧新增 **`删除`** 按钮，顶部数据维护栏新增 **按来源频道一键清理**、**`🗑 清空全部记录`** 与 **`🔄 立即巡检重扫`** 按钮。
-  - 新增标准 V3 API `/api/v1/plugin/Pan123TgPilot/clear_records`（支持 `record_id`、`channel`、`keyword`、`clear_all`、`rerun`），同步统一 `/manual_check` 为标准 V3 三段式信封响应；配置页新增保存即清理重扫并自动置空的 **`clear_records_target`** 选项。
-  - 延续 v1.4.0 两层 `MetaInfo` + 分享文件树精准校准与零重复探测复用特性。
+### v1.4.2
+- **修复片名包含「大小 / 密码 / 状态」等关键字被误跳过导致 `🆔TMDB : xxxxx` 沦为主标题的 Bug**：
+  - 重构 `TgMessageParser._extract_title_and_year`：将原先宽泛的「子串包含即跳过」改为精确识别元信息专属图标行（`🆔`、`🏷`、`⭐`、`📅`、`💾`、`📦` 等）、严格带冒号/空格的元信息字段头（`TMDB` / `类型` / `标签` / `版本` / `大小` 等）与链接行，彻底避免《弱气MAX的大小姐…》《达芬奇密码》等片名被误跳过，且确保 `🆔TMDB : ...` 行永远不会成为候选片名。
+  - 增强 `fallback_filename` 回退提取：支持 `片名.2026.S01E07...` 点分隔命名格式的片名与年份提取。
+  - 延续 v1.4.1 网页端记录清理/重扫、`%E4/%E5/%E6` 相对标签防误判及 v1.4.0 两层 `MetaInfo` + 分享文件树校准架构。
