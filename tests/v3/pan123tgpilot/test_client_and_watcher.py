@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 plugins_v3_dir = Path(__file__).resolve().parents[3] / "plugins.v3"
 if str(plugins_v3_dir) not in sys.path:
@@ -297,6 +297,72 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertEqual(parsed["media_type"], "tv")
         self.assertEqual(parsed["ep_tag"], "S01")
         self.assertIsNone(parsed["episode"])
+
+    @patch("pan123tgpilot.tg_watcher.time.sleep")
+    def test_tg_watcher_paginates_before_cursor_for_60_burst_messages(self, _mock_sleep):
+        """验证 10 分钟爆发 60 条新消息时通过 ?before= 自动连续向后翻页，完整召回 1001..1060 不被 limit 截断"""
+        watcher = TgChannelWatcher()
+        called_before_ids = []
+
+        def fake_page(channel_username, before_id=None):
+            called_before_ids.append(before_id)
+            if before_id is None:
+                return [(str(i), f"msg {i}") for i in range(1041, 1061)]
+            if before_id == 1041:
+                return [(str(i), f"msg {i}") for i in range(1021, 1041)]
+            if before_id == 1021:
+                return [(str(i), f"msg {i}") for i in range(1001, 1021)]
+            if before_id == 1001:
+                return [(str(i), f"msg {i}") for i in range(981, 1001)]
+            return []
+
+        watcher._fetch_web_preview_page = fake_page
+        msgs = watcher.fetch_channel_messages("@BurstChan", limit=20, since_msg_id=1000, max_pages=5)
+
+        self.assertEqual(called_before_ids, [None, 1041, 1021, 1001])
+        self.assertEqual(len(msgs), 60)
+        self.assertEqual([int(m[0]) for m in msgs], list(range(1001, 1061)))
+
+    @patch("pan123tgpilot.tg_watcher.time.sleep")
+    def test_tg_watcher_initial_fetch_only_one_page_and_guards_non_decreasing_id(self, _mock_sleep):
+        """验证首次无游标仅抓首页 1 页、max_pages 上限截断、及站点 ID 不递减时防死循环保护"""
+        watcher = TgChannelWatcher()
+        calls_init = []
+
+        def fake_init_page(channel_username, before_id=None):
+            calls_init.append(before_id)
+            return [(str(i), f"init {i}") for i in range(101, 121)]
+
+        watcher._fetch_web_preview_page = fake_init_page
+        msgs_init = watcher.fetch_channel_messages("InitChan", limit=10, since_msg_id=0, max_pages=5)
+        self.assertEqual(calls_init, [None])
+        self.assertEqual(len(msgs_init), 10)
+        self.assertEqual(msgs_init[0][0], "111")
+
+        # 站方 returned ID 未下降时主动退出防死循环
+        calls_stuck = []
+
+        def fake_stuck_page(channel_username, before_id=None):
+            calls_stuck.append(before_id)
+            return [("500", "stuck 500"), ("501", "stuck 501")]
+
+        watcher._fetch_web_preview_page = fake_stuck_page
+        msgs_stuck = watcher.fetch_channel_messages("StuckChan", limit=20, since_msg_id=100, max_pages=5)
+        self.assertEqual(calls_stuck, [None, 500])
+        self.assertEqual([m[0] for m in msgs_stuck], ["500", "501"])
+
+        # 到达 max_pages=2 时截断停止
+        calls_cap = []
+
+        def fake_cap_page(channel_username, before_id=None):
+            calls_cap.append(before_id)
+            top = 1000 if before_id is None else before_id - 1
+            return [(str(top - 10 + i), f"m {i}") for i in range(10)]
+
+        watcher._fetch_web_preview_page = fake_cap_page
+        msgs_cap = watcher.fetch_channel_messages("CapChan", limit=20, since_msg_id=100, max_pages=2)
+        self.assertEqual(len(calls_cap), 2)
+        self.assertEqual(len(msgs_cap), 20)
 
 
 if __name__ == "__main__":

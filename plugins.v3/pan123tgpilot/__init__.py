@@ -73,7 +73,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.4.2"
+    plugin_version = "1.5.0"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -91,6 +91,8 @@ class Pan123TgPilot(_PluginBase):
         self._tg_channels_raw: str = ""
         self._tg_proxy: str = ""
         self._tg_bot_token: str = ""
+        self._tg_max_pages_per_run: int = 5
+        self._tg_channel_cursors: dict[str, int] = {}
         self._check_interval: int = 10
         self._auto_upgrade: bool = True
         self._auto_delete_old_version: bool = True
@@ -206,6 +208,11 @@ class Pan123TgPilot(_PluginBase):
                     break
 
         self._tg_bot_token = str(config.get("tg_bot_token") or "").strip()
+        try:
+            mp = int(config.get("tg_max_pages_per_run") if config.get("tg_max_pages_per_run") is not None else 5)
+            self._tg_max_pages_per_run = max(1, min(20, mp))
+        except (ValueError, TypeError):
+            self._tg_max_pages_per_run = 5
 
         try:
             self._check_interval = max(1, int(config.get("check_interval") or 10))
@@ -245,11 +252,12 @@ class Pan123TgPilot(_PluginBase):
         else:
             self._client = None
 
-        # 初始化 TG 监听器
+        # 初始化 TG 监听器与游标状态
         self._watcher = TgChannelWatcher(
             proxy=self._tg_proxy if self._tg_proxy else "",
             bot_token=self._tg_bot_token if self._tg_bot_token else "",
         )
+        self._load_tg_cursors()
 
         # 初始化 pan1.me (Xiuno BBS) 论坛监听器与签到器
         self._pan1me_enabled = bool(config.get("pan1me_enabled", False))
@@ -466,6 +474,62 @@ class Pan123TgPilot(_PluginBase):
             logger.warning(f"Pan123TgPilot pan1.me 每日签到未成功: {msg}")
         return ok, msg
 
+    @staticmethod
+    def _normalize_channel_key(channel: Any) -> str:
+        """规范化 TG 频道标识符为游标键 (去除 @ 并转小写)"""
+        return str(channel or "").strip().lstrip("@").strip().lower()
+
+    def _load_tg_cursors(self) -> None:
+        """从插件持久化存储恢复各 TG 频道最后已安全处理的最大 msg_id 游标"""
+        if not hasattr(self, "get_data"):
+            return
+        try:
+            saved = self.get_data("tg_channel_cursors")
+            if isinstance(saved, dict):
+                cleaned: dict[str, int] = {}
+                for k, v in saved.items():
+                    ch_k = self._normalize_channel_key(k)
+                    if not ch_k:
+                        continue
+                    try:
+                        vid = int(v or 0)
+                    except (ValueError, TypeError):
+                        vid = 0
+                    if vid > 0:
+                        cleaned[ch_k] = vid
+                self._tg_channel_cursors = cleaned
+        except Exception:
+            pass
+
+    def _save_tg_cursors(self) -> None:
+        """持久化各 TG 频道最新安全游标"""
+        if not hasattr(self, "save_data"):
+            return
+        try:
+            self.save_data("tg_channel_cursors", dict(self._tg_channel_cursors))
+        except Exception:
+            pass
+
+    def _reset_tg_cursors(self, channel: str = "", clear_all: bool = False) -> None:
+        """重置全部或指定 TG 频道的消息游标，确保清理记录后重扫不被旧游标跳过"""
+        changed = False
+        if clear_all:
+            if self._tg_channel_cursors:
+                self._tg_channel_cursors.clear()
+                changed = True
+            else:
+                changed = True  # 确保底层持久化的游标也被同步清空
+        elif channel:
+            for part in re.split(r"[,，\s\n]+", str(channel)):
+                ch_k = self._normalize_channel_key(part)
+                if ch_k and ch_k in self._tg_channel_cursors:
+                    self._tg_channel_cursors.pop(ch_k, None)
+                    changed = True
+                elif ch_k:
+                    changed = True
+        if changed:
+            self._save_tg_cursors()
+
     def execute_check_all_channels(self) -> dict[str, Any]:
         """执行全量监控频道 (含 pan1.me 论坛板块与每日签到) 扫描与转存"""
         if not self._client or not self._watcher or not self._db:
@@ -475,6 +539,13 @@ class Pan123TgPilot(_PluginBase):
         if not self._tg_channels and not forum_enabled:
             logger.info("Pan123TgPilot 未配置任何 TG 频道或论坛板块，无需执行抓取")
             return {"success": True, "msg": "未配置监控频道"}
+
+        self._load_tg_cursors()
+        tg_channel_keys = {
+            self._normalize_channel_key(c)
+            for c in (self._tg_channels or [])
+            if self._normalize_channel_key(c)
+        }
 
         if self._tg_channels:
             logger.info(f"Pan123TgPilot 开始巡检 {len(self._tg_channels)} 个 TG 频道...")
@@ -487,11 +558,26 @@ class Pan123TgPilot(_PluginBase):
             "failed": 0,
         }
 
-        # 阶段 0：并发抓取各 TG 频道最新消息 (纯网络 I/O)
+        # 阶段 0：并发抓取各 TG 频道新消息 (携带持久化游标与 ?before= 自动向后翻页补漏)
         def _fetch(ch: str) -> tuple[str, Optional[list]]:
             try:
-                msgs = self._watcher.fetch_channel_messages(ch, limit=30)
-                logger.info(f"Pan123TgPilot 成功获取频道 {ch} 的 {len(msgs)} 条最近消息")
+                ch_k = self._normalize_channel_key(ch)
+                since_id = int(self._tg_channel_cursors.get(ch_k, 0) or 0)
+                max_pages = max(1, min(20, int(getattr(self, "_tg_max_pages_per_run", 5) or 5)))
+                try:
+                    msgs = self._watcher.fetch_channel_messages(
+                        ch,
+                        limit=30,
+                        since_msg_id=since_id,
+                        max_pages=max_pages,
+                        stop_event=self._stop_event,
+                    )
+                except TypeError:
+                    msgs = self._watcher.fetch_channel_messages(ch, limit=30)
+                logger.info(
+                    f"Pan123TgPilot 成功获取频道 {ch} 的 {len(msgs)} 条新消息"
+                    + (f" (游标 since>{since_id})" if since_id > 0 else " (首次基线抓取)")
+                )
                 return ch, msgs
             except Exception as e:
                 logger.error(f"Pan123TgPilot 抓取频道 {ch} 消息失败: {e}")
@@ -544,11 +630,25 @@ class Pan123TgPilot(_PluginBase):
         # 阶段 A：串行完成解析、链接去重与洗版判定 (纯本地、毫秒级)，收集待转存任务
         batch_links: set = set()
         jobs: list[dict] = []
+        ch_seen_max_id: dict[str, int] = {}
+        ch_failed_min_id: dict[str, int] = {}
+
+        def _mark_ch_failed(ch_str: str, raw_mid: Any) -> None:
+            ck = self._normalize_channel_key(ch_str)
+            mid_s = str(raw_mid or "").strip()
+            if ck in tg_channel_keys and mid_s.isdigit():
+                mid_i = int(mid_s)
+                if mid_i > 0:
+                    cur_f = ch_failed_min_id.get(ck)
+                    ch_failed_min_id[ck] = mid_i if cur_f is None else min(cur_f, mid_i)
+
         for channel, messages in fetch_results:
             stats["channels_checked"] += 1
             if messages is None:
                 continue
 
+            ch_key = self._normalize_channel_key(channel)
+            is_tg_ch = ch_key in tg_channel_keys
             ch_valid = 0
             ch_no_link = 0
             for msg_item in messages:
@@ -560,6 +660,11 @@ class Pan123TgPilot(_PluginBase):
                 else:
                     continue
 
+                if is_tg_ch and m_id.isdigit():
+                    m_int = int(m_id)
+                    if m_int > 0 and m_int > ch_seen_max_id.get(ch_key, 0):
+                        ch_seen_max_id[ch_key] = m_int
+
                 stats["messages_checked"] += 1
                 with self._stats_lock:
                     self._check_stats["total_checked"] += 1
@@ -569,6 +674,7 @@ class Pan123TgPilot(_PluginBase):
                     )
                 except Exception as e:
                     logger.error(f"Pan123TgPilot 处理消息异常 ({channel}): {e}")
+                    _mark_ch_failed(channel, m_id)
                     stats["failed"] += 1
                     with self._stats_lock:
                         self._check_stats["failed_count"] += 1
@@ -692,9 +798,26 @@ class Pan123TgPilot(_PluginBase):
                     elif res in ("cancelled", "skipped"):
                         stats["skipped"] += 1
                         self._check_stats["skipped_count"] += 1
+                        if res == "cancelled":
+                            _mark_ch_failed(_job.get("channel", ""), _job.get("msg_id"))
                     else:
                         stats["failed"] += 1
                         self._check_stats["failed_count"] += 1
+                        _mark_ch_failed(_job.get("channel", ""), _job.get("msg_id"))
+
+        # 安全推进 TG 频道持久化游标：若某频道存在转存失败/取消任务，则游标停在 (最小失败ID - 1)，下轮自动补抓重试
+        cursors_changed = False
+        for ch_k, max_seen in ch_seen_max_id.items():
+            prev_cursor = int(self._tg_channel_cursors.get(ch_k, 0) or 0)
+            if ch_k in ch_failed_min_id:
+                safe_cursor = ch_failed_min_id[ch_k] - 1
+            else:
+                safe_cursor = max_seen
+            if safe_cursor > prev_cursor:
+                self._tg_channel_cursors[ch_k] = safe_cursor
+                cursors_changed = True
+        if cursors_changed:
+            self._save_tg_cursors()
 
         logger.info(
             f"Pan123TgPilot 频道巡检结束: 检查消息 {stats['messages_checked']} 条, "
@@ -1193,6 +1316,13 @@ class Pan123TgPilot(_PluginBase):
                 }], md=12),
                 col([fld("check_interval", "检查周期 (分钟)", "默认 10 分钟", type="number", placeholder="10")]),
                 col([fld(
+                    "tg_max_pages_per_run",
+                    "单轮最大补漏翻页数",
+                    "每页约 20 条消息，默认 5 页 (单轮最多无缝补齐约 100 条爆发消息，范围 1-20)；填 1 仅抓首页",
+                    type="number",
+                    placeholder="5",
+                )]),
+                col([fld(
                     "tg_proxy", "Telegram 代理 (可选)",
                     "留空则继承 MoviePilot 全局代理；Docker 内请勿填 127.0.0.1",
                     placeholder="http://192.168.1.100:7890",
@@ -1298,6 +1428,7 @@ class Pan123TgPilot(_PluginBase):
             "tv_target_dir_id": "",
             "tg_channels": "@Pan123Movie, @regeng123, @yun123pan",
             "check_interval": 10,
+            "tg_max_pages_per_run": 5,
             "tg_proxy": "",
             "tg_bot_token": "",
             "pan1me_enabled": False,
@@ -2110,7 +2241,15 @@ class Pan123TgPilot(_PluginBase):
                     keyword=keyword,
                     clear_all=clear_all,
                 )
-            return int(deleted or 0)
+            deleted_int = int(deleted or 0)
+            if deleted_int > 0 or clear_all or channel or record_id is not None or keyword:
+                if clear_all:
+                    self._reset_tg_cursors(clear_all=True)
+                elif channel:
+                    self._reset_tg_cursors(channel=channel)
+                elif record_id is not None or keyword:
+                    self._reset_tg_cursors(clear_all=True)
+            return deleted_int
         except Exception as e:
             logger.error(f"Pan123TgPilot 清理记录异常: {e}")
             return 0

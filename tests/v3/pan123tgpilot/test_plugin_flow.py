@@ -527,6 +527,93 @@ S05E217 4K WEB-DL H.265
             self.assertEqual(saved_cfg["clear_records_target"], "")
             mock_inst.start.assert_called_once()
 
+    def test_tg_cursor_advances_on_success_holds_on_failure_and_resets_on_clear(self):
+        """验证 TG 持久化游标：首次建立基线、部分失败停在最小失败前一位、补抓成功后推进，且清理频道时同步清空游标"""
+        kv_store: dict = {}
+        self.plugin.get_data = lambda k: kv_store.get(k)
+        self.plugin.save_data = lambda k, v: kv_store.__setitem__(k, v)
+
+        self.plugin.init_plugin(
+            {
+                "enabled": True,
+                "pan123_token": "tok",
+                "tg_channels": "@BurstChan",
+                "movie_target_dir_id": "200",
+                "tv_target_dir_id": "100",
+                "tg_max_pages_per_run": "5",
+            }
+        )
+        self.assertEqual(self.plugin._tg_max_pages_per_run, 5)
+
+        saved_urls: set[str] = set()
+
+        fake_db = MagicMock()
+        fake_db.get_record_by_link.return_value = None
+        fake_db.has_link_processed.side_effect = lambda share_url="", fslink="": share_url in saved_urls
+        fake_db.get_record_by_media_key.return_value = None
+        fake_db.delete_records.return_value = 3
+
+        def _record_save(**kwargs):
+            if kwargs.get("share_url"):
+                saved_urls.add(kwargs["share_url"])
+            return 1
+
+        fake_db.save_or_update_record.side_effect = _record_save
+        self.plugin._db = fake_db
+        self.plugin._watcher = MagicMock()
+        self.plugin._client = MagicMock()
+
+        def _mk_movie(name: str, key: str) -> str:
+            return f"🎬 {name} (2025)\n🎭 类型：电影\n🔗 https://www.123pan.com/s/{key}"
+
+        # 1. 首轮建立游标 1000
+        self.plugin._client.save_share_link.return_value = (True, "1", "ok")
+        self.plugin._watcher.fetch_channel_messages.return_value = [
+            ("1000", _mk_movie("MovieZero", "key-000"))
+        ]
+        res1 = self.plugin.execute_check_all_channels()
+        self.assertEqual(res1["stats"]["transferred"], 1)
+        self.assertEqual(kv_store["tg_channel_cursors"]["burstchan"], 1000)
+
+        # 2. 二轮遇到爆发新消息 1001(成功), 1002(转存失败), 1003(成功) -> 游标必须停在 1001 (1002-1)
+        def _fail_key2(share_key, **kwargs):
+            if share_key == "key-002":
+                return False, None, "123 temp error"
+            return True, f"fid_{share_key}", "ok"
+
+        self.plugin._client.save_share_link.side_effect = _fail_key2
+        self.plugin._watcher.fetch_channel_messages.return_value = [
+            ("1001", _mk_movie("MovieOne", "key-001")),
+            ("1002", _mk_movie("MovieTwo", "key-002")),
+            ("1003", _mk_movie("MovieThree", "key-003")),
+        ]
+        res2 = self.plugin.execute_check_all_channels()
+        self.assertEqual(self.plugin._watcher.fetch_channel_messages.call_args.kwargs["since_msg_id"], 1000)
+        self.assertEqual(self.plugin._watcher.fetch_channel_messages.call_args.kwargs["max_pages"], 5)
+        self.assertEqual(res2["stats"]["transferred"], 2)
+        self.assertEqual(res2["stats"]["failed"], 1)
+        self.assertEqual(kv_store["tg_channel_cursors"]["burstchan"], 1001)
+
+        # 3. 三轮补抓：1002 恢复成功、1003 已被 link_hash 跳过 -> 游标顺畅推进到 1003
+        self.plugin._client.save_share_link.side_effect = None
+        self.plugin._client.save_share_link.return_value = (True, "99", "ok")
+        self.plugin._watcher.fetch_channel_messages.return_value = [
+            ("1002", _mk_movie("MovieTwo", "key-002")),
+            ("1003", _mk_movie("MovieThree", "key-003")),
+        ]
+        res3 = self.plugin.execute_check_all_channels()
+        self.assertEqual(self.plugin._watcher.fetch_channel_messages.call_args.kwargs["since_msg_id"], 1001)
+        self.assertEqual(res3["stats"]["transferred"], 1)
+        self.assertEqual(res3["stats"]["skipped"], 1)
+        self.assertEqual(kv_store["tg_channel_cursors"]["burstchan"], 1003)
+
+        # 4. 清理该频道记录时同步清除游标，确保重扫从 since_msg_id=0 重新拉取
+        self.plugin._api_clear_records(channel="@BurstChan")
+        self.assertNotIn("burstchan", kv_store["tg_channel_cursors"])
+        self.plugin._watcher.fetch_channel_messages.return_value = []
+        self.plugin.execute_check_all_channels()
+        self.assertEqual(self.plugin._watcher.fetch_channel_messages.call_args.kwargs["since_msg_id"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
