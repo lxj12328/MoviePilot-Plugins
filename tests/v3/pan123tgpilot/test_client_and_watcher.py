@@ -8,6 +8,7 @@ if str(plugins_v3_dir) not in sys.path:
     sys.path.insert(0, str(plugins_v3_dir))
 
 from pan123tgpilot.client import Pan123TgClient
+from pan123tgpilot.parser import TgMessageParser
 from pan123tgpilot.tg_watcher import TgChannelWatcher
 
 
@@ -268,6 +269,34 @@ class TestClientAndWatcher(unittest.TestCase):
         self.assertNotIn("S01E05", text)
         self.assertIn("奥德赛", text)
         self.assertIn("欧美电影", text)
+
+    def test_tg_watcher_strips_relative_hashtag_href_and_self_tme_links(self):
+        """验证 Telegram 相对标签链接 ?q=%23%E5... 与 t.me 自身链接不会被输出，彻底杜绝 %E4/%E5/%E6 误判为 S01E05"""
+        html = """
+        <div class="tgme_widget_message" data-post="xx123pan/100">
+            <div class="tgme_widget_message_text js-message_text" dir="auto">
+                🎬 <a href="?q=%23%E5%8C%97%E4%BA%AC%E5%A5%B3%E5%AD%90%E5%9B%BE%E9%89%B4">#北京女子图鉴</a> (2018)<br/>
+                🎭 类型：剧集<br/>
+                S01 4K WEB-DL<br/>
+                🔗 链接：<a href="https://www.123pan.com/s/kyeA-kBV7v?pwd=t00N#">123网盘</a><br/>
+                <a href="?q=%23%E6%9A%B4%E9%A3%8E%E7%9C%BC">#暴风眼</a> <a href="https://t.me/xx123pan/888">888</a>
+            </div>
+        </div>
+        """
+        messages = TgChannelWatcher._parse_tg_web_html(html, "xx123pan")
+        self.assertEqual(len(messages), 1)
+        msg_id, text = messages[0]
+        self.assertEqual(msg_id, "100")
+        self.assertIn("#北京女子图鉴", text)
+        self.assertNotIn("?q=%23%E5", text)
+        self.assertNotIn("https://t.me/xx123pan/888", text)
+
+        parsed = TgMessageParser.parse(text, msg_id=msg_id, channel="@xx123pan")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["title"], "北京女子图鉴")
+        self.assertEqual(parsed["media_type"], "tv")
+        self.assertEqual(parsed["ep_tag"], "S01")
+        self.assertIsNone(parsed["episode"])
 
 
 if __name__ == "__main__":

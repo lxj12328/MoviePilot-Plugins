@@ -48,12 +48,12 @@ class TgMessageParser:
         re.IGNORECASE,
     )
     RE_EP_RANGE_ONLY = re.compile(
-        r"(?:(?:\b(?:EP|E)|第|(?:集数|全集)[：:\s]*)\s*(\d{1,4})\s*[-~～至]\s*(?:EP|E|第)?\s*(\d{1,4})\s*(?:集|话|期|\b)|\b(\d{1,4})\s*[-~～至]\s*(\d{1,4})\s*(?:集|话|期))",
+        r"(?:(?:(?<!%)\b(?:EP|E)|第|(?:集数|全集)[：:\s]*)\s*(\d{1,4})\s*[-~～至]\s*(?:EP|E|第)?\s*(\d{1,4})\s*(?:集|话|期|\b)|\b(\d{1,4})\s*[-~～至]\s*(\d{1,4})\s*(?:集|话|期))",
         re.IGNORECASE,
     )
-    # 严格匹配集数：必须带有集/话/期，或明确写有 EPxx/Exx/更新至第xx集，杜绝将「第5部/第2场」等非集数数字误判为集数
+    # 严格匹配集数：必须带有集/话/期，或明确写有 EPxx/Exx/更新至第xx集，杜绝将「第5部/第2场」与 URL %E5 误判为集数
     RE_EPISODE_ONLY = re.compile(
-        r"(?:\b(?:EP|E)\s*(\d{1,4})\b|(?:更新至|更至)\s*第?\s*(\d{1,4})\s*(?:集|话|期)?|第\s*(\d{1,4})\s*(?:集|话|期))",
+        r"(?:(?<!%)\b(?:EP|E)\s*(\d{1,4})\b|(?:更新至|更至)\s*第?\s*(\d{1,4})\s*(?:集|话|期)?|第\s*(\d{1,4})\s*(?:集|话|期))",
         re.IGNORECASE,
     )
     RE_SEASON_ONLY = re.compile(r"(?:\b(?:Season|S)\s*(\d{1,2})\b|第\s*(\d{1,2})\s*季)", re.IGNORECASE)
@@ -252,8 +252,8 @@ class TgMessageParser:
             has_title_prefix = bool(re.match(title_prefix_pattern, cleaned, flags=re.IGNORECASE))
             cleaned = re.sub(title_prefix_pattern, "", cleaned, flags=re.IGNORECASE).strip()
 
-            # 移除 Markdown 链接包裹 [标题](https://...) -> 标题
-            cleaned = re.sub(r"\[([^\]]+)\]\(https?://[^\)]+\)", r"\1", cleaned).strip()
+            # 移除 Markdown 链接包裹 [标题](url 或 ?q=...) -> 标题
+            cleaned = re.sub(r"\[#?([^\]]+)\]\([^\)]+\)", r"\1", cleaned).strip()
 
             if not cleaned:
                 continue
@@ -338,9 +338,11 @@ class TgMessageParser:
         """
         if not text:
             return ""
-        # 移除秒传特征码与 HTTP(S) URL (保留链接前的文字提示)
+        # 移除秒传特征码、Markdown 链接目标 (含相对标签 ?q=%23%E5...)、HTTP(S) URL 与百分号编码噪声
         scrubbed = cls.RE_FS_LINK.sub("", text)
+        scrubbed = re.sub(r"\]\([^)\r\n]+\)", "]", scrubbed)
         scrubbed = re.sub(r"https?://[^\s\)\]\>\"']+", "", scrubbed)
+        scrubbed = re.sub(r"%[0-9A-Fa-f]{2}", " ", scrubbed)
 
         kept_lines: List[str] = []
         in_synopsis = False

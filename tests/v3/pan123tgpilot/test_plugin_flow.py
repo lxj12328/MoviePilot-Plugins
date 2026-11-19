@@ -53,8 +53,10 @@ class TestPan123TgPilotPlugin(unittest.TestCase):
         self.assertEqual(commands[0]["cmd"], "/pan123_tg_run")
 
         apis = self.plugin.get_api()
-        self.assertEqual(len(apis), 6)
-        self.assertIn("/pan1me_checkin", [a["path"] for a in apis])
+        self.assertEqual(len(apis), 7)
+        api_paths = [a["path"] for a in apis]
+        self.assertIn("/pan1me_checkin", api_paths)
+        self.assertIn("/clear_records", api_paths)
 
     @patch("threading.Thread")
     def test_run_now_on_save(self, mock_thread):
@@ -433,6 +435,97 @@ S05E217 4K WEB-DL H.265
         self.assertEqual(res2["stats"]["transferred"], 0)
         self.assertEqual(res2["stats"]["skipped"], 2)
         self.plugin._client.save_share_link.assert_not_called()
+
+    def test_api_clear_records_and_web_ui_cleanup_buttons(self):
+        """验证网页端单行删除/按频道清理/清空全部/重扫按钮渲染与 /clear_records 三段式 API 契约"""
+        self.plugin.init_plugin({"enabled": True, "pan123_token": "tok"})
+        self.plugin._db = MagicMock()
+        self.plugin._db.count_records.return_value = 2
+        self.plugin._db.list_channels.return_value = ["@xx123pan", "@Pan123Movie"]
+        self.plugin._db.list_records.return_value = [
+            {
+                "id": 101,
+                "media_title": "北京女子图鉴 S01E05",
+                "resolution": "2160p",
+                "codec": "H.265",
+                "quality_score": 130,
+                "channel": "@xx123pan",
+                "status": "saved",
+                "updated_at": "2026-11-19 08:40:36",
+            }
+        ]
+        self.plugin._db.delete_records.return_value = 18
+
+        # 1. 验证详情页包含按频道清理、清空全部、立即重扫与单行删除按钮
+        page = self.plugin.get_page()
+        page_json = str(page)
+        self.assertIn("plugin/Pan123TgPilot/clear_records", page_json)
+        self.assertIn("plugin/Pan123TgPilot/manual_check", page_json)
+        self.assertIn("🗑 清理 @xx123pan", page_json)
+        self.assertIn("🗑 清空全部记录", page_json)
+        self.assertIn("🔄 立即巡检重扫", page_json)
+
+        table = page[1]["content"][3]
+        heads = [th["text"] for th in table["content"][0]["content"][0]["content"]]
+        self.assertEqual(heads[-1], "操作")
+        action_td = table["content"][1]["content"][0]["content"][-1]
+        self.assertEqual(action_td["content"][0]["text"], "删除")
+        self.assertEqual(action_td["content"][0]["events"]["click"]["params"], {"record_id": 101})
+
+        # 2. 验证 /clear_records 空条件拒绝及各参数组合，且返回严格 3 键信封
+        bad_res = self.plugin._api_clear_records()
+        self.assertFalse(bad_res["success"])
+        self.assertEqual(set(bad_res.keys()), {"success", "message", "data"})
+
+        with patch("pan123tgpilot.threading.Thread") as mock_thread:
+            mock_inst = MagicMock()
+            mock_thread.return_value = mock_inst
+
+            res_id = self.plugin._api_clear_records(record_id=101)
+            self.assertTrue(res_id["success"])
+            self.assertEqual(set(res_id.keys()), {"success", "message", "data"})
+            self.plugin._db.delete_records.assert_called_with(
+                record_id=101, channel="", keyword="", clear_all=False
+            )
+
+            res_ch = self.plugin._api_clear_records(channel="@xx123pan", rerun="true")
+            self.assertTrue(res_ch["success"])
+            self.assertEqual(set(res_ch.keys()), {"success", "message", "data"})
+            self.assertEqual(res_ch["data"]["deleted"], 18)
+            self.assertTrue(res_ch["data"]["rerun"])
+            mock_inst.start.assert_called()
+
+            res_all = self.plugin._api_clear_records(clear_all="true")
+            self.assertTrue(res_all["success"])
+            self.assertEqual(set(res_all.keys()), {"success", "message", "data"})
+
+            res_manual = self.plugin._api_manual_check()
+            self.assertTrue(res_manual["success"])
+            self.assertEqual(set(res_manual.keys()), {"success", "message", "data"})
+
+    def test_clear_records_target_auto_resets_and_reruns(self):
+        """验证配置项 clear_records_target 保存触发按频道清理后自动置空防重删并启动后台重扫"""
+        self.plugin.update_config = MagicMock()
+        self.plugin._db = MagicMock()
+        self.plugin._db.delete_records.return_value = 18
+
+        cfg = {
+            "enabled": True,
+            "pan123_token": "tok",
+            "clear_records_target": "@xx123pan",
+        }
+        with patch("pan123tgpilot.threading.Thread") as mock_thread:
+            mock_inst = MagicMock()
+            mock_thread.return_value = mock_inst
+            self.plugin.init_plugin(cfg)
+
+            self.plugin._db.delete_records.assert_called_once_with(
+                record_id=None, channel="@xx123pan", keyword="", clear_all=False
+            )
+            self.plugin.update_config.assert_called_once()
+            saved_cfg = self.plugin.update_config.call_args[0][0]
+            self.assertEqual(saved_cfg["clear_records_target"], "")
+            mock_inst.start.assert_called_once()
 
 
 if __name__ == "__main__":

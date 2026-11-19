@@ -73,7 +73,7 @@ class Pan123TgPilot(_PluginBase):
     # 插件元信息
     plugin_name = "123云盘TG转存助手"
     plugin_desc = "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "lxj12328"
 
     # 详情页最多加载的最近记录条数 (客户端分页/排序)
@@ -312,6 +312,29 @@ class Pan123TgPilot(_PluginBase):
             f"电影目录ID={self._movie_target_dir_id}, 剧集目录ID={self._tv_target_dir_id}, "
             f"智能洗版={self._auto_upgrade}"
         )
+
+        # 一次性清理指定频道或全部历史记录逻辑：执行后自动清空输入框并立即后台重扫
+        clear_target = str(config.get("clear_records_target") or "").strip()
+        if clear_target:
+            config["clear_records_target"] = ""
+            if hasattr(self, "update_config"):
+                try:
+                    self.update_config(dict(config))
+                except Exception as e:
+                    logger.warning(f"Pan123TgPilot 自动清空 clear_records_target 异常: {e}")
+            is_all = clear_target.upper() in ("ALL", "全部", "*")
+            deleted_cnt = self._clear_records_internal(
+                clear_all=is_all,
+                channel="" if is_all else clear_target,
+            )
+            self._ui_page = 1
+            self._save_ui_view_state()
+            logger.info(
+                f"Pan123TgPilot 已按配置清理转存记录 ({'全部记录' if is_all else clear_target}): "
+                f"共清理 {deleted_cnt} 条 (123 云盘文件不受影响)"
+            )
+            if self._enabled and not config.get("run_now_on_save"):
+                threading.Thread(target=self._service_check_channels, daemon=True).start()
 
         # 立即运行一次触发逻辑：触发后立即自动将「保存后立即运行一次」开关复位为关闭状态，无需人工再手动关一次
         if config.get("run_now_on_save"):
@@ -1247,6 +1270,12 @@ class Pan123TgPilot(_PluginBase):
                     "retention_days", "记录保留天数", "0 = 永久保留；填 N 则每天 03:00 清理 N 天前的记录 (清理后同资源可能被重新转存)",
                     type="number", placeholder="0",
                 )], md=12),
+                col([fld(
+                    "clear_records_target",
+                    "清理指定频道记录并重扫 (一次性)",
+                    "填入要清理的频道名 (如 @xx123pan，多频道用逗号分隔) 或填 ALL 清空全部记录；仅删插件记录、不删 123 云盘文件，保存执行后自动清空输入框并立即重扫",
+                    placeholder="例如: @xx123pan 或 ALL",
+                )], md=12),
             ]},
         ])
 
@@ -1287,6 +1316,7 @@ class Pan123TgPilot(_PluginBase):
             "share_file_inspect": True,
             "notify_enabled": False,
             "retention_days": 0,
+            "clear_records_target": "",
             "msg_concurrency": 3,
             "file_concurrency": 4,
         }
@@ -1339,6 +1369,7 @@ class Pan123TgPilot(_PluginBase):
                     title_text = f"{title_text} {m_ep.group(1).upper()}"
 
         return {
+            "id": r.get("id"),
             "title": title_text or "-",
             "spec": spec,
             "size": size_str,
@@ -1349,18 +1380,47 @@ class Pan123TgPilot(_PluginBase):
         }
 
     @staticmethod
-    def _records_table(rows_data: list[dict]) -> dict:
-        """用 VTable 逐行渲染一页记录 (移动端可横向滚动)"""
-        heads = ["影视名称", "画质 (分辨率/编码/HDR)", "大小", "评分", "来源频道", "类型", "转存时间"]
+    def _records_table(rows_data: list[dict], plugin_id: str = "Pan123TgPilot") -> dict:
+        """用 VTable 逐行渲染一页记录 (移动端可横向滚动，支持单条清理操作)"""
+        heads = ["影视名称", "画质 (分辨率/编码/HDR)", "大小", "评分", "来源频道", "类型", "转存时间", "操作"]
         keys = ["title", "spec", "size", "score", "channel", "status", "time"]
         if rows_data:
-            trs = [
-                {"component": "tr", "content": [{"component": "td", "text": str(row[k])} for k in keys]}
-                for row in rows_data
-            ]
+            trs = []
+            for row in rows_data:
+                tds = [{"component": "td", "text": str(row[k])} for k in keys]
+                rec_id = row.get("id")
+                if rec_id is not None:
+                    tds.append(
+                        {
+                            "component": "td",
+                            "text": "",
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "size": "x-small",
+                                        "variant": "text",
+                                        "color": "error",
+                                        "text": "删除",
+                                    },
+                                    "text": "删除",
+                                    "events": {
+                                        "click": {
+                                            "api": f"plugin/{plugin_id}/clear_records",
+                                            "method": "get",
+                                            "params": {"record_id": rec_id},
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    tds.append({"component": "td", "text": "-"})
+                trs.append({"component": "tr", "content": tds})
         else:
             trs = [{"component": "tr", "content": [{
-                "component": "td", "props": {"colspan": len(keys), "class": "text-center text-grey py-4"},
+                "component": "td", "props": {"colspan": len(heads), "class": "text-center text-grey py-4"},
                 "text": "暂无转存记录，抓取并转存资源后将在此展示",
             }]}]
         return {
@@ -1643,6 +1703,95 @@ class Pan123TgPilot(_PluginBase):
             for ps in (15, 20, 50)
         ]
 
+        plugin_id = self.__class__.__name__
+        known_channels: list[str] = []
+        if self._db and hasattr(self._db, "list_channels"):
+            try:
+                ch_res = self._db.list_channels()
+                if isinstance(ch_res, list):
+                    known_channels = [str(c).strip() for c in ch_res if str(c or "").strip()]
+            except Exception:
+                known_channels = []
+        if not known_channels and raw_records:
+            seen_ch: list[str] = []
+            for rec in raw_records:
+                ch_val = str(rec.get("channel") or "").strip()
+                if ch_val and ch_val != "-" and ch_val not in seen_ch:
+                    seen_ch.append(ch_val)
+            known_channels = seen_ch
+        known_channels = known_channels[:6]
+
+        cleanup_buttons: list[dict] = [
+            {
+                "component": "span",
+                "props": {"class": "text-caption text-medium-emphasis mr-1"},
+                "text": "数据维护：",
+            }
+        ]
+        for ch in known_channels:
+            cleanup_buttons.append(
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "size": "x-small",
+                        "variant": "outlined",
+                        "color": "warning",
+                        "class": "ma-1",
+                        "text": f"🗑 清理 {ch}",
+                    },
+                    "text": f"🗑 清理 {ch}",
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{plugin_id}/clear_records",
+                            "method": "get",
+                            "params": {"channel": ch},
+                        }
+                    },
+                }
+            )
+        clear_all_disabled = (all_files_total <= 0 and not page_rows)
+        clear_all_btn: dict[str, Any] = {
+            "component": "VBtn",
+            "props": {
+                "size": "x-small",
+                "variant": "tonal",
+                "color": "error",
+                "disabled": clear_all_disabled,
+                "class": "ma-1",
+                "text": "🗑 清空全部记录",
+            },
+            "text": "🗑 清空全部记录",
+        }
+        if not clear_all_disabled:
+            clear_all_btn["events"] = {
+                "click": {
+                    "api": f"plugin/{plugin_id}/clear_records",
+                    "method": "get",
+                    "params": {"clear_all": "true"},
+                }
+            }
+        cleanup_buttons.append(clear_all_btn)
+        cleanup_buttons.append(
+            {
+                "component": "VBtn",
+                "props": {
+                    "size": "x-small",
+                    "variant": "tonal",
+                    "color": "primary",
+                    "class": "ma-1",
+                    "text": "🔄 立即巡检重扫",
+                },
+                "text": "🔄 立即巡检重扫",
+                "events": {
+                    "click": {
+                        "api": f"plugin/{plugin_id}/manual_check",
+                        "method": "get",
+                        "params": {},
+                    }
+                },
+            }
+        )
+
         filter_toolbar = {
             "component": "div",
             "props": {"class": "px-4 py-2 bg-surface-light"},
@@ -1667,6 +1816,11 @@ class Pan123TgPilot(_PluginBase):
                     "component": "div",
                     "props": {"class": "d-flex flex-wrap align-center"},
                     "content": status_filter_buttons,
+                },
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex flex-wrap align-center mt-1"},
+                    "content": cleanup_buttons,
                 },
             ],
         }
@@ -1809,7 +1963,7 @@ class Pan123TgPilot(_PluginBase):
             },
             filter_toolbar,
             {"component": "VDivider"},
-            self._records_table(page_rows),
+            self._records_table(page_rows, plugin_id=plugin_id),
             {"component": "VDivider"},
             pagination_footer,
         ]
@@ -1824,8 +1978,17 @@ class Pan123TgPilot(_PluginBase):
                 "path": "/manual_check",
                 "endpoint": self._api_manual_check,
                 "methods": ["POST", "GET"],
+                "auth": "bear",
                 "summary": "立即执行一次 TG 频道抓取与转存巡检",
                 "description": "手动触发对所有配置频道的抓取、解析与转存升级流程",
+            },
+            {
+                "path": "/clear_records",
+                "endpoint": self._api_clear_records,
+                "methods": ["POST", "GET"],
+                "auth": "bear",
+                "summary": "清理历史转存记录（支持单条/按频道/按关键词/清空全部）",
+                "description": "仅清理插件本地记录表，不删除 123 云盘文件；可选 rerun=true 清理后立即重扫",
             },
             {
                 "path": "/records",
@@ -1921,10 +2084,92 @@ class Pan123TgPilot(_PluginBase):
             },
         }
 
+    @staticmethod
+    def _is_truthy(val: Any) -> bool:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return val != 0
+        return str(val or "").strip().lower() in ("true", "1", "yes", "on")
+
+    def _clear_records_internal(
+        self,
+        record_id: Any = None,
+        channel: str = "",
+        keyword: str = "",
+        clear_all: bool = False,
+    ) -> int:
+        """线程安全地从本地数据库清理指定条件的历史记录（绝不影响 123 云盘文件）"""
+        if not self._db or not hasattr(self._db, "delete_records"):
+            return 0
+        try:
+            with self._db_lock:
+                deleted = self._db.delete_records(
+                    record_id=record_id,
+                    channel=channel,
+                    keyword=keyword,
+                    clear_all=clear_all,
+                )
+            return int(deleted or 0)
+        except Exception as e:
+            logger.error(f"Pan123TgPilot 清理记录异常: {e}")
+            return 0
+
     def _api_manual_check(self) -> dict[str, Any]:
-        """API: 手动触发频道巡检"""
+        """API: 手动触发频道巡检（遵循 MoviePilot V3 三段式信封格式）"""
         threading.Thread(target=self._service_check_channels, daemon=True).start()
-        return {"success": True, "code": 200, "message": "已在后台启动 TG 频道巡检与转存任务", "data": None}
+        return {
+            "success": True,
+            "message": "已在后台启动 TG 频道巡检与转存任务",
+            "data": {"triggered": True},
+        }
+
+    def _api_clear_records(
+        self,
+        record_id: Optional[int] = None,
+        channel: str = "",
+        keyword: str = "",
+        clear_all: bool = False,
+        rerun: bool = False,
+    ) -> dict[str, Any]:
+        """API: 网页端单条删除 / 按频道批量清理 / 清空全部历史转存记录（仅清库，不删网盘文件）"""
+        ch_clean = str(channel or "").strip()
+        kw_clean = str(keyword or "").strip()
+        do_clear_all = self._is_truthy(clear_all)
+        do_rerun = self._is_truthy(rerun)
+        has_id = record_id is not None and str(record_id).strip() != ""
+
+        if not self._db:
+            return {"success": False, "message": "数据库未就绪", "data": {"deleted": 0}}
+
+        if not (has_id or ch_clean or kw_clean or do_clear_all):
+            return {
+                "success": False,
+                "message": "请至少指定 record_id、channel、keyword 或 clear_all=true",
+                "data": {"deleted": 0},
+            }
+
+        deleted = self._clear_records_internal(
+            record_id=record_id if has_id else None,
+            channel=ch_clean,
+            keyword=kw_clean,
+            clear_all=do_clear_all,
+        )
+        if do_clear_all or ch_clean or kw_clean:
+            self._ui_page = 1
+            self._save_ui_view_state()
+
+        if do_rerun:
+            threading.Thread(target=self._service_check_channels, daemon=True).start()
+
+        return {
+            "success": True,
+            "message": (
+                f"已清理 {deleted} 条记录（123 云盘文件不受影响）"
+                + ("，已在后台启动重新巡检" if do_rerun else "")
+            ),
+            "data": {"deleted": deleted, "rerun": do_rerun},
+        }
 
     def _api_get_records(
         self, keyword: str = "", status: str = "", page: int = 1, page_size: int = 20

@@ -186,20 +186,34 @@ class TgChannelWatcher:
                 )
                 body_html = m_body.group(1) if m_body else ""
 
-                # 额外提取内联按钮 (tgme_widget_message_inline_button) 与链接卡片中的 123 云盘链接
+                # 额外提取内联按钮 (tgme_widget_message_inline_button) 与链接卡片中的 123 云盘 / TMDB 链接
                 extra_links: List[str] = []
                 for m_href in re.finditer(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', clean_block, flags=re.DOTALL | re.IGNORECASE):
                     href_val = unescape(m_href.group(1).strip())
-                    if "/s/" in href_val or "123" in href_val:
+                    if not re.match(r"^https?://", href_val, re.IGNORECASE):
+                        continue
+                    if re.match(r"^https?://(?:www\.)?t\.me/", href_val, re.IGNORECASE):
+                        continue
+                    if re.search(
+                        r"(?:123pan\.|123(?:684|685|865|912|952|592|\d{3})\.|/(?:s|123pan)/|themoviedb\.org)",
+                        href_val,
+                        re.IGNORECASE,
+                    ):
                         extra_links.append(href_val)
 
                 if not body_html and not extra_links:
                     continue
 
-                # 将 <a> 链接保留为 markdown [文本](url) 形式，避免链接文本丢失
+                # 将真实非 t.me 的 http(s) <a> 链接保留为 markdown [文本](url)；相对链接 (?q=%23%E5...) 与 t.me/ 自身链接仅保留纯文本，杜绝百分号编码或频道数字误判
                 def _replace_anchor(match: re.Match) -> str:
                     href = unescape(match.group(1).strip())
                     anchor_text = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+                    if (
+                        not href
+                        or not re.match(r"^https?://", href, re.IGNORECASE)
+                        or re.match(r"^https?://(?:www\.)?t\.me/", href, re.IGNORECASE)
+                    ):
+                        return f" {anchor_text} "
                     return f" [{anchor_text}]({href}) "
 
                 text = re.sub(

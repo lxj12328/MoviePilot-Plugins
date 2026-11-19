@@ -346,6 +346,23 @@ S1-S6 1080p H.265
         self.assertEqual(p2["media_type"], "tv")
         self.assertEqual(p2["ep_tag"], "S01-S06")
 
+    def test_percent_encoded_utf8_never_matches_episode(self):
+        """验证原始 Markdown/文本中出现 UTF-8 百分号编码 %E4/%E5/%E6 时不会误判为 E04/E05/E06"""
+        for label, ch_url in [
+            ("北京女子图鉴", "?q=%23%E5%8C%97%E4%BA%AC%E5%A5%B3%E5%AD%90%E5%9B%BE%E9%89%B4"),
+            ("暴风眼", "?q=%23%E6%9A%B4%E9%A3%8E%E7%9C%BC"),
+            ("伴君如伴舞", "?q=%23%E4%BC%B4%E5%90%9B%E5%A6%82%E4%BC%B4%E8%88%9E"),
+        ]:
+            msg = f"""🎬 [#{label}]({ch_url}) (2025)
+🎭 类型：剧集
+S01 2160p H.265
+🔗 链接：[123网盘](https://www.123pan.com/s/test-1111?pwd=abcd#)"""
+            parsed = self.parser.parse(msg)
+            self.assertIsNotNone(parsed, label)
+            self.assertEqual(parsed["title"], label)
+            self.assertEqual(parsed["ep_tag"], "S01", label)
+            self.assertIsNone(parsed["episode"], label)
+
 
 if __name__ == "__main__":
     unittest.main()

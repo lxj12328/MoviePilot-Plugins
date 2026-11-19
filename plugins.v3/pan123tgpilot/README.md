@@ -69,6 +69,7 @@
 | **分享文件树精准校准** | `share_file_inspect` | 布尔值 (Switch) | `true` | 转存前预先只读解析 123 分享目录内的视频文件，自动校准真实 `SxxExx` 季集、正片体积与缺失画质规格，并在转存阶段复用目录树免重复请求 |
 | **Telegram Bot Token** | `tg_bot_token` | 字符串 (Password) | `空` | 高级备用选项。留空时默认通过公开流免鉴权解析；如配置则通过官方 Bot API 读取 |
 | **记录保留天数** | `retention_days` | 整数 (Number) | `0` | `0` 表示永久保留；填 N 则每天 03:00 自动清理 `updated_at` 早于 N 天的转存记录。注意：清理后同一资源再次出现可能被重新转存 |
+| **清理指定频道记录并重扫 (一次性)** | `clear_records_target` | 字符串 | `空` | 填入要清理的频道名（如 `@xx123pan`，多频道用逗号分隔）或 `ALL` 清空全部记录；仅删插件记录、不删 123 云盘文件，保存执行后自动置空并立即重扫 |
 | **消息并发转存数** | `msg_concurrency` | 整数 (Number) | `3` | 同时并发处理多少条 TG 频道消息（取值范围 `1~8`，推荐 `2~4`，填 `1` 退回单线程串行） |
 | **单分享内文件并发数** | `file_concurrency` | 整数 (Number) | `4` | 单个多集剧集分享内部同时秒传多少个文件（取值范围 `1~8`，推荐 `3~5`，大幅加速多集剧集转存） |
 | **启用 pan1.me 监控** | `pan1me_enabled` | 布尔值 (Switch) | `false` | 是否同步巡检 `pan1.me` (Xiuno BBS) 论坛影视板块 |
@@ -142,12 +143,18 @@ flowchart LR
 - 升级到 v1.1.0 时自动执行可重复运行的迁移：补齐 `link_hash` 列与索引并回填历史数据。
 - 详情页清单：采用与 123云盘助手同款的现代化交互式分页导航栏（支持首页/上一页/页码直跳/下一页/末页/快进快退 5 页、每页 15/20/50 条切换）及顶部媒体分类/状态筛选工具栏。
 - 完整检索与翻页使用 API：`GET /api/v1/plugin/Pan123TgPilot/records?keyword=八仙&status=saved&page=1&page_size=20`，返回 `total` / `pages` / `data`。
-- 手动清理：`/purge`（保留天数为 0 时不会删除任何数据）。
+- **网页端可视化记录清理与重扫**（仅删除插件历史记录表数据，**绝不删除 123 云盘文件**）：
+  - 在插件详情页顶部操作栏可点击 **`🗑 清理 <频道名>`**、**`🗑 清空全部记录`** 或每行右侧 **`删除`** 按钮精准删掉脏数据，点击 **`🔄 立即巡检重扫`** 重新抓取校准；
+  - 也可通过 API 触发：`GET /api/v1/plugin/Pan123TgPilot/clear_records?channel=@xx123pan&rerun=true`（支持 `record_id`、`channel`、`keyword`、`clear_all=true`、`rerun=true`）。
+- 手动按天清理：`/purge`（保留天数为 0 时不会删除任何数据）。
 
 ## 6. 版本历史 (Changelog)
 
-### v1.4.0
-- **两层通用智能解析与分享文件树校准架构**：
-  - **Tier 1 文本去噪 + 宿主 `MetaInfo` 协同**：剥离多行简介剧情（`📖 简介：`）、评分（`⭐`/`🍅`）、话题标签（`🏷 标签：`）及链接参数中的干扰数字，结合 MoviePilot V3 `app.sdk.media.MetaInfo` 与本地增强正则按识别粒度择优，全面适配 `🎬 片名 (年份)` / `🎭 类型：剧集` / `🖥 画质` / `📹 视频` / `📦 大小` / `[123网盘](...)` 等多频道样式与 `S01-S06` 多季区间。
-  - **Tier 2 分享文件树预扫校准 (`share_file_inspect`)**：转存前只读遍历 123 分享目录 tree（自动剔除字幕/NFO 与预告片/花絮目录），结合 `MetaInfoPath` 与目录/文件名规则反推真实 `SxxExx`（如 `S01` -> `S01E01-E20` 或多季 `S01-S06`）、真实正片总体积及缺失分辨率/编码/杜比视界参数，同时严格尊重 TMDB `/movie/` 权威电影锁定。
-  - **目录树缓存复用与校准后去重**：`save_share_link` 直接复用预扫目录树，零重复请求 `/b/api/share/get`；校准生成精确 `media_key` 后二次检索数据库，自动拦截同片不同分享链接的跨频道重复转存，并支持旧版模糊 `S01` 记录的追更/洗版识别。
+### v1.4.1
+- **彻底修复 Telegram 相对标签 URL `%E4/%E5/%E6` 误判为 `S01E05 / S01E06` 的底层问题**：
+  - `TgChannelWatcher._parse_tg_web_html` 不再将 `?q=%23%E5...` 相对标签链接及 `t.me/` 频道自身链接作为 Markdown URL 输出（仅保留纯文本标签名），且内联外链扫描排除 `t.me/` 避免误扫频道链接。
+  - `TgMessageParser` 在 `_strip_noise_for_meta` 中剥离全部 Markdown 链接目标与 `%XX` 百分号编码，并对 `RE_EPISODE_ONLY` / `RE_EP_RANGE_ONLY` 加入 `(?<!%)` 负向断言双重防护。
+- **新增网页端记录清理与一键重扫闭环**（仅清库，不删 123 云盘文件）：
+  - 详情页表格每行右侧新增 **`删除`** 按钮，顶部数据维护栏新增 **按来源频道一键清理**、**`🗑 清空全部记录`** 与 **`🔄 立即巡检重扫`** 按钮。
+  - 新增标准 V3 API `/api/v1/plugin/Pan123TgPilot/clear_records`（支持 `record_id`、`channel`、`keyword`、`clear_all`、`rerun`），同步统一 `/manual_check` 为标准 V3 三段式信封响应；配置页新增保存即清理重扫并自动置空的 **`clear_records_target`** 选项。
+  - 延续 v1.4.0 两层 `MetaInfo` + 分享文件树精准校准与零重复探测复用特性。

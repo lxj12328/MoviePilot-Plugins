@@ -251,6 +251,86 @@ class Pan123TgDatabase:
             pass
         return getattr(res, "rowcount", 0) or 0
 
+    @db_update
+    def delete_records(self, *args, **kwargs) -> int:
+        """
+        按记录 ID / 来源频道 / 关键字 / 全量删除本地转存记录 (仅删插件历史记录，不影响 123 云盘文件)。
+        支持同时传入逗号或换行分隔的多个频道名，自动兼容带或不带 `@` 前缀。
+        """
+        db = self._extract_db(args, kwargs)
+        if db is None:
+            return 0
+
+        record_id = kwargs.get("record_id")
+        channel = str(kwargs.get("channel") or "").strip()
+        keyword = str(kwargs.get("keyword") or "").strip()
+        clear_all = bool(kwargs.get("clear_all", False))
+
+        from sqlalchemy import delete
+
+        conditions = []
+        if record_id is not None and str(record_id).strip():
+            try:
+                conditions.append(Pan123TgRecord.id == int(str(record_id).strip()))
+            except (ValueError, TypeError):
+                return 0
+
+        if channel:
+            raw_parts = [p.strip() for p in re.split(r"[,，\s\n]+", channel) if p.strip()]
+            chan_candidates = set()
+            for part in raw_parts:
+                bare = part.lstrip("@").strip()
+                chan_candidates.add(part)
+                if bare:
+                    chan_candidates.add(bare)
+                    chan_candidates.add(f"@{bare}")
+            if chan_candidates:
+                conditions.append(Pan123TgRecord.channel.in_(sorted(chan_candidates)))
+
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                or_(
+                    Pan123TgRecord.media_title.like(pattern),
+                    Pan123TgRecord.media_key.like(pattern),
+                    Pan123TgRecord.channel.like(pattern),
+                )
+            )
+
+        if not clear_all and not conditions:
+            return 0
+
+        stmt = delete(Pan123TgRecord)
+        if not clear_all and conditions:
+            stmt = stmt.where(*conditions)
+        res = db.execute(stmt)
+        db.flush()
+        try:
+            db.commit()
+        except Exception:
+            pass
+        return getattr(res, "rowcount", 0) or 0
+
+    @db_query
+    def list_channels(self, *args, **kwargs) -> list[str]:
+        """查询当前库中出现过的所有去重来源频道列表"""
+        db = self._extract_db(args, kwargs)
+        if db is None:
+            return []
+        try:
+            rows = (
+                db.execute(
+                    select(Pan123TgRecord.channel)
+                    .distinct()
+                    .where(Pan123TgRecord.channel != "")
+                )
+                .scalars()
+                .all()
+            )
+            return sorted({str(ch).strip() for ch in rows if str(ch or "").strip()})
+        except Exception:
+            return []
+
     @db_query
     def get_record_by_media_key(self, *args, **kwargs) -> Optional[dict]:
         """

@@ -21,13 +21,13 @@
     "name": "123云盘TG转存助手",
     "description": "MoviePilot V3 的 123 云盘 Telegram 频道智能转存与画质洗版助手。实时监控指定 TG 频道影视更新，智能识别电影/剧集并分类转存，支持标准分享链接与秒传链接解析，支持画质评分与自动洗版升级。",
     "labels": "网盘,Telegram,TG转存,秒传,洗版,123云盘",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "icon": "https://raw.githubusercontent.com/lxj12328/MoviePilot-Plugins/main/icons/123pan.png",
     "author": "lxj12328",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
-      "v1.4.0": "两层通用智能解析与分享文件树校准架构重构：1. Tier 1 文本去噪结合 MoviePilot V3 官方 app.sdk.media.MetaInfo 与增强正则择优识别，完整适配新版 TG 频道样式（🎬 片名 (年份) / 🎭 类型：剧集 / 🖥 画质 / 📹 视频 / 📦 大小 / 多行 📖 简介 / Markdown 链接），自动隔离简介剧情与 URL 数字噪声；2. Tier 2 新增「分享文件树精准校准」（配置开关 share_file_inspect，默认开启），转存前只读预扫 123 分享目录树并接入 MetaInfoPath 识别，自动将模糊的 S01 校准为精确集数区间（如 S01E01-E20）及多季（S01-S06）、剔除预告片/花絮/伴生文件计算真实正片体积并补全缺失画质参数，同时复用目录树零重复请求转存；3. 校准后二次核对数据库触发跨频道去重与旧单季记录升级，告别按单频道写死的适配维护。"
+      "v1.4.1": "根治 Telegram 相对标签 URL (%E4/%E5/%E6) 误判为 S01E05 缺陷并新增网页端可视化垃圾数据清理与重扫功能：1. 修复 tg_watcher 抓取公开预览 HTML 时将 ?q=%23%E5%8C%97... 等相对标签链接与 t.me/ 频道自身链接输出到文本正文导致汉字 UTF-8 编码 %E4/%E5/%E6 被误判为 S01E04/E05/E06 的底层 Bug，并在 parser 中双重剥离 Markdown 链接目标、百分号编码与 (?<!%) 断言防护；2. 网页详情页新增逐行「删除」、顶部按来源频道一键清理（如「🗑 清理 @xx123pan」）、「🗑 清空全部记录」与「🔄 立即巡检重扫」交互按钮（仅清插件本地记录，绝不删 123 云盘文件），同步新增 /clear_records 标准 V3 API 及保存即生效并自动复位的一次性配置项 clear_records_target；3. 延续 v1.4.0 两层 MetaInfo + 分享文件树精准校准架构。"
     }
   }
 }
