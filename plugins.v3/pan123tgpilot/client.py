@@ -369,6 +369,89 @@ class Pan123TgClient:
 
         return True, items, ""
 
+    def inspect_share_tree(
+        self,
+        share_key: str,
+        share_pwd: str = "",
+        max_depth: int = 6,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """
+        只读递归窥探 123 分享目录树，返回原始节点树及带完整相对路径的扁平文件列表，
+        供解析器校准真实剧集 SxxExx、视频体积及高清规格；同时可供后续 save_share_link 直接复用，
+        避免重复请求 /b/api/share/get 接口。
+        :return: (ok: 是否成功, tree_data: 目录树数据字典, msg: 说明)
+        """
+        if not share_key:
+            return False, None, "分享 Key 为空"
+        if not self.is_configured():
+            return False, None, "123 云盘 Web Token 未配置"
+
+        hosts = [self.WEB_BASE_URL, self.BACKUP_BASE_URL]
+        last_msg = ""
+
+        for host in hosts:
+            ok_root, root_items, err_root = self._list_share_dir(
+                host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=0
+            )
+            if not ok_root or not root_items:
+                last_msg = err_root or "分享链接内容为空或已失效"
+                continue
+
+            files: List[Dict[str, Any]] = []
+
+            def _walk_tree(items_list: List[Dict[str, Any]], rel_prefix: str = "", depth: int = 0) -> List[Dict[str, Any]]:
+                if depth > max_depth:
+                    return []
+                nodes: List[Dict[str, Any]] = []
+                for it in items_list:
+                    if not isinstance(it, dict):
+                        continue
+                    node = dict(it)
+                    itype = int(it.get("Type") if it.get("Type") is not None else (it.get("type") or 0))
+                    ifid = it.get("FileId") or it.get("fileId")
+                    iname = str(it.get("FileName") or it.get("fileName") or it.get("filename") or "").strip()
+
+                    if itype == 1:
+                        child_prefix = f"{rel_prefix}/{iname}" if (rel_prefix and iname) else (iname or rel_prefix)
+                        children: List[Dict[str, Any]] = []
+                        if ifid is not None and depth < max_depth:
+                            ok_ch, ch_items, _ = self._list_share_dir(
+                                host=host,
+                                share_key=share_key,
+                                share_pwd=share_pwd,
+                                parent_file_id=int(ifid),
+                            )
+                            if ok_ch and ch_items:
+                                children = _walk_tree(ch_items, child_prefix, depth + 1)
+                        node["_children"] = children
+                    else:
+                        etag = str(it.get("Etag") or it.get("etag") or it.get("md5") or "").strip()
+                        fsize = int(it.get("Size") if it.get("Size") is not None else (it.get("size") or 0))
+                        rel_path = f"{rel_prefix}/{iname}" if (rel_prefix and iname) else iname
+                        if iname:
+                            files.append(
+                                {
+                                    "rel_path": rel_path,
+                                    "name": iname,
+                                    "etag": etag,
+                                    "size": fsize,
+                                    "file_id": ifid,
+                                }
+                            )
+                    nodes.append(node)
+                return nodes
+
+            root_nodes = _walk_tree(root_items, "", 0)
+            return True, {
+                "host": host,
+                "share_key": share_key,
+                "share_pwd": share_pwd,
+                "root_items": root_nodes,
+                "files": files,
+            }, ""
+
+        return False, None, f"读取分享目录树失败: {last_msg}"
+
     def save_share_link(
         self,
         share_key: str,
@@ -376,11 +459,13 @@ class Pan123TgClient:
         target_parent_id: int = 0,
         folder_name: str = "",
         file_concurrency: Optional[int] = None,
+        prefetched_tree: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, Optional[str], str]:
         """
         转存标准 123 分享链接中的全量文件夹与所有文件 (包含视频、字幕、nfo、图片等刮削信息)
         采用「递归遍历 /b/api/share/get 提取 (Etag, Size, FileName) + /b/api/file/upload_request 秒传落盘」方案，
         彻底解决 123 云盘 Web 端无 /b/api/share/save 接口导致 HTTP 404 的问题，并返回正片真实 FileId。
+        支持传入 prefetched_tree 直接复用 inspect_share_tree 缓存结果，零重复目录探测请求。
         目录树遍历与子目录创建串行完成，文件秒传由线程池并发执行 (并发数 file_concurrency，缺省取实例配置)。
         :return: (ok: 是否成功, file_id: 云盘文件ID, msg: 说明)
         """
@@ -391,10 +476,22 @@ class Pan123TgClient:
         hosts = [self.WEB_BASE_URL, self.BACKUP_BASE_URL]
         last_msg = ""
 
-        for host in hosts:
-            ok_root, root_items, err_root = self._list_share_dir(
-                host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=0
-            )
+        # 若已传入预抓取目录树，直接复用，不再重复调用 /b/api/share/get
+        use_prefetched = isinstance(prefetched_tree, dict) and bool(prefetched_tree.get("root_items"))
+        candidate_sources: List[Tuple[str, Optional[List[Dict[str, Any]]], bool]]
+        if use_prefetched:
+            prefetched_host = str(prefetched_tree.get("host") or self.WEB_BASE_URL)
+            candidate_sources = [(prefetched_host, prefetched_tree.get("root_items"), True)]
+        else:
+            candidate_sources = [(h, None, False) for h in hosts]
+
+        for host, pre_root_items, from_prefetch in candidate_sources:
+            if from_prefetch and pre_root_items is not None:
+                ok_root, root_items, err_root = True, pre_root_items, ""
+            else:
+                ok_root, root_items, err_root = self._list_share_dir(
+                    host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=0
+                )
             if not ok_root or not root_items:
                 last_msg = err_root or "分享链接内容为空或已失效"
                 continue
@@ -423,13 +520,18 @@ class Pan123TgClient:
             # 则直接展开该根文件夹内容转存到 base_target_id 下，避免出现「谷雨 (2026)/谷雨 (2026)」双层同名套娃
             initial_items = root_items
             if has_single_root_folder and base_target_id != configured_parent_id:
-                root_folder_fid = root_items[0].get("FileId") or root_items[0].get("fileId")
-                if root_folder_fid:
-                    ok_sub, sub_items, _ = self._list_share_dir(
-                        host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=int(root_folder_fid)
-                    )
-                    if ok_sub and sub_items:
+                if from_prefetch:
+                    sub_items = root_items[0].get("_children") or []
+                    if sub_items:
                         initial_items = sub_items
+                else:
+                    root_folder_fid = root_items[0].get("FileId") or root_items[0].get("fileId")
+                    if root_folder_fid:
+                        ok_sub, sub_items, _ = self._list_share_dir(
+                            host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=int(root_folder_fid)
+                        )
+                        if ok_sub and sub_items:
+                            initial_items = sub_items
 
             saved_files_count = 0
             primary_file_id: Optional[str] = None
@@ -455,7 +557,11 @@ class Pan123TgClient:
                             ok_sub_mk, created_sub_id, _ = self.mkdir(dirname=iname, parent_file_id=cur_dir_id)
                             if ok_sub_mk and created_sub_id:
                                 sub_target_id = created_sub_id
-                        if ifid is not None:
+                        if from_prefetch:
+                            ch_items = it.get("_children") or []
+                            if ch_items:
+                                _collect_items_recursive(ch_items, sub_target_id, depth + 1)
+                        elif ifid is not None:
                             ok_ch, ch_items, _ = self._list_share_dir(
                                 host=host, share_key=share_key, share_pwd=share_pwd, parent_file_id=int(ifid)
                             )

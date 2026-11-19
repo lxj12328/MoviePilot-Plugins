@@ -281,24 +281,33 @@ class Pan123TgDatabase:
             conditions.append(Pan123TgRecord.media_key == media_key)
 
         if is_tv:
+            m_rng = re.match(r"^S(\d{1,3})E\d{1,4}-E?\d{1,4}$", ep_tag, re.IGNORECASE) if ep_tag else None
             if tmdb_id:
                 if ep_tag:
                     conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}_{ep_tag}")
+                    if m_rng:
+                        s_num = int(m_rng.group(1))
+                        conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}_S{s_num:02d}")
                 else:
                     conditions.append(Pan123TgRecord.media_key == f"tv_tmdb_{tmdb_id}")
             if title:
-                # 剥离可能已附带的 SxxExx 后缀再计算 norm_title
-                clean_base = re.sub(r"\s+S\d{1,3}(?:E\d{1,4}(?:-E?\d{1,4})?)?$", "", title, flags=re.IGNORECASE).strip()
+                # 剥离可能已附带的 SxxExx / Sxx-Syy 后缀再计算 norm_title
+                clean_base = re.sub(
+                    r"\s+S\d{1,3}(?:-S\d{1,3}|E\d{1,4}(?:-E?\d{1,4})?)?$",
+                    "",
+                    title,
+                    flags=re.IGNORECASE,
+                ).strip()
                 norm_title = re.sub(r"[^\w\u4e00-\u9fa5]", "", clean_base).lower()
                 if norm_title:
                     if ep_tag:
                         conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}_{ep_tag}")
                         conditions.append(Pan123TgRecord.media_title == f"{clean_base} {ep_tag}")
-                        # 若当前为合集区间 (如 S01E01-E20)，同步检索同剧同季的已有合集区间记录 (如 S01E01-E17)，便于识别追更扩充
-                        m_rng = re.match(r"^S(\d{1,3})E\d{1,4}-E?\d{1,4}$", ep_tag, re.IGNORECASE)
+                        # 若当前为合集区间 (如 S01E01-E20)，同步检索同剧同季的已有合集区间或仅单季记录 (如 S01E01-E17 / S01)，便于识别追更扩充与校准后去重
                         if m_rng:
                             s_num = int(m_rng.group(1))
                             conditions.append(Pan123TgRecord.media_key.like(f"tv_{norm_title}_S{s_num:02d}E%-E%"))
+                            conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}_S{s_num:02d}")
                     else:
                         conditions.append(Pan123TgRecord.media_key == f"tv_{norm_title}")
         else:

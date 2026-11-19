@@ -263,6 +263,88 @@ https://1840976528.share.123pan.cn/123pan/cHCOTd-jKjP"""
         self.assertEqual(self.parser.parse_ep_range("今天是太阳雨 S01E01-E17"), (1, 1, 17, True))
         self.assertEqual(self.parser.parse_ep_range("S01E05"), (1, 5, 5, False))
         self.assertEqual(self.parser.parse_ep_range("S02"), (2, None, None, False))
+        self.assertEqual(self.parser.parse_ep_range("S01-S06"), (1, None, None, True))
+
+    def test_parse_beijing_women_channel_style(self):
+        """验证新版频道格式（🎭 类型 / ⭐ 评分 / 🖥 画质 / 📹 视频 / 📦 大小 / 多行简介 / Markdown链接）解析准确"""
+        msg = """🎬 北京女子图鉴 (2018)
+🎭 类型：剧集
+⭐ TMDB评分：5.5/10
+🍅 豆瓣评分：6.2
+🖥 画质：2160p
+📹 视频：WEB-DL.H.265
+💬 字幕：简中（内嵌）
+📦 大小：92.89GB
+👤 分享：匿名
+S01 4K WEB-DL [国语][内嵌简中字幕]
+🔗 链接：[123网盘](https://www.123pan.com/s/kyeA-kBV7v?pwd=t00N#)
+📖 简介：
+讲述了在北京打拼的职业女性的故事。她们被现实包裹，被压力、责任所困扰，她们也不断用青春的激情、倔强的个性、不屈的进取心去努力营造、交织出一片励志的天空。这是一本实用的现代都市女子的最新解读手册。
+🏷 标签：#北京女子图鉴 #剧情"""
+        parsed = self.parser.parse(msg)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["title"], "北京女子图鉴")
+        self.assertEqual(parsed["year"], "2018")
+        self.assertEqual(parsed["media_type"], "tv")
+        self.assertEqual(parsed["season"], 1)
+        self.assertEqual(parsed["ep_tag"], "S01")
+        self.assertEqual(parsed["resolution"], "2160p")
+        self.assertEqual(parsed["codec"], "H.265")
+        self.assertEqual(parsed["share_key"], "kyeA-kBV7v")
+        self.assertEqual(parsed["share_pwd"], "t00N")
+        self.assertGreater(parsed["file_size"], 90 * (1024 ** 3))
+        self.assertGreaterEqual(parsed["quality_score"], 130)
+
+    def test_noise_isolation_ignores_synopsis_and_url_digits(self):
+        """验证简介正文或链接参数中的 Sxx/Exx/第X季/第X集 噪声不会污染媒体类型和季集判定"""
+        movie_msg = """🎬 测试电影 (2025)
+🎭 类型：电影
+🖥 画质：2160p
+📹 视频：WEB-DL.H.265
+📦 大小：15.5GB
+🔗 链接：[123网盘](https://www.123pan.com/s/test-S02E08?pwd=E09A#)
+📖 简介：
+该片讲述了第2季第3集提到的历史档案，主人公曾在 S02E05 行动中获救，并非 720p 电视剪辑版。
+🏷 标签：#测试电影 #悬疑"""
+        p_movie = self.parser.parse(movie_msg)
+        self.assertIsNotNone(p_movie)
+        self.assertEqual(p_movie["media_type"], "movie")
+        self.assertEqual(p_movie["ep_tag"], "")
+        self.assertEqual(p_movie["resolution"], "2160p")
+
+        tv_msg = """🎬 迷雾追踪 (2024)
+🎭 类型：剧集
+📦 大小：20.0GB
+S01 1080p WEB-DL H.265
+🔗 链接：https://www.123pan.com/s/test-E08S03?pwd=E02B
+📖 简介：故事延续了第3季第12集以及 S04E01 的悬念设定。"""
+        p_tv = self.parser.parse(tv_msg)
+        self.assertIsNotNone(p_tv)
+        self.assertEqual(p_tv["media_type"], "tv")
+        self.assertEqual(p_tv["season"], 1)
+        self.assertIsNone(p_tv["episode"])
+        self.assertEqual(p_tv["ep_tag"], "S01")
+
+    def test_parse_multi_season_range(self):
+        """验证多季合并分享 (S1-S6 / 第1-6季) 标准化为 S01-S06"""
+        msg1 = """📺 爸爸去哪儿 (2013)
+🎭 类型：剧集
+S1-S6 1080p H.265
+🔗 https://www.123865.com/s/h0CtTd-OPZgv"""
+        p1 = self.parser.parse(msg1)
+        self.assertIsNotNone(p1)
+        self.assertEqual(p1["media_type"], "tv")
+        self.assertEqual(p1["ep_tag"], "S01-S06")
+        self.assertEqual(p1["season"], 1)
+        self.assertEqual(self.parser.parse_ep_range(p1["ep_tag"]), (1, None, None, True))
+
+        msg2 = """📺 爸爸去哪儿全集 (2013)
+第1-6季 1080p
+🔗 https://www.123865.com/s/AbCdEf-12345"""
+        p2 = self.parser.parse(msg2)
+        self.assertIsNotNone(p2)
+        self.assertEqual(p2["media_type"], "tv")
+        self.assertEqual(p2["ep_tag"], "S01-S06")
 
 
 if __name__ == "__main__":
